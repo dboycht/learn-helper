@@ -22,10 +22,26 @@ import logging
 import threading
 from logging.handlers import RotatingFileHandler
 
-import requests
+try:
+    import requests
+    from playwright.sync_api import sync_playwright
+except Exception as _imp_err:
+    _msg = (f'依赖导入失败: {_imp_err}\n\n'
+            f'请使用 Python 3.10 运行，并安装依赖:\n    pip install playwright requests\n\n'
+            f'当前解释器: {sys.executable}')
+    try:
+        import tkinter as _tk
+        from tkinter import messagebox as _mb
+        _r = _tk.Tk()
+        _r.withdraw()
+        _mb.showerror('学习助理 · 启动失败', _msg)
+        _r.destroy()
+    except Exception:
+        print(_msg)
+    sys.exit(1)
+
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
-from playwright.sync_api import sync_playwright
 
 APP_VERSION = '1.0.1'
 SCHOOL_ID = 'nuaa'
@@ -562,8 +578,17 @@ class AppConsole:
         self.notice_loop_id = None
 
         self.create_widgets()
-        self.auto_launch_browser_on_start()
+        # 先让控制面板显示并短暂置顶，避免被随后拉起的浏览器窗口盖住
+        self.root.update_idletasks()
+        self.root.lift()
+        try:
+            self.root.attributes('-topmost', True)
+            self.root.after(900, lambda: self.root.attributes('-topmost', False))
+        except Exception:
+            pass
+        self.root.after(500, self.auto_launch_browser_on_start)
         self.query_points()
+        LOGGER.info('[系统] 控制面板已显示（若被浏览器盖住，请查看任务栏）。')
 
     def on_close_window(self):
         self.root.destroy()
