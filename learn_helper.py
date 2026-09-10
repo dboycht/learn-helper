@@ -14,9 +14,13 @@
 
 import json
 import os
+import sys
 import subprocess
 import time
 import ctypes
+import logging
+import threading
+from logging.handlers import RotatingFileHandler
 
 import requests
 import tkinter as tk
@@ -49,6 +53,27 @@ def _load_server_url():
 
 
 SERVER_URL = _load_server_url()
+
+# ----------------------------------------------------------------------------
+# 日志系统：写文件（logs/learn_helper.log，滚动）+ 可镜像到 GUI
+# ----------------------------------------------------------------------------
+LOG_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+
+
+def setup_logger():
+    os.makedirs(LOG_DIR, exist_ok=True)
+    lg = logging.getLogger('learn_helper')
+    lg.setLevel(logging.DEBUG)
+    if not lg.handlers:
+        path = os.path.join(LOG_DIR, 'learn_helper.log')
+        fh = RotatingFileHandler(path, maxBytes=2 * 1024 * 1024, backupCount=5, encoding='utf-8')
+        fh.setLevel(logging.DEBUG)
+        fh.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', '%Y-%m-%d %H:%M:%S'))
+        lg.addHandler(fh)
+    return lg
+
+
+LOGGER = setup_logger()
 
 
 # ----------------------------------------------------------------------------
@@ -254,6 +279,113 @@ def get_device_id():
         return 'DEV-' + hashlib.md5(str(machine_uuid.getnode()).encode()).hexdigest()[:12].upper()
     except Exception:
         return 'DEV-UNKNOWN'
+
+
+# 页面关键元素探测用的选择器
+DIAG_SELECTORS = [
+    'div.ans-attach-ct', '.ans-attach-online', '.ans-cc', 'div[class*="attach"]',
+    'iframe', 'video', 'audio', '#panView', '#container', '#scrollBox',
+    'div.singlequesid', 'div.TiMu', '.question-card', '.prev_ul li', '.prev_tab li',
+]
+
+
+def collect_job_containers(page, cards_frame):
+    """
+    在 卡片帧 / 主帧 / 全部子帧 中寻找「任务容器」并返回 Locator 列表。
+    命中即返回该帧的结果（避免跨帧混合）。全部未命中返回 []。
+    """
+    frames = []
+    if cards_frame is not None:
+        frames.append(cards_frame)
+    if page.main_frame not in frames:
+        frames.append(page.main_frame)
+    for f in page.frames:
+        if f not in frames:
+            frames.append(f)
+    sels = ['div.ans-attach-ct', '.ans-attach-online', '.ans-cc']
+    for fr in frames:
+        out = []
+        for sel in sels:
+            try:
+                out.extend(fr.locator(sel).all())
+            except Exception:
+                pass
+        if out:
+            try:
+                furl = fr.url
+            except Exception:
+                furl = '?'
+            LOGGER.info(f'[识别] 任务容器命中 frame url={furl[:100]} 数量={len(out)}')
+            return out
+    return []
+
+
+def diagnose_page(page, log):
+    """把当前页面（含所有 frame）的关键元素计数与片段写入日志，便于排查"识别不到"的问题。"""
+    try:
+        try:
+            title = page.title()
+        except Exception:
+            title = '?'
+        log(f'[诊断] 页面标题: {title}')
+        log(f'[诊断] 页面 URL : {page.url}')
+        frames = [('main', page.main_frame)] + [(f'#{i + 1}', f) for i, f in enumerate(page.frames)]
+        for name, fr in frames:
+            try:
+                furl = fr.url
+            except Exception:
+                furl = '?'
+            counts = {}
+            for sel in DIAG_SELECTORS:
+                try:
+                    counts[sel] = fr.locator(sel).count()
+                except Exception:
+                    counts[sel] = -1
+            nonzero = ', '.join(f'{k}={v}' for k, v in counts.items() if v and v > 0)
+            log(f'[诊断] frame<{name}> url={furl[:120]}')
+            log(f'        命中: {nonzero if nonzero else "(无关键元素)"}')
+            # 若存在任务容器，dump 一段 outerHTML
+            for sel in ('div.ans-attach-ct', '.ans-attach-online', "div[class*='attach']"):
+                try:
+                    if fr.locator(sel).count() > 0:
+                        html = fr.locator(sel).first.evaluate('(e) => e.outerHTML')
+                        html = ' '.join((html or '').split())
+                        log(f'        [{sel}] 片段: {html[:500]}')
+                        break
+                except Exception as e:
+                    log(f'        [{sel}] dump 失败: {e}')
+    except Exception as e:
+        log(f'[诊断] 异常: {e}')
+    return None
+
+
+def run_diagnose_cli():
+    """命令行诊断：连接本机 CDP，dump 所有已打开页面的识别信息。用法：python learn_helper.py --diagnose"""
+    def log(msg):
+        print(msg)
+        LOGGER.info(msg)
+
+    log(f'[诊断] learn-helper v{APP_VERSION} 诊断模式')
+    log(f'[诊断] 日志文件: {os.path.join(LOG_DIR, "learn_helper.log")}')
+    ok, _ = kill_and_launch_browser()
+    if not ok:
+        log('[诊断] 无法连接/拉起浏览器（9222 不可用）。')
+        return
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.connect_over_cdp('http://127.0.0.1:9222')
+            ctx = browser.contexts[0]
+            if not ctx.pages:
+                log('[诊断] 浏览器无已打开页面。')
+                browser.close()
+                return
+            for i, pg in enumerate(ctx.pages):
+                log(f'========== 页面 {i + 1} / {len(ctx.pages)} ==========')
+                diagnose_page(pg, log)
+            browser.close()
+    except Exception as e:
+        log(f'[诊断] 异常: {e}')
+    return None
 
 
 def find_button_in_frames(page, text_list):
@@ -558,6 +690,12 @@ class AppConsole:
         self.btn_stop.pack(side=tk.RIGHT, padx=(3, 0), ipady=5)
         self.bind_hover(self.btn_stop, '#E67E22', '#D35400')
 
+        self.btn_diag = tk.Button(controls, text='诊断页面', bg=self.COLOR_CARD_BG, fg=self.COLOR_PRIMARY,
+                                  font=('Microsoft YaHei', 9), relief=tk.FLAT, cursor='hand2',
+                                  command=self.diagnose_current_page, activebackground='#E3F2FD')
+        self.btn_diag.pack(side=tk.RIGHT, padx=(3, 6), ipady=5)
+        self.bind_hover(self.btn_diag, '#E3F2FD', self.COLOR_CARD_BG)
+
         self.btn_toggle_log = tk.Button(main, text='展开详细运行日志 ∨', bg=self.COLOR_BG,
                                         fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 9),
                                         relief=tk.FLAT, cursor='hand2', command=self.toggle_log,
@@ -587,10 +725,28 @@ class AppConsole:
         return None
 
     def log(self, text):
-        self.log_area.configure(state='normal')
-        self.log_area.insert(tk.END, text + '\n')
-        self.log_area.see(tk.END)
-        self.log_area.configure(state='disabled')
+        """统一日志出口：写文件 + 镜像到 GUI（GUI 操作自动切回主线程）。"""
+        try:
+            LOGGER.info(text)
+        except Exception:
+            pass
+        if threading.current_thread() is threading.main_thread():
+            self._append_log(text)
+        else:
+            try:
+                self.root.after(0, self._append_log, text)
+            except Exception:
+                pass
+        return None
+
+    def _append_log(self, text):
+        try:
+            self.log_area.configure(state='normal')
+            self.log_area.insert(tk.END, text + '\n')
+            self.log_area.see(tk.END)
+            self.log_area.configure(state='disabled')
+        except Exception:
+            pass
         return None
 
     def start_scrolling_notice(self, text_content=None):
@@ -788,6 +944,44 @@ class AppConsole:
         return None
 
     # ---------------- 运行控制 ----------------
+    def diagnose_current_page(self):
+        """连接浏览器，把当前页（或所选网页）的识别详情写入日志/界面。"""
+        selected = self.cb_pages.get().strip()
+        self.log('[诊断] 正在连接浏览器并分析页面...（详情同时写入 logs/learn_helper.log）')
+
+        def run():
+            ok, _ = kill_and_launch_browser()
+            if not ok:
+                self.log('[诊断] 浏览器不可用（9222 未就绪）。')
+                return None
+            try:
+                with sync_playwright() as p:
+                    browser = p.chromium.connect_over_cdp('http://127.0.0.1:9222')
+                    ctx = browser.contexts[0]
+                    pages = list(ctx.pages)
+                    target = None
+                    for pg in pages:
+                        try:
+                            if pg.title() == selected:
+                                target = pg
+                                break
+                        except Exception:
+                            pass
+                    if target is None and pages:
+                        target = pages[-1]
+                    if target is None:
+                        self.log('[诊断] 浏览器无已打开页面。')
+                        browser.close()
+                        return None
+                    diagnose_page(target, self.log)
+                    browser.close()
+            except Exception as e:
+                self.log(f'[诊断] 异常: {e}')
+            return None
+
+        threading.Thread(target=run, daemon=True).start()
+        return None
+
     def check_pause_and_stop(self):
         if self.stop_requested:
             return True
@@ -1137,6 +1331,12 @@ class AppConsole:
                         self.log('[系统] 正在等待任务卡片加载...')
                         robust_wait_for_tasks_to_render(target_page, self.check_pause_and_stop)
 
+                        LOGGER.info(f'[识别] 页面帧数={1 + len(target_page.frames)}')
+                        for i, fr in enumerate(target_page.frames):
+                            try:
+                                LOGGER.info(f'[识别]   frame#{i + 1} url={fr.url[:120]}')
+                            except Exception:
+                                pass
                         cards_frame = None
                         for frame in target_page.frames:
                             if 'knowledge/cards' in frame.url:
@@ -1147,6 +1347,7 @@ class AppConsole:
                                 if frame != target_page.main_frame:
                                     cards_frame = frame
                                     break
+                        LOGGER.info(f'[识别] cards_frame={"命中" if cards_frame else "未命中"}')
 
                         tab_buttons = find_tab_buttons(cards_frame) if cards_frame else []
                         total_tabs = max(1, len(tab_buttons))
@@ -1185,27 +1386,38 @@ class AppConsole:
                                 pass
                             time.sleep(0.3)
 
-                            # 扫描音视频/文档任务
-                            active_cards_frame = cards_frame if cards_frame else target_page.main_frame
+                            # 扫描音视频/文档任务（多选择器 + 多帧回退）
+                            containers = collect_job_containers(target_page, cards_frame)
+                            self.log(f'      [识别] 发现候选任务容器 {len(containers)} 个')
                             valid_jobs = []
-                            for ph in active_cards_frame.locator('div.ans-attach-ct').all():
+                            for ph in containers:
                                 try:
                                     if not ph.is_visible():
+                                        LOGGER.info('[识别] 跳过容器：不可见')
                                         continue
                                     box = ph.bounding_box()
                                     if not box or box['height'] < 10 or box['width'] < 10:
+                                        LOGGER.info(f'[识别] 跳过容器：尺寸过小 box={box}')
                                         continue
                                     html = ph.inner_html().lower()
-                                    if any(kw in html for kw in
-                                           ('video', 'audio', 'fastforward', 'insertvideo',
-                                            'pdf', 'ppt', 'doc', 'preview')):
-                                        valid_jobs.append(ph)
-                                except Exception:
-                                    pass
+                                    matched = [kw for kw in
+                                               ('video', 'audio', 'fastforward', 'insertvideo',
+                                                'pdf', 'ppt', 'doc', 'preview') if kw in html]
+                                    if not matched:
+                                        LOGGER.info('[识别] 跳过容器：未见媒体关键字 '
+                                                    f'html={" ".join(html.split())[:200]}')
+                                        continue
+                                    LOGGER.info(f'[识别] 接受容器 命中={matched} '
+                                                f'size=({int(box["width"])}x{int(box["height"])})')
+                                    valid_jobs.append(ph)
+                                except Exception as ex:
+                                    LOGGER.info(f'[识别] 容器检查异常: {ex}')
 
                             if not valid_jobs:
-                                self.log('      [系统] 当前卡片无音视频/文档任务。')
+                                self.log('      [系统] 当前卡片无音视频/文档任务。（可点「诊断页面」查看命中详情）')
                                 self.update_task_perception(0, 0)
+                                LOGGER.info('[识别] 未识别到任务容器，自动输出页面诊断：')
+                                diagnose_page(target_page, self.log)
                             else:
                                 v_count = sum(1 for ph in valid_jobs
                                               if any(k in ph.inner_html().lower() for k in
@@ -1345,6 +1557,10 @@ class AppConsole:
 
 
 if __name__ == '__main__':
+    if '--diagnose' in sys.argv:
+        run_diagnose_cli()
+        sys.exit(0)
+    LOGGER.info(f'===== 启动 学习助理·纯刷课 v{APP_VERSION} (日志: {os.path.join(LOG_DIR, "learn_helper.log")}) =====')
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
