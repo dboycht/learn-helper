@@ -45,6 +45,12 @@ from tkinter import ttk, messagebox, scrolledtext
 
 APP_VERSION = '1.0.1'
 SCHOOL_ID = 'nuaa'
+
+# 账户信息（1.0.1 先写死；1.0.2 接后端时置 USE_STATIC_ACCOUNT=False）
+USE_STATIC_ACCOUNT = True
+DEFAULT_CARD_KEY = 'admin'
+DEFAULT_BALANCE = 9999
+
 BROWSER_EXE = 'msedge.exe'
 BROWSER_PATHS = [
     'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe',
@@ -627,9 +633,10 @@ class AppConsole:
                                 highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER,
                                 highlightcolor=self.COLOR_PRIMARY, insertbackground=self.COLOR_PRIMARY)
         self.ent_key.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=5, ipady=3)
+        self.ent_key.insert(0, DEFAULT_CARD_KEY)
         self.ent_key.bind('<Return>', lambda e: self.query_points())
         self.ent_key.bind('<FocusOut>', lambda e: self.query_points())
-        self.lbl_points = tk.Label(row1, text='点数余额: --', font=('Segoe UI', 9, 'bold'),
+        self.lbl_points = tk.Label(row1, text=f'账户余额: {DEFAULT_BALANCE}', font=('Segoe UI', 9, 'bold'),
                                    bg=self.COLOR_CARD_BG, fg=self.COLOR_PRIMARY)
         self.lbl_points.pack(side=tk.RIGHT, padx=(0, 15))
 
@@ -795,10 +802,14 @@ class AppConsole:
 
     # ---------------- 远端调用（自建后端） ----------------
     def query_points(self):
+        # 1.0.1：账户信息先写死，不访问后端
+        if USE_STATIC_ACCOUNT:
+            self.lbl_points.configure(text=f'账户余额: {DEFAULT_BALANCE}')
+            return None
         card_key = self.ent_key.get().strip()
         if not card_key:
             # 允许匿名/本地模式：无卡密时也放行启动
-            self.lbl_points.configure(text='点数余额: --')
+            self.lbl_points.configure(text='账户余额: --')
             self.root.after(0, self.check_server_version)
             return None
 
@@ -809,12 +820,12 @@ class AppConsole:
                     timeout=5)
                 if res.status_code == 200:
                     pts = res.json().get('points')
-                    self.root.after(0, lambda: self.lbl_points.configure(text=f'点数余额: {pts}'))
+                    self.root.after(0, lambda: self.lbl_points.configure(text=f'账户余额: {pts}'))
                 else:
-                    detail = res.json().get('detail', '无法获取点数')
-                    self.root.after(0, lambda d=detail: self.lbl_points.configure(text=f'点数: {d}'))
+                    detail = res.json().get('detail', '无法获取余额')
+                    self.root.after(0, lambda d=detail: self.lbl_points.configure(text=f'余额: {d}'))
             except Exception:
-                self.root.after(0, lambda: self.lbl_points.configure(text='点数: 服务未连接'))
+                self.root.after(0, lambda: self.lbl_points.configure(text='余额: 服务未连接'))
             return None
 
         import threading
@@ -841,6 +852,9 @@ class AppConsole:
 
     def deduct_video_heartbeat(self):
         """累计播放满 600 秒触发一次，向后端报心跳。"""
+        if USE_STATIC_ACCOUNT:
+            self.log('      [看课心跳] 已累计看课满 10 分钟（本地模式，未上报后端）。')
+            return None
         card_key = self.ent_key.get().strip()
 
         def run():
@@ -851,7 +865,7 @@ class AppConsole:
                 if res.status_code == 200:
                     pts = res.json().get('remaining_points')
                     if pts is not None:
-                        self.root.after(0, lambda: self.lbl_points.configure(text=f'点数余额: {pts}'))
+                        self.root.after(0, lambda: self.lbl_points.configure(text=f'账户余额: {pts}'))
                     self.log(f'      [看课心跳] 已累计看课满 10 分钟，后端余额: {pts}')
                 elif res.status_code == 402:
                     self.log('      [看课心跳] 后端返回点数耗尽，正在终止...')
