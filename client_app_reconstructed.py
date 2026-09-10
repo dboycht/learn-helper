@@ -18,7 +18,7 @@ from tkinter import ttk, messagebox, scrolledtext
 from playwright.sync_api import sync_playwright
 from concurrent.futures import ThreadPoolExecutor
 import io
-import urllib.request as urllib
+import urllib.request
 
 urllib.request.getproxies = lambda: {}
 
