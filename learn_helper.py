@@ -18,6 +18,7 @@
 """
 
 import base64
+import io
 import json
 import os
 import re
@@ -953,6 +954,174 @@ def solve_question(image_bytes, q_type, num_blanks, text_source, mode, cfg=None)
 
 
 # ----------------------------------------------------------------------------
+# 「测试图片」自检：题目图片在内存里合成，不依赖任何外部素材
+#   点一下按钮 → 生成 3 张内置测试题图片 → 逐张 POST /solve → 报告
+#   "接口通不通 / 模型认不认得 / 答案对不对"（三种结果分开报，便于定位问题）
+# ----------------------------------------------------------------------------
+TEST_CASES = (
+    {
+        'name': '单选题',
+        'question_type': 'choice',
+        'num_blanks': 4,
+        'zh': {'stem': '中国的首都是哪座城市？',
+               'choices': ['A. 上海', 'B. 北京', 'C. 广州', 'D. 深圳']},
+        'ascii': {'stem': 'Which city is the capital of China?',
+                  'choices': ['A. Shanghai', 'B. Beijing', 'C. Guangzhou', 'D. Shenzhen']},
+        'expect_key': 'B',
+    },
+    {
+        'name': '多选题',
+        'question_type': 'multi_choice',
+        'num_blanks': 4,
+        'zh': {'stem': '下列哪些属于哺乳动物？（多选）',
+               'choices': ['A. 鲸鱼', 'B. 鲨鱼', 'C. 蝙蝠', 'D. 鳄鱼']},
+        'ascii': {'stem': 'Which of these are mammals? (select all)',
+                  'choices': ['A. Whale', 'B. Shark', 'C. Bat', 'D. Crocodile']},
+        'expect_key': 'AC',
+    },
+    {
+        'name': '填空题',
+        'question_type': 'blank',
+        'num_blanks': 1,
+        'zh': {'stem': '填空题：一年有 ____ 个月。', 'choices': []},
+        'ascii': {'stem': 'Fill in the blank: there are ____ months in a year.',
+                  'choices': []},
+        'expect_texts_any': ('12', '十二', 'twelve'),
+    },
+)
+
+_TEST_FONT_CANDIDATES = (
+    'C:/Windows/Fonts/msyh.ttc', 'C:/Windows/Fonts/msyhbd.ttc',
+    'C:/Windows/Fonts/simhei.ttf', 'C:/Windows/Fonts/simsun.ttc',
+)
+
+
+def _test_font(size=20):
+    """找能渲染中文的字体；返回 (font, has_cjk)。找不到就退化为默认字体 + 纯英文题。"""
+    try:
+        from PIL import ImageFont
+    except Exception:
+        return None, False
+    for path in _TEST_FONT_CANDIDATES:
+        try:
+            if os.path.exists(path):
+                return ImageFont.truetype(path, size), True
+        except Exception:
+            pass
+    try:
+        return ImageFont.load_default(), False
+    except Exception:
+        return None, False
+
+
+def build_test_question_image(case):
+    """把内置测试题渲染成 PNG 字节（模拟真实题目截图）。
+
+    返回 (png_bytes, text_source, used_cjk)；无中文字体时自动改用英文题面。
+    """
+    try:
+        from PIL import Image, ImageDraw
+    except Exception as e:
+        raise RuntimeError(f'缺少 Pillow，无法生成测试图片（pip install pillow）：{e}')
+    font, has_cjk = _test_font(20)
+    body = case['zh'] if has_cjk else case['ascii']
+    stem = body['stem']
+    choices = list(body.get('choices') or [])
+    text_source = (stem + ' ' + ' '.join(choices)).strip()
+
+    width = 840
+    height = 110 + 38 * max(1, len(choices))
+    img = Image.new('RGB', (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    draw.text((18, 18), '1. ' + stem, font=font, fill=(0, 0, 0))
+    y = 66
+    for choice in choices:
+        draw.text((42, y), choice, font=font, fill=(0, 0, 0))
+        y += 38
+    draw.rectangle([0, 0, width - 1, height - 1], outline=(190, 195, 205), width=2)
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    return buf.getvalue(), text_source, has_cjk
+
+
+def _grade_case(case, ans):
+    """判定单题结果，返回 (ok, got_text, verdict)。verdict: pass | mismatch | empty。"""
+    got = ans.get('answer_key') or ' / '.join(ans.get('text_answers') or []) or ''
+    got = str(got).strip()
+    if not got:
+        return False, got, 'empty'
+    if case.get('expect_key'):
+        want = set(str(case['expect_key']).upper())
+        good = set(got.upper()) == want
+        return good, got, ('pass' if good else 'mismatch')
+    low = got.lower()
+    good = any(str(k).lower() in low for k in (case.get('expect_texts_any') or ()))
+    return good, got, ('pass' if good else 'mismatch')
+
+
+def run_solve_self_test(timeout=None, retry=1):
+    """用内置测试图跑一遍当前「内部答题 API」，逐题给出结论。
+
+    返回 (ok_all, lines, results)；纯网络调用，界面侧请放到后台线程执行。
+    """
+    acfg = get_answer_cfg()
+    limit = acfg['solver_timeout'] if timeout is None else int(timeout)
+    limit = max(10, min(limit, 120))          # 自检不必等满 240s
+    lines, results = [], []
+    for case in TEST_CASES:
+        try:
+            image, text_source, _has_cjk = build_test_question_image(case)
+        except Exception as e:
+            results.append({'name': case['name'], 'ok': False, 'verdict': 'build_fail',
+                            'got': '', 'ms': 0, 'detail': str(e)})
+            lines.append(f'✗ {case["name"]}：测试图生成失败 — {e}')
+            continue
+        t0 = time.time()
+        try:
+            ans = solve_with_server(image, case['question_type'], case['num_blanks'],
+                                    text_source, timeout=limit, retry=retry)
+        except Exception as e:
+            ms = int((time.time() - t0) * 1000)
+            results.append({'name': case['name'], 'ok': False, 'verdict': 'request_fail',
+                            'got': '', 'ms': ms, 'detail': str(e)})
+            lines.append(f'✗ {case["name"]}：请求失败（{ms} ms）— {e}')
+            continue
+        ms = int((time.time() - t0) * 1000)
+        ok, got, verdict = _grade_case(case, ans)
+        want = case.get('expect_key') or '/'.join(case.get('expect_texts_any') or ())
+        tags = []
+        if ans.get('cached'):
+            tags.append('后端缓存命中')
+        if ans.get('hash_id'):
+            tags.append(f'hash_id={ans["hash_id"]}')
+        suffix = f'（{ms} ms' + ('，' + '，'.join(tags) if tags else '') + '）'
+        if verdict == 'empty':
+            lines.append(f'⚠ {case["name"]}：接口通了，但没返回可用的答案{suffix}')
+        elif ok:
+            lines.append(f'✓ {case["name"]}：识别正确，返回 {got}（期望 {want}）{suffix}')
+        else:
+            lines.append(f'⚠ {case["name"]}：接口正常但答案不符，返回 {got}（期望 {want}）{suffix}')
+        results.append({'name': case['name'], 'ok': ok, 'verdict': verdict,
+                        'got': got, 'ms': ms, 'detail': ''})
+    return (bool(results) and all(r['ok'] for r in results)), lines, results
+
+
+def summarize_self_test(results):
+    """把自检结果汇成一句话：区分"接口不通"和"接口通但答得不对"。"""
+    total = len(results)
+    if not total:
+        return '自检未执行'
+    passed = sum(1 for r in results if r['ok'])
+    reached = sum(1 for r in results if r['verdict'] in ('pass', 'mismatch', 'empty'))
+    if reached == 0:
+        return f'自检失败 ✗：{total} 题全部请求失败（接口或地址不可用）'
+    if passed == total:
+        return f'自检通过 ✓：{passed}/{total} 题识别正确'
+    return (f'自检部分通过 ⚠：{passed}/{total} 题识别正确；'
+            f'另有 {reached - passed} 题接口返回正常但答案不符或为空')
+
+
+# ----------------------------------------------------------------------------
 # 并发工具：用**守护线程**实现，不用 ThreadPoolExecutor
 #   ThreadPoolExecutor 的工作线程是非守护的，解释器退出时会 join 它们；
 #   退出时若有在途 /solve 请求（最长 solver_timeout 秒）就会卡住进程，
@@ -1831,7 +2000,7 @@ class AppConsole:
 
         win = tk.Toplevel(self.root)
         win.title(f'答题中心 · learn-helper v{APP_VERSION}')
-        win.geometry('720x600')
+        win.geometry('740x700')
         win.resizable(False, False)
         win.configure(bg=self.COLOR_BG)
 
@@ -1931,10 +2100,113 @@ class AppConsole:
                               activebackground=self.COLOR_PRIMARY_DARK)
         btn_probe.pack(side=tk.LEFT, ipady=3, padx=(0, 10))
         self.bind_hover(btn_probe, self.COLOR_PRIMARY_DARK, self.COLOR_PRIMARY)
-        lbl_probe = tk.Label(tab_api, text='尚未测试。点「测试连接」会请求后端 /check_version，确认地址可达。',
+        btn_imgtest = tk.Button(row_test, text='测试图片', bg='#2E7D32', fg='white',
+                                font=('Microsoft YaHei', 9, 'bold'), relief=tk.FLAT, cursor='hand2',
+                                activebackground='#1B5E20')
+        btn_imgtest.pack(side=tk.LEFT, ipady=3, padx=(0, 10))
+        self.bind_hover(btn_imgtest, '#1B5E20', '#2E7D32')
+        tk.Label(row_test, text='（合成 3 张内置测试题图片发给后端，逐题报告能否识别）',
+                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
+                 font=('Microsoft YaHei', 8)).pack(side=tk.LEFT)
+
+        lbl_probe = tk.Label(tab_api, text='尚未测试。点「测试连接」确认地址可达；点「测试图片」验证模型能否识图作答。',
                              bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8),
-                             justify='left', anchor='w', wraplength=640)
-        lbl_probe.pack(anchor='w', padx=18, pady=(8, 0))
+                             justify='left', anchor='w', wraplength=650)
+        lbl_probe.pack(anchor='w', padx=18, pady=(8, 4))
+
+        # 测试详情（等宽只读文本框，带颜色标记）
+        detail_wrap = tk.Frame(tab_api, bg=self.COLOR_BG)
+        detail_wrap.pack(fill=tk.BOTH, expand=True, padx=18, pady=(0, 8))
+        detail = tk.Text(detail_wrap, height=7, wrap='word', font=('Consolas', 9),
+                         bg='#FFFFFF', fg=self.COLOR_TEXT_MAIN, relief=tk.FLAT,
+                         highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER,
+                         state='disabled')
+        detail.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        detail.tag_configure('ok', foreground='#1E7E34')
+        detail.tag_configure('warn', foreground='#B7791F')
+        detail.tag_configure('bad', foreground='#C0392B')
+        detail.tag_configure('dim', foreground=self.COLOR_TEXT_MUTED)
+        sb = tk.Scrollbar(detail_wrap, command=detail.yview)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        detail.configure(yscrollcommand=sb.set)
+
+        def _write_detail(lines, status='', ok=True):
+            detail.configure(state='normal')
+            detail.delete('1.0', tk.END)
+            if status:
+                detail.insert(tk.END, status + '\n', ('ok' if ok else 'bad'))
+            for ln in (lines or []):
+                tag = 'ok' if ln.startswith('✓') else ('bad' if ln.startswith('✗') else (
+                    'warn' if ln.startswith('⚠') else 'dim'))
+                detail.insert(tk.END, ln + '\n', tag)
+            detail.configure(state='disabled')
+            return None
+
+        def _start_test(btn, label, task, pending):
+            """后台执行 task() -> (ok, status, detail_lines)，完成后回写界面。"""
+            btn.configure(state='disabled', text=pending)
+            lbl_probe.configure(text=pending, fg=self.COLOR_TEXT_MUTED)
+            _write_detail([], pending, True)
+
+            def worker():
+                try:
+                    ok, status, lines = task()
+                except Exception as e:
+                    ok, status, lines = False, f'测试异常：{e}', []
+
+                def done():
+                    btn.configure(state='normal', text=label)
+                    lbl_probe.configure(text=status, fg=('#1E7E34' if ok else '#C0392B'))
+                    _write_detail(lines, status, ok)
+                try:
+                    self.root.after(0, done)
+                except Exception:
+                    pass
+                return None
+
+            threading.Thread(target=worker, daemon=True).start()
+            return None
+
+        def _unsaved_guard():
+            """后端地址改了但没保存时，提示先保存（否则测的还是旧地址）。"""
+            saved = load_config().get('server_url') or ''
+            typed = v_server.get().strip().rstrip('/')
+            if typed and typed != saved:
+                return (f'后端地址已改但尚未保存\n\n请先点「保存」，再测试。\n'
+                        f'当前生效地址: {saved or get_server_url()}')
+            return None
+
+        def _task_probe():
+            guard = _unsaved_guard()
+            if guard:
+                return False, '地址未保存，未执行测试', guard.split('\n')
+            ok, msg = probe_backend()
+            lines = [ln for ln in msg.split('\n') if ln.strip()]
+            return ok, ('连接成功 ✓' if ok else '连接失败 ✗'), lines
+
+        def _task_image():
+            if get_answer_cfg()['mode'] != 'server':
+                return (False, '当前答题方式不是「内部答题 API」',
+                        ['请先到「答题方式」页选择「内部答题 API」，再回来测试图片。'])
+            guard = _unsaved_guard()
+            if guard:
+                return False, '地址未保存，未执行测试', guard.split('\n')
+            _ok, lines, results = run_solve_self_test()
+            status = summarize_self_test(results)
+            lines = list(lines)
+            lines.append(f'后端: {get_server_url()}')
+            lines.append('说明：✗=接口/网络失败，⚠=接口通但答案不符或为空，✓=识别正确。')
+            return status.startswith('自检通过'), status, lines
+
+        btn_probe.configure(command=lambda: _start_test(btn_probe, '测试连接', _task_probe, '测试中…'))
+        btn_imgtest.configure(command=lambda: _start_test(btn_imgtest, '测试图片', _task_image,
+                                                          '识别中…'))
+        _write_detail(['点「测试图片」会合成下面 3 道题并发给后端 /solve：',
+                       '  · 单选题：中国的首都是哪座城市？ → 期望 B',
+                       '  · 多选题：下列哪些属于哺乳动物？（多选）→ 期望 AC',
+                       '  · 填空题：一年有 ____ 个月。→ 期望 12',
+                       '结果显示具体返回内容与耗时，便于判断是"接口不通"还是"识图不准"。'],
+                      '尚未测试', True)
 
         # ================= 页签 3：自配大模型 =================
         tab_llm = tk.Frame(nb, bg=self.COLOR_BG)
@@ -2021,14 +2293,6 @@ class AppConsole:
             threading.Thread(target=worker, daemon=True).start()
             return None
 
-        def _test_api():
-            saved = load_config().get('server_url') or ''
-            typed = v_server.get().strip().rstrip('/')
-            if typed and typed != saved:
-                return False, (f'后端地址已改但尚未保存。\n请先点「保存」，再测试连接。\n\n'
-                               f'（当前生效地址: {saved or get_server_url()}）')
-            return probe_backend()
-
         def _test_llm():
             base = v_url.get().strip().rstrip('/')
             key = v_key.get().strip()
@@ -2049,7 +2313,6 @@ class AppConsole:
                 return True, f'连接成功 ✓  模型：{model}'
             return False, f'HTTP {r.status_code}：{r.text[:200]}'
 
-        btn_probe.configure(command=lambda: _probe_thread(_test_api, btn_probe, lbl_probe, '测试中…'))
         btn_llm_test.configure(command=lambda: _probe_thread(_test_llm, btn_llm_test, lbl_llm_test, '测试中…'))
 
         tk.Button(btns, text='保存', command=_save, bg=self.COLOR_PRIMARY_DARK, fg='white',
