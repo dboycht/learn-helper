@@ -300,6 +300,39 @@ def kill_and_launch_browser():
         return (False, None)
 
 
+def collect_page_labels(context, attempts=10, interval=0.6):
+    """读取沙盒浏览器里的标签页标题，返回 (labels, used_url_fallback)。
+
+    冷启动（浏览器刚被拉起）时 Edge 的标签页还在恢复/加载，`pg.title()` 可能暂时为空，
+    旧实现会直接当成"没有标签页"并提示用户手动打开学习页。这里改为轮询等待标题，
+    等满 attempts 次仍没有标题，才退回用 URL 兜底（至少界面能选到那个页面）。
+    """
+    titles, urls = [], []
+    for _ in range(max(1, int(attempts))):
+        titles, urls = [], []
+        try:
+            pages = list(context.pages)
+        except Exception:
+            pages = []
+        for pg in pages:
+            try:
+                url = (pg.url or '').strip()
+                if not url or url == 'about:blank':
+                    continue
+                if url not in urls:
+                    urls.append(url)
+                title = (pg.title() or '').strip()
+                if title and title not in ('New Tab', '新建标签页', 'about:blank') \
+                        and title not in titles:
+                    titles.append(title)
+            except Exception:
+                pass
+        if titles:
+            return titles, False
+        time.sleep(interval)
+    return (titles or urls), (not titles and bool(urls))
+
+
 def get_device_id():
     """基于机器指纹的稳定设备标识（供后端限设备）。"""
     try:
@@ -1888,14 +1921,9 @@ class AppConsole:
                         if not context.pages:
                             context.new_page()
                             time.sleep(0.5)
-                        pages_list = []
-                        for pg in context.pages:
-                            try:
-                                title = pg.title()
-                                if title and title.strip():
-                                    pages_list.append(title.strip())
-                            except Exception:
-                                pass
+                        pages_list, used_url = collect_page_labels(context)
+                        if used_url:
+                            LOGGER.info('[系统] 标签页标题尚未就绪，改用 URL 占位')
                         browser.close()
                         self.root.after(0, lambda: self.update_pages_dropdown_silent(pages_list))
                 except Exception:
@@ -1924,14 +1952,7 @@ class AppConsole:
                     if not context.pages:
                         context.new_page()
                         time.sleep(0.5)
-                    pages_list = []
-                    for pg in context.pages:
-                        try:
-                            title = pg.title()
-                            if title and title.strip():
-                                pages_list.append(title.strip())
-                        except Exception:
-                            pass
+                    pages_list, _used_url = collect_page_labels(context, attempts=6)
                     browser.close()
                     self.root.after(0, lambda: self.update_pages_dropdown(pages_list))
             except Exception as ex:
