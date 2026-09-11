@@ -795,13 +795,14 @@ SOLVE_PROMPT = (
 )
 
 
-def solve_with_llm(image_bytes, q_type, num_blanks, text_source, timeout=180):
+def solve_with_llm(image_bytes, q_type, num_blanks, text_source, timeout=180, llm_cfg=None):
     """把题目截图 + 题干发给自己配置的大模型（OpenAI 兼容接口），返回结果 dict。
 
     图片以 `image_url` 的 data URL 形式放进 user 消息的 content 数组，
     并带 `detail: "high"`（保留原分辨率）—— 题目截图字小且密，低分辨率会看错。
+    `llm_cfg` 用于界面「测试」按钮直接测输入框里当前填的值（可不保存）。
     """
-    cfg = get_llm_cfg()
+    cfg = llm_cfg or get_llm_cfg()
     if not cfg['api_key']:
         raise ValueError('未配置大模型 API Key，请点击「答题设置」→「自配大模型」填写 Base URL / API Key / 模型名')
     base = cfg['base_url'].rstrip('/')
@@ -916,16 +917,17 @@ def _post_json(url, payload, timeout):
 
 
 def solve_with_server(image_bytes, q_type, num_blanks, text_source,
-                      timeout=None, retry=None, device_id=None):
+                      timeout=None, retry=None, device_id=None, base=None):
     """向自建后端答题模型请求单题答案（内部答题 API）。
 
     返回 {'question_type','answer_key','text_answers','hash_id','cached'}。
     只重试网络抖动与 5xx；退出过程中（SHUTDOWN 置位）不再发起新请求。
+    `base` 用于界面「测试」按钮**直接测输入框里当前填的地址**（可不保存）。
     """
     cfg = get_answer_cfg()
     timeout = timeout or cfg['solver_timeout']
     retry = cfg['retry'] if retry is None else retry
-    base = get_server_url()
+    base = (base or get_server_url()).rstrip('/')
     payload = {
         'image': base64.b64encode(image_bytes).decode(),
         'question_type': q_type,
@@ -957,9 +959,12 @@ def solve_with_server(image_bytes, q_type, num_blanks, text_source,
     raise RuntimeError(f'内部答题接口连续 {retry + 1} 次失败：{last_err}')
 
 
-def probe_backend(timeout=8):
-    """「测试连接」用：探活自建后端（GET /check_version）。返回 (ok, message)。"""
-    base = get_server_url()
+def probe_backend(timeout=8, base=None):
+    """「测试连接」用：探活自建后端（GET /check_version）。返回 (ok, message)。
+
+    `base` 用于直接测界面输入框里当前填的地址（可不保存）。
+    """
+    base = (base or get_server_url()).rstrip('/')
     try:
         res = requests.get(f'{base}/check_version',
                            params={'ver': APP_VERSION, 'school_id': SCHOOL_ID},
@@ -1099,10 +1104,11 @@ def _grade_case(case, ans):
     return good, got, ('pass' if good else 'mismatch')
 
 
-def run_solve_self_test(mode='server', timeout=None, retry=1):
+def run_solve_self_test(mode='server', timeout=None, retry=1, base=None, llm_cfg=None):
     """用内置测试图跑一遍指定通道（server=内部答题 API / llm=自配大模型），逐题给出结论。
 
     返回 (ok_all, lines, results)；纯网络调用，界面侧请放到后台线程执行。
+    `base` / `llm_cfg` 让界面「测试图片」直接测当前填写的值，无需先保存。
     """
     acfg = get_answer_cfg()
     limit = acfg['solver_timeout'] if timeout is None else int(timeout)
@@ -1121,10 +1127,10 @@ def run_solve_self_test(mode='server', timeout=None, retry=1):
         try:
             if mode == 'server':
                 ans = solve_with_server(image, case['question_type'], case['num_blanks'],
-                                        text_source, timeout=limit, retry=retry)
+                                        text_source, timeout=limit, retry=retry, base=base)
             else:
                 ans = solve_with_llm(image, case['question_type'], case['num_blanks'],
-                                     text_source, timeout=limit)
+                                     text_source, timeout=limit, llm_cfg=llm_cfg)
         except Exception as e:
             ms = int((time.time() - t0) * 1000)
             results.append({'name': case['name'], 'ok': False, 'verdict': 'request_fail',
@@ -2312,82 +2318,87 @@ class AppConsole:
             threading.Thread(target=worker, daemon=True).start()
             return None
 
-        def _unsaved_guard():
-            """后端地址改了但没保存时，提示先保存（否则测的还是旧地址）。"""
-            saved = load_config().get('server_url') or ''
-            typed = v_server.get().strip().rstrip('/')
-            if typed and typed != saved:
-                return (f'后端地址已改但尚未保存\n\n请先点「保存」，再测试。\n'
-                        f'当前生效地址: {saved or get_server_url()}')
+        def _unsaved_note(changed):
+            """改了但没保存时的提示行（**不阻止测试**：测的就是当前填的值）。"""
+            if changed:
+                return ('⚠ 本次测试用的是输入框里当前填的值（尚未保存）；'
+                        '要让答题/刷课也用它，记得点「保存」。')
             return None
 
         def _task_probe():
-            guard = _unsaved_guard()
-            if guard:
-                return False, '地址未保存，未执行测试', guard.split('\n')
-            ok, msg = probe_backend()
+            typed = v_server.get().strip().rstrip('/')
+            saved = (load_config().get('server_url') or '').rstrip('/')
+            ok, msg = probe_backend(base=typed or None)
             lines = [ln for ln in msg.split('\n') if ln.strip()]
+            note = _unsaved_note(bool(typed) and typed != saved)
+            if note:
+                lines.append(note)
             return ok, ('连接成功 ✓' if ok else '连接失败 ✗'), lines
 
         def _task_image():
-            guard = _unsaved_guard()
-            if guard:
-                return False, '地址未保存，未执行测试', guard.split('\n')
-            ok, lines, results = run_solve_self_test(mode='server')
+            typed = v_server.get().strip().rstrip('/')
+            saved = (load_config().get('server_url') or '').rstrip('/')
+            ok, lines, results = run_solve_self_test(mode='server', base=typed or None)
             status = summarize_self_test(results)
             lines = list(lines)
-            lines.append(f'后端: {get_server_url()}')
+            lines.append(f'后端: {typed or get_server_url()}')
+            note = _unsaved_note(bool(typed) and typed != saved)
+            if note:
+                lines.append(note)
+            if get_answer_cfg()['mode'] != 'server':
+                lines.append('提示：当前「答题方式」不是内部答题 API，刷课时不会走这个通道。')
             lines.append('说明：✗=接口/网络失败，⚠=接口通但答案不符或为空，✓=识别正确。')
             return ok, status, lines
 
-        def _llm_guard():
-            """自配大模型的三个字段改了但没保存时，提示先保存（自检读的是 config.json）。"""
-            saved = get_llm_cfg()
-            typed_url = v_url.get().strip().rstrip('/')
-            typed_model = v_model.get().strip()
-            if not typed_url or not typed_model:
-                return '请先填写 Base URL 与模型名。'
-            if typed_url != (saved['base_url'] or '').rstrip('/') or typed_model != (saved['model'] or ''):
-                return (f'大模型设置已改但尚未保存\n\n请先点「保存」，再测试。\n'
-                        f'当前生效: {saved["base_url"]} / {saved["model"]}')
-            return None
+        def _llm_typed():
+            """取输入框当前填的三个值（统一去空格，base 去尾斜杠）。"""
+            return {
+                'base_url': v_url.get().strip().rstrip('/'),
+                'api_key': v_key.get().strip(),
+                'model': v_model.get().strip(),
+            }
+
+        def _llm_changed():
+            typed, saved = _llm_typed(), get_llm_cfg()
+            return (typed['base_url'] != (saved['base_url'] or '').rstrip('/')
+                    or typed['api_key'] != (saved['api_key'] or '')
+                    or typed['model'] != (saved['model'] or ''))
 
         def _task_llm_probe():
-            guard = _llm_guard()
-            if guard:
-                return False, '设置未保存，未执行测试', guard.split('\n')
-            cfg_now = get_llm_cfg()
-            key = v_key.get().strip()
-            if not key:
-                return False, '未填写 API Key', ['请填写 API Key 并保存后再测试。']
+            typed = _llm_typed()
+            if not typed['base_url'] or not typed['api_key'] or not typed['model']:
+                return False, '请先填写 Base URL / API Key / 模型名', ['三项都填好后再测。']
             try:
-                r = requests.post(f'{cfg_now["base_url"]}/chat/completions',
-                                  headers={'Authorization': f'Bearer {key}',
+                r = requests.post(f'{typed["base_url"]}/chat/completions',
+                                  headers={'Authorization': f'Bearer {typed["api_key"]}',
                                            'Content-Type': 'application/json'},
-                                  json={'model': cfg_now['model'],
+                                  json={'model': typed['model'],
                                         'messages': [{'role': 'user', 'content': '回复 OK 即可'}],
                                         'max_tokens': 16},
                                   timeout=30)
             except Exception as e:
-                return False, f'连接失败：{e}', [f'POST {cfg_now["base_url"]}/chat/completions',
+                return False, f'连接失败：{e}', [f'POST {typed["base_url"]}/chat/completions',
                                                 f'错误: {e}']
+            lines = [f'地址: {typed["base_url"]}', f'模型: {typed["model"]}',
+                     '⚠ 这一步只发纯文本，**不能**证明该模型能读图片 —— 请点「测试图片」。']
+            note = _unsaved_note(_llm_changed())
+            if note:
+                lines.append(note)
             if r.status_code == 200:
-                return True, f'连接成功 ✓ 模型: {cfg_now["model"]}', [
-                    f'地址: {cfg_now["base_url"]}', f'模型: {cfg_now["model"]}',
-                    '⚠ 这一步只发纯文本，**不能**证明该模型能读图片 —— 请点「测试图片」。']
-            return False, f'HTTP {r.status_code}', [(r.text or '')[:300]]
+                return True, f'连接成功 ✓ 模型: {typed["model"]}', lines
+            return False, f'HTTP {r.status_code}', lines + [(r.text or '')[:300]]
 
         def _task_llm_image():
-            guard = _llm_guard()
-            if guard:
-                return False, '设置未保存，未执行测试', guard.split('\n')
-            cfg_now = get_llm_cfg()
-            if not cfg_now['api_key']:
-                return False, '未配置 API Key', ['请先在「自配大模型」页填写并保存。']
-            ok, lines, results = run_solve_self_test(mode='llm')
+            typed = _llm_typed()
+            if not typed['base_url'] or not typed['api_key'] or not typed['model']:
+                return False, '请先填写 Base URL / API Key / 模型名', ['三项都填好后再测。']
+            ok, lines, results = run_solve_self_test(mode='llm', llm_cfg=typed)
             status = summarize_self_test(results)
             lines = list(lines)
-            lines.append(f'接口: {cfg_now["base_url"]}   模型: {cfg_now["model"]}')
+            lines.append(f'接口: {typed["base_url"]}   模型: {typed["model"]}')
+            note = _unsaved_note(_llm_changed())
+            if note:
+                lines.append(note)
             if get_answer_cfg()['mode'] != 'llm':
                 lines.append('提示：当前「答题方式」不是自配大模型，刷课时不会走这个通道。')
             lines.append('说明：✗=接口/网络失败，⚠=接口通但答案不符或为空，✓=识别正确。')
