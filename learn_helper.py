@@ -12,8 +12,10 @@
 - 远端地址优先级：环境变量 LH_SERVER_URL > 同目录 config.json 的 server_url > 默认 127.0.0.1:8000。
 """
 
+import base64
 import json
 import os
+import re
 import sys
 import subprocess
 import time
@@ -43,10 +45,10 @@ except Exception as _imp_err:
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
-APP_VERSION = '1.0.1'
+APP_VERSION = '1.0.2'
 SCHOOL_ID = 'nuaa'
 
-# 账户信息（1.0.1 先写死；1.0.2 接后端时置 USE_STATIC_ACCOUNT=False）
+# 账户信息（先写死；接自建后端时置 USE_STATIC_ACCOUNT=False）
 USE_STATIC_ACCOUNT = True
 DEFAULT_CARD_KEY = 'admin'
 DEFAULT_BALANCE = 9999
@@ -554,6 +556,491 @@ def robust_wait_for_tasks_to_render(page, check_func, timeout=8000):
 
 
 # ----------------------------------------------------------------------------
+# 1.0.2 答题（直连自配大模型）：题目识别 / 截图 / 求解 / 填涂 / 提交
+# ----------------------------------------------------------------------------
+CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
+
+DEFAULT_LLM = {
+    'base_url': 'https://api.openai.com/v1',
+    'api_key': '',
+    'model': 'gpt-4o',
+}
+
+
+def load_config():
+    try:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def save_config(cfg):
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        LOGGER.error(f'保存 config.json 失败: {e}')
+
+
+def get_llm_cfg():
+    cfg = load_config().get('llm', {}) or {}
+    return {
+        'base_url': cfg.get('base_url') or DEFAULT_LLM['base_url'],
+        'api_key': cfg.get('api_key') or '',
+        'model': cfg.get('model') or DEFAULT_LLM['model'],
+    }
+
+
+# 填空/简答答案注入脚本（UEditor / textarea / iframe / input / contenteditable 多轨写入）
+FILL_TEXT_SCRIPT = '''
+
+(element, answers) => {
+    let filled_count = 0;
+    if (!answers || answers.length === 0) return filled_count;
+    let blankContainers = Array.from(element.querySelectorAll('.blankItemDiv'));
+    if (blankContainers.length === 0) {
+        let allInputs = Array.from(element.querySelectorAll('textarea[id^="answer"], textarea, input[type="text"], input.blank_input, div[contenteditable="true"]'));
+        blankContainers = allInputs.length > 0 ? allInputs : [element];
+    }
+    function fillSingle(container, text) {
+        if (!container || text === undefined || text === null) return false;
+        let success = false;
+        let cleanText = String(text);
+        let textareas = Array.from(container.querySelectorAll ? container.querySelectorAll('textarea[id^="answer"], textarea') : []);
+        if (container.tagName === 'TEXTAREA') textareas.push(container);
+        for (let ta of textareas) {
+            let taId = ta.id;
+            if (window.UE) {
+                try {
+                    if (taId && window.UE.getEditor) { let ed = window.UE.getEditor(taId); if (ed && ed.setContent) { ed.setContent(cleanText); success = true; } }
+                } catch(e) {}
+                if (!success && window.UE.instants) {
+                    for (let key in window.UE.instants) {
+                        let inst = window.UE.instants[key];
+                        if (inst && (inst.key === taId || inst.textarea === ta || (taId && inst.key && inst.key.includes(taId)))) {
+                            try { inst.setContent(cleanText); success = true; break; } catch(e) {}
+                        }
+                    }
+                }
+            }
+            try {
+                ta.value = cleanText;
+                ta.dispatchEvent(new Event('input', { bubbles: true }));
+                ta.dispatchEvent(new Event('change', { bubbles: true }));
+                ta.dispatchEvent(new Event('blur', { bubbles: true }));
+                success = true;
+            } catch(e) {}
+        }
+        let iframes = Array.from(container.querySelectorAll ? container.querySelectorAll('iframe[id^="ueditor_"], iframe') : []);
+        if (container.tagName === 'IFRAME') iframes.push(container);
+        for (let ifr of iframes) {
+            try {
+                let doc = ifr.contentDocument || (ifr.contentWindow ? ifr.contentWindow.document : null);
+                if (doc && doc.body) {
+                    doc.body.innerHTML = '<p>' + cleanText.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</p>';
+                    doc.body.dispatchEvent(new Event('input', { bubbles: true }));
+                    doc.body.dispatchEvent(new Event('change', { bubbles: true }));
+                    success = true;
+                }
+            } catch(e) {}
+        }
+        let inputs = Array.from(container.querySelectorAll ? container.querySelectorAll('input[type="text"], input.blank_input, input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"])') : []);
+        if (container.tagName === 'INPUT' && container.type !== 'hidden' && container.type !== 'radio' && container.type !== 'checkbox') inputs.push(container);
+        for (let ipt of inputs) {
+            try { ipt.focus(); ipt.value = cleanText; ipt.dispatchEvent(new Event('input', { bubbles: true })); ipt.dispatchEvent(new Event('change', { bubbles: true })); ipt.dispatchEvent(new Event('blur', { bubbles: true })); success = true; } catch(e) {}
+        }
+        let editables = Array.from(container.querySelectorAll ? container.querySelectorAll('div[contenteditable="true"]') : []);
+        if (container.getAttribute && container.getAttribute('contenteditable') === 'true') editables.push(container);
+        for (let ed of editables) {
+            try { ed.focus(); ed.innerText = cleanText; ed.dispatchEvent(new Event('input', { bubbles: true })); ed.dispatchEvent(new Event('change', { bubbles: true })); ed.dispatchEvent(new Event('blur', { bubbles: true })); success = true; } catch(e) {}
+        }
+        return success;
+    }
+    for (let i = 0; i < answers.length; i++) {
+        if (i < blankContainers.length && fillSingle(blankContainers[i], answers[i])) filled_count++;
+    }
+    if (filled_count === 0 && answers.length > 0 && fillSingle(element, answers[0])) filled_count++;
+    return filled_count;
+}
+
+'''
+
+
+SOLVE_PROMPT = (
+    '你是一名网课答题助手。请根据附带的题目截图作答。\n'
+    '题目类型 {question_type}（choice=单选, multi_choice=多选, blank=填空, essay=简答）。\n'
+    '题干文本：{text_source}\n'
+    '数量信息：{num_info}（值 0 表示未知）\n'
+    '请只输出一个 JSON 对象，禁止任何多余文字：\n'
+    '{{"question_type": "{question_type}", '
+    '"answer_key": "选择/多选答案为A-F大写字母组合，例如 A 或 ACD；填空/简答填空留空", '
+    '"text_answers": ["填空/简答答案数组，填将按顺序填入各空，简答放一个元素"]}}\n'
+    '规则：choice/multi_choice 必须给出 answer_key；blank 的 text_answers 长度等于填空个数；essay 的 '
+    'text_answers 为一个元素。无法确定时给出你的最佳判断。'
+)
+
+
+def solve_with_llm(image_bytes, q_type, num_blanks, text_source):
+    """把题目截图 + 题干发给自己配置的大模型（OpenAI 兼容接口），返回结果 dict。"""
+    cfg = get_llm_cfg()
+    if not cfg['api_key']:
+        raise ValueError('未配置大模型 API Key，请点击「模型设置」填写 Base URL / API Key / 模型名')
+    base = cfg['base_url'].rstrip('/')
+    b64 = base64.b64encode(image_bytes).decode()
+    num_info = f'填空数/选项数: {num_blanks}' if (q_type in ('blank', 'essay')) else f'选项数: {num_blanks}'
+    prompt = SOLVE_PROMPT.format(question_type=q_type, text_source=text_source or '(无题干)',
+                                 num_info=num_info)
+    headers = {
+        'Authorization': f'Bearer {cfg["api_key"]}',
+        'Content-Type': 'application/json',
+    }
+    payload = {
+        'model': cfg['model'],
+        'messages': [{
+            'role': 'user',
+            'content': [
+                {'type': 'text', 'text': prompt},
+                {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
+            ],
+        }],
+        'temperature': 0.1,
+    }
+    LOGGER.info(f'[LLM] 调用 {base}/chat/completions model={cfg["model"]} q_type={q_type}')
+    res = requests.post(f'{base}/chat/completions', json=payload, headers=headers, timeout=180)
+    if res.status_code != 200:
+        raise RuntimeError(f'大模型返回 {res.status_code}: {res.text[:300]}')
+    content = res.json()['choices'][0]['message']['content']
+    return parse_llm_answer(content, q_type)
+
+
+def parse_llm_answer(content, q_type):
+    """把大模型返回的文本解析成统一答案格式（尽力鲁棒）。"""
+    content = (content or '').strip()
+    m = re.search(r'\{[^{}]*\}', content, re.S)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            at = obj.get('answer_key')
+            ta = obj.get('text_answers')
+            qt = str(obj.get('question_type') or q_type)
+            if isinstance(at, str):
+                at = re.sub(r'[^A-Fa-f]', '', at).upper()
+            if not isinstance(ta, (list, tuple)):
+                ta = [ta] if ta else []
+            ta = [str(x) for x in ta if x is not None]
+            if qt in ('blank', 'essay'):
+                return {'question_type': qt, 'answer_key': '', 'text_answers': ta}
+            return {'question_type': 'multi_choice' if len(at) > 1 else 'choice',
+                    'answer_key': at, 'text_answers': []}
+    # 兜底：抽字母或整段当文本
+    letters = re.findall(r'[A-Fa-f]', content)
+    if q_type in ('blank', 'essay'):
+        return {'question_type': q_type, 'answer_key': '', 'text_answers': [content]}
+    return {'question_type': 'choice', 'answer_key': ''.join(letters[:6]).upper(), 'text_answers': []}
+
+
+def scan_page_recursively(page):
+    """在主框架与所有 iframe 中递归寻找题目节点。返回 ([locators], frame)。"""
+    class_selectors = [
+        'div.singleQuesId', 'div.singlequesid', 'div.TiMu', '.question-card',
+        '.question-item', '.test-item', '.Tm_cont', '.problem', '.exercise',
+        '.ti-q-c', '.que', '.multiquesid',
+    ]
+    xpath_selector = ("//input[(@type='radio' or @type='checkbox')]/ancestor::div[contains(@class, 'que') "
+                      "or contains(@class, 'item') or contains(@class, 'box') or string-length(@class)>2]")
+    frames_to_scan = [page.main_frame] + page.frames
+    for frame in frames_to_scan:
+        try:
+            for sel in class_selectors:
+                found = frame.locator(sel).all()
+                if len(found) > 0:
+                    return (found, frame)
+            with_xpath = frame.locator(xpath_selector).all()
+            if len(with_xpath) > 0:
+                valid_qs = []
+                for q in with_xpath:
+                    try:
+                        box = q.bounding_box()
+                        if box and box['height'] > 50:
+                            valid_qs.append(q)
+                    except Exception:
+                        pass
+                if len(valid_qs) > 0:
+                    return (valid_qs, frame)
+        except Exception:
+            pass
+    return ([], None)
+
+
+LATEX_EXTRACT_JS = '''
+(element) => {
+    function decodeAndClean(latexData) {
+        try {
+            let decoded = decodeURIComponent(latexData);
+            decoded = decoded.replace(/^"+|"+$/g, '').replace(/^%22+|%22+$/g, '');
+            return decoded;
+        } catch(e) { return latexData; }
+    }
+    function traverse(node) {
+        let text = "";
+        if (node.nodeType === 3) {
+            text += node.textContent;
+        } else if (node.nodeType === 1) {
+            if (node.tagName === "INPUT" && node.type === "hidden") return "";
+            if (node.tagName === "SCRIPT" || node.tagName === "STYLE") return "";
+            if (node.tagName === "IMG" && node.classList.contains("ans-latex-moudle")) {
+                let latexData = node.getAttribute("data") || node.getAttribute("data-original") || "";
+                if (latexData) return " " + decodeAndClean(latexData) + " ";
+            }
+            for (let child of node.childNodes) text += traverse(child);
+        }
+        return text;
+    }
+    return traverse(element);
+}
+'''
+
+
+def extract_clean_text_with_latex(question_locator):
+    """提取题干文本（含 LaTeX 图片内容）并清洗。"""
+    try:
+        raw = question_locator.evaluate(LATEX_EXTRACT_JS)
+        clean = clean_text_for_gui(raw)
+        clean = re.sub(r'^\d+[\s\.、]*', '', clean)
+        clean = re.sub(r'[\(（]\s*\d+(\.\d+)?\s*分\s*[\)）]', '', clean)
+        clean = re.sub(r'\s+', ' ', clean).strip()
+        return clean
+    except Exception as e:
+        LOGGER.info(f'[题干] LaTeX 提取失败，回退 inner_text: {e}')
+        try:
+            return clean_text_for_gui(question_locator.inner_text())
+        except Exception:
+            return ''
+
+
+def detect_question_type_and_inputs(question_locator):
+    """识别题型，返回 (类型, 数量)。类型：choice / multi_choice / blank / essay。"""
+    try:
+        timu_el = question_locator.locator('div.TiMu').first
+        if timu_el.count() > 0:
+            timu_type = timu_el.get_attribute('data')
+            if timu_type in ('0', '1', '3'):
+                options_count = question_locator.locator(
+                    "li.before-after, li[role='radio'], li[role='checkbox']").count()
+                is_multi = (timu_type == '1') or (question_locator.locator(
+                    "li[role='checkbox'], input[type='checkbox']").count() > 0)
+                q_type_res = 'multi_choice' if is_multi else 'choice'
+                return (q_type_res, options_count if options_count > 0 else 4)
+            if timu_type == '2':
+                blanks_count = question_locator.locator('.blankItemDiv').count()
+                if blanks_count == 0:
+                    blanks_count = question_locator.locator("textarea[id^='answer']").count()
+                if blanks_count == 0:
+                    blanks_count = question_locator.locator("iframe[id^='ueditor_']").count()
+                if blanks_count == 0:
+                    blanks_count = question_locator.locator("input[type='text'], input.blank_input").count()
+                return ('blank', blanks_count if blanks_count > 0 else 1)
+            if timu_type in ('4', '5', '6'):
+                return ('essay', 1)
+        options = question_locator.locator("li.before-after, li[role='radio'], li[role='checkbox']").all()
+        if len(options) > 0:
+            return ('choice', len(options))
+        blanks = question_locator.locator(
+            ".blankItemDiv, textarea[id^='answer'], iframe[id^='ueditor_'], input[type='text']").all()
+        if len(blanks) > 0:
+            return ('blank', len(blanks))
+        return ('essay', 1)
+    except Exception:
+        return ('essay', 1)
+
+
+def fill_and_click_smart(question_locator, response_data):
+    """按大模型返回的答案填涂题目。response_data 形如
+       {'question_type':..., 'answer_key':'AC', 'text_answers':[...]}。"""
+    q_type = response_data.get('question_type', 'choice')
+    text_answers = response_data.get('text_answers') or []
+    answer_key = response_data.get('answer_key') or ''
+    try:
+        if q_type in ('choice', 'multi_choice') or text_answers:
+            if not answer_key:
+                return False
+            clean_str = (answer_key.upper().replace('对', 'A').replace('TRUE', 'A')
+                         .replace('T', 'A').replace('正确', 'A'))
+            clean_str = (clean_str.replace('错', 'B').replace('FALSE', 'B')
+                         .replace('F', 'B').replace('错误', 'B'))
+            clean_keys = re.sub(r'[^A-F]', '', clean_str)
+            target_set = set(clean_keys)
+
+            def parse_option_letter(el, idx):
+                txt = ''
+                data_val = ''
+                try:
+                    if not el.is_visible():
+                        pass
+                    txt = (el.inner_text() or '').strip().upper()
+                except Exception:
+                    pass
+                match = re.search(r'^[A-F]', txt)
+                if match:
+                    return match.group(0)
+                if any(kw in txt for kw in ('对', '正确', 'TRUE', '√')):
+                    return 'A'
+                if any(kw in txt for kw in ('错', '错误', 'FALSE', '×')):
+                    return 'B'
+                try:
+                    data_val = (el.get_attribute('data') or '').strip().upper()
+                except Exception:
+                    pass
+                if data_val in ('A', 'B', 'C', 'D', 'E', 'F'):
+                    return data_val
+                if data_val in ('TRUE', '对'):
+                    return 'A'
+                if data_val in ('FALSE', '错'):
+                    return 'B'
+                alphabet = ['A', 'B', 'C', 'D', 'E', 'F']
+                return alphabet[idx] if idx < len(alphabet) else ''
+
+            spans = question_locator.locator(
+                'span.num_option, span.num_option_dx, span.check_answer, span.check_answer_dx').all()
+            if not spans:
+                spans = question_locator.locator(
+                    "li.before-after, li[role='radio'], li[role='checkbox']").all()
+
+            if len(spans) > 0:
+                # 先判断是否已全对
+                all_correct = True
+                for idx, el in enumerate(spans):
+                    try:
+                        letter = parse_option_letter(el, idx)
+                        classes = el.get_attribute('class') or ''
+                        is_selected = ('check_answer' in classes) or ('check_answer_dx' in classes)
+                        should_select = letter in target_set
+                        if is_selected != should_select:
+                            all_correct = False
+                            break
+                    except Exception:
+                        all_correct = False
+                        break
+                if all_correct:
+                    return True
+                # 修正勾选
+                for idx, el in enumerate(spans):
+                    try:
+                        letter = parse_option_letter(el, idx)
+                        classes = el.get_attribute('class') or ''
+                        is_selected = ('check_answer' in classes) or ('check_answer_dx' in classes)
+                        should_select = letter in target_set
+                        if should_select and not is_selected:
+                            el.scroll_into_view_if_needed()
+                            time.sleep(0.05)
+                            el.click(True, force=True)
+                            time.sleep(0.12)
+                        elif not should_select and is_selected and q_type == 'multi_choice':
+                            el.scroll_into_view_if_needed()
+                            time.sleep(0.05)
+                            el.click(True, force=True)
+                            time.sleep(0.12)
+                    except Exception as e:
+                        LOGGER.info(f'[填涂] 选项 {idx + 1} 异常: {e}')
+                return True
+            else:
+                inputs = question_locator.locator("input[type='radio'], input[type='checkbox']").all()
+                if inputs:
+                    alphabet = ['A', 'B', 'C', 'D', 'E', 'F']
+                    for char in target_set:
+                        if char in alphabet:
+                            target_idx = alphabet.index(char)
+                            if target_idx < len(inputs):
+                                target_ipt = inputs[target_idx]
+                                try:
+                                    if not target_ipt.is_checked():
+                                        target_ipt.scroll_into_view_if_needed()
+                                        target_ipt.click(True, force=True)
+                                        time.sleep(0.12)
+                                except Exception:
+                                    pass
+                    return True
+                return False
+        if q_type in ('blank', 'essay') and text_answers:
+            try:
+                filled_ok = question_locator.evaluate(FILL_TEXT_SCRIPT, text_answers)
+                return filled_ok > 0
+            except Exception as e:
+                LOGGER.info(f'[填涂] {q_type} JS 写入异常: {e}')
+                return False
+        return False
+    except Exception as ex:
+        LOGGER.info(f'[填涂] 智能填涂异常: {ex}')
+        return False
+
+
+def find_submit_button(page):
+    """找「提交作业/提交」按钮。"""
+    el, frame = find_button_in_frames(page, ['提交作业', '提交', '确认提交'])
+    if el:
+        return (el, frame)
+    fallback = ['.submit', "[class*='submit']", '.btn-submit', '#submitButton', '.btn_ok']
+    return _find_by_selectors(page, fallback)
+
+
+def find_save_button(page):
+    """找「暂存/保存」按钮。"""
+    el, frame = find_button_in_frames(page, ['暂存', '保存答案', '保存'])
+    if el:
+        return (el, frame)
+    fallback = ['.save', "[class*='save']", '.btn-save', '#saveButton']
+    return _find_by_selectors(page, fallback)
+
+
+def _find_by_selectors(page, selectors):
+    frames_to_scan = [page.main_frame] + page.frames
+    for frame in frames_to_scan:
+        try:
+            for sel in selectors:
+                loc = frame.locator(sel)
+                count = loc.count()
+                for idx in range(count):
+                    el = loc.nth(idx)
+                    try:
+                        if el.is_visible() and el.is_enabled():
+                            box = el.bounding_box()
+                            if box and box['height'] > 5 and box['width'] > 5:
+                                return (el, frame)
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    return (None, None)
+
+
+def check_quiz_completed(questions, target_frame):
+    """判断测试页是否已被平台标记完成/已作答。"""
+    try:
+        if target_frame:
+            done = target_frame.evaluate(
+                '() => { let b = document.body ? document.body.innerText : ""; '
+                'let t = /得分：|成绩：|已提交|已完成|我的答案|正确答案|查看作答|已批阅|本题得\\s*\\d+/.test(b); '
+                'let i = document.querySelectorAll(\'input[type="radio"], input[type="checkbox"], textarea\'); '
+                'let d = i.length > 0 && Array.from(i).every(e => e.disabled); '
+                'let m = document.querySelectorAll(\'.answer-right, .score, .scoreNum, .dui, .cuo, [class*="score"]\').length > 0; '
+                'return t || d || m; }')
+            if done:
+                return True
+            fe = target_frame.frame_element()
+            if fe:
+                return fe.evaluate(
+                    '(iframe) => { let p = iframe.closest(\'div.ans-attach-ct\') || iframe.closest(\'.ans-attach-online\'); '
+                    'return p ? (p.classList.contains("ans-job-finished") || /ans-job-finished|icon_Completed|jobFinish|job-finished/.test(p.className || \'\')) : false; }')
+    except Exception as e:
+        LOGGER.info(f'[答题] 完成态检查异常: {e}')
+    return False
+
+
+# ----------------------------------------------------------------------------
 # 主面板
 # ----------------------------------------------------------------------------
 class AppConsole:
@@ -665,6 +1152,26 @@ class AppConsole:
                                      values=('1.0', '1.5', '2.0'), state='readonly', width=5,
                                      font=('Microsoft YaHei', 9))
         self.cb_speed.pack(side=tk.LEFT)
+
+        # 做题提交模式 + 大模型设置
+        row4 = tk.Frame(main, bg=self.COLOR_BG)
+        row4.pack(fill=tk.X, pady=(0, 4))
+        tk.Label(row4, text='做题提交:', font=('Microsoft YaHei', 9, 'bold'),
+                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN).pack(side=tk.LEFT, padx=(10, 6))
+        self.var_auto_submit = tk.IntVar(value=1)
+        self.rad_submit = tk.Radiobutton(row4, text='自动提交', value=1, variable=self.var_auto_submit,
+                                         bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN, selectcolor='white',
+                                         font=('Microsoft YaHei', 9))
+        self.rad_submit.pack(side=tk.LEFT)
+        self.rad_save = tk.Radiobutton(row4, text='仅暂存', value=0, variable=self.var_auto_submit,
+                                       bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN, selectcolor='white',
+                                       font=('Microsoft YaHei', 9))
+        self.rad_save.pack(side=tk.LEFT, padx=(6, 0))
+        self.btn_llm = tk.Button(row4, text='模型设置', bg=self.COLOR_PRIMARY, fg='white',
+                                 font=('Microsoft YaHei', 9, 'bold'), relief=tk.FLAT, cursor='hand2',
+                                 command=self.open_llm_settings, activebackground=self.COLOR_PRIMARY_DARK)
+        self.btn_llm.pack(side=tk.RIGHT, padx=(0, 10))
+        self.bind_hover(self.btn_llm, self.COLOR_PRIMARY_DARK, self.COLOR_PRIMARY)
 
         # KPI：视频 / 文档
         dash = tk.Frame(main, bg=self.COLOR_BG)
@@ -983,6 +1490,81 @@ class AppConsole:
         return None
 
     # ---------------- 运行控制 ----------------
+    def open_llm_settings(self):
+        """大模型配置窗口：Base URL / API Key / 模型名，保存到 config.json。"""
+        cfg = get_llm_cfg()
+        win = tk.Toplevel(self.root)
+        win.title('大模型配置 (1.0.2 答题)')
+        win.geometry('560x300')
+        win.resizable(False, False)
+        win.configure(bg=self.COLOR_BG)
+
+        v_url = tk.StringVar(value=cfg['base_url'])
+        v_key = tk.StringVar(value=cfg['api_key'])
+        v_model = tk.StringVar(value=cfg['model'])
+
+        frame = tk.Frame(win, bg=self.COLOR_BG)
+        frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(18, 6))
+        frame.columnconfigure(1, weight=1)
+        rows = [
+            ('Base URL', v_url, 'OpenAI 兼容地址，例如 https://api.openai.com/v1（需带 /v1）'),
+            ('API Key', v_key, 'Bearer 令牌，如 sk-...'),
+            ('模型名', v_model, '例如 gpt-4o / qwen-vl-max / glm-4v / deepseek-vl'),
+        ]
+        for i, (label, var, tip) in enumerate(rows):
+            tk.Label(frame, text=label, bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
+                     font=('Microsoft YaHei', 9, 'bold')).grid(row=i, column=0, sticky='w', pady=(8, 2))
+            tk.Entry(frame, textvariable=var, show='*' if label == 'API Key' else None,
+                     font=('Segoe UI', 10), bg='#FFFFFF', fg=self.COLOR_TEXT_MAIN,
+                     highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER
+                     ).grid(row=i, column=1, sticky='ew', pady=(8, 2), padx=(10, 0))
+            if tip:
+                tk.Label(frame, text=tip, bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
+                         font=('Microsoft YaHei', 8)).grid(row=i, column=1, sticky='w', padx=(10, 0))
+
+        tk.Label(win, text='保存后自动写入同目录 config.json（已加入 .gitignore，不上网）。',
+                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8)).pack()
+
+        btns = tk.Frame(win, bg=self.COLOR_BG)
+        btns.pack(pady=14)
+
+        def on_save():
+            save_config({'llm': {
+                'base_url': v_url.get().strip(), 'api_key': v_key.get().strip(),
+                'model': v_model.get().strip()}})
+            self.log(f'[模型设置] 已保存: {v_url.get().strip()}  | 模型: {v_model.get().strip()}')
+            win.destroy()
+
+        def on_test():
+            base = v_url.get().strip().rstrip('/')
+            key = v_key.get().strip()
+            model = v_model.get().strip()
+            if not base or not key or not model:
+                messagebox.showwarning('模型测试', '请先填写 Base URL / API Key / 模型名。')
+                return
+            try:
+                r = requests.post(f'{base}/chat/completions',
+                                  headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+                                  json={'model': model,
+                                        'messages': [{'role': 'user', 'content': '回复 OK 即可'}],
+                                        'max_tokens': 16},
+                                  timeout=30)
+                if r.status_code == 200:
+                    msg = f'连接成功 ✓  模型: {model}'
+                else:
+                    msg = f'HTTP {r.status_code}: {r.text[:200]}'
+            except Exception as e:
+                msg = f'连接失败: {e}'
+            messagebox.showinfo('模型测试', msg)
+
+        tk.Button(btns, text='测试连接', command=on_test, bg=self.COLOR_PRIMARY, fg='white',
+                  font=('Microsoft YaHei', 9), relief=tk.FLAT, cursor='hand2',
+                  activebackground=self.COLOR_PRIMARY_DARK).pack(side=tk.LEFT, padx=6, ipady=3)
+        tk.Button(btns, text='保存', command=on_save, bg=self.COLOR_PRIMARY_DARK, fg='white',
+                  font=('Microsoft YaHei', 9), relief=tk.FLAT, cursor='hand2').pack(side=tk.LEFT, padx=6, ipady=3)
+        tk.Button(btns, text='取消', command=win.destroy, bg=self.COLOR_TEXT_MUTED, fg='white',
+                  font=('Microsoft YaHei', 9), relief=tk.FLAT, cursor='hand2').pack(side=tk.LEFT, padx=6, ipady=3)
+        return None
     def diagnose_current_page(self):
         """连接浏览器，把当前页（或所选网页）的识别详情写入日志/界面。"""
         selected = self.cb_pages.get().strip()
@@ -1019,6 +1601,69 @@ class AppConsole:
             return None
 
         threading.Thread(target=run, daemon=True).start()
+        return None
+
+    def _do_submit_target_page(self, target_page):
+        """点「提交」并处理二次确认；失败自动降级为暂存。"""
+        self.log('      [提交] 执行自动提交...')
+        submit_btn, _ = find_submit_button(target_page)
+        if not submit_btn:
+            self.log('         [警告] 未找到提交按钮，自动降级为暂存。')
+            return self._do_save_target_page(target_page)
+        try:
+            submit_btn.scroll_into_view_if_needed()
+            time.sleep(0.3)
+            submit_btn.click(True, force=True)
+            self.log('         [提交] 已点击提交，等待二次确认弹窗...')
+            time.sleep(0.8)
+            confirm_btn = None
+            sels = ['#popok', 'a#popok', '.jb_btn_92', "a:has-text('确定')", "button:has-text('确定')"]
+            for f in [target_page.main_frame] + target_page.frames:
+                try:
+                    for sel in sels:
+                        loc = f.locator(sel)
+                        if loc.count() > 0:
+                            el = loc.first
+                            if el.is_visible() and el.is_enabled():
+                                confirm_btn = el
+                                break
+                    if confirm_btn:
+                        break
+                except Exception:
+                    pass
+            if confirm_btn:
+                confirm_btn.scroll_into_view_if_needed()
+                confirm_btn.click(True, force=True)
+                self.log('         [提交] 二次确认完成，任务点已提交。')
+            else:
+                self.log('         [提示] 未检测到确认弹窗（可能已被浏览器自动放行）。')
+            for _ in range(10):
+                if self.stop_requested:
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            self.log(f'         [警告] 自动提交失败: {e}，降级为暂存。')
+            return self._do_save_target_page(target_page)
+        return None
+
+    def _do_save_target_page(self, target_page):
+        """点「暂存/保存」留存答案。"""
+        self.log('      [暂存] 执行自动暂存...')
+        save_btn, _ = find_save_button(target_page)
+        if not save_btn:
+            self.log('         [系统] 未找到暂存按钮，跳过暂存。')
+            return None
+        try:
+            save_btn.scroll_into_view_if_needed()
+            time.sleep(0.3)
+            save_btn.click(True, force=True)
+            self.log('         [存档] 暂存成功，答案已留存。')
+            for _ in range(10):
+                if self.stop_requested:
+                    break
+                time.sleep(0.2)
+        except Exception as e:
+            self.log(f'         [警告] 暂存失败: {e}')
         return None
 
     def check_pause_and_stop(self):
@@ -1424,6 +2069,48 @@ class AppConsole:
                             except Exception:
                                 pass
                             time.sleep(0.3)
+
+                            # ---- 答题（1.0.2：直连本地配置的大模型）----
+                            questions, target_frame = scan_page_recursively(target_page)
+                            if questions:
+                                if check_quiz_completed(questions, target_frame):
+                                    self.log('      [跳过] 该测验任务点已被平台标记完成。')
+                                    self.update_progress_quiz('已完成')
+                                else:
+                                    total_q = len(questions)
+                                    self.log(f'      [测验] 探测到文字题 {total_q} 道，正在截图并调用大模型...')
+                                    self.update_progress_task('自动做题中')
+                                    self.update_progress_quiz(f'识别到 {total_q} 题')
+                                    nc = 0
+                                    for i, q in enumerate(questions):
+                                        if self.check_pause_and_stop():
+                                            break
+                                        try:
+                                            q.scroll_into_view_if_needed()
+                                            time.sleep(0.05)
+                                            img_bytes = q.screenshot()
+                                            q_type, num_inputs = detect_question_type_and_inputs(q)
+                                            text_source = extract_clean_text_with_latex(q)
+                                            self.log(f'         [题 {i + 1}/{total_q}] 类型={q_type} '
+                                                     f'数量={num_inputs} 题干={(text_source or "(无题干)")[:40]}')
+                                            resp = solve_with_llm(img_bytes, q_type, num_inputs, text_source)
+                                            show = resp.get('answer_key') or ', '.join(resp.get('text_answers', []))
+                                            self.log(f'         [题 {i + 1}] 模型答案: {show or "(空)"}')
+                                            if fill_and_click_smart(q, resp):
+                                                nc += 1
+                                                self.update_progress_quiz(f'已填涂 {nc}/{total_q}')
+                                                time.sleep(0.1)
+                                        except Exception as e:
+                                            self.log(f'         [题 {i + 1}] 失败: {e}')
+                                    self.log(f'      [完成] 本卡片填涂 {nc}/{total_q} 题。')
+                                    self.update_progress_quiz(f'完成 {nc}/{total_q}')
+                                    if nc > 0 and not self.check_pause_and_stop():
+                                        if self.var_auto_submit.get():
+                                            self._do_submit_target_page(target_page)
+                                        else:
+                                            self._do_save_target_page(target_page)
+                            else:
+                                self.update_progress_quiz('无题目')
 
                             # 扫描音视频/文档任务（多选择器 + 多帧回退）
                             containers = collect_job_containers(target_page, cards_frame)
