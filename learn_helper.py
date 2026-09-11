@@ -828,11 +828,24 @@ def solve_with_llm(image_bytes, q_type, num_blanks, text_source, timeout=180, ll
     }
     LOGGER.info(f'[LLM] 调用 {base}/chat/completions model={cfg["model"]} q_type={q_type} '
                 f'img={len(image_bytes)}B')
-    res = requests.post(f'{base}/chat/completions', json=payload, headers=headers, timeout=timeout)
+    try:
+        res = requests.post(f'{base}/chat/completions', json=payload, headers=headers,
+                            timeout=timeout)
+    except Exception as e:
+        LOGGER.warning(f'[LLM] 请求异常: {e}')
+        raise
     if res.status_code != 200:
+        LOGGER.warning(f'[LLM] HTTP {res.status_code}: {(res.text or "")[:300]}')
         raise RuntimeError(f'大模型返回 {res.status_code}: {res.text[:300]}')
-    content = res.json()['choices'][0]['message']['content']
-    return parse_llm_answer(content, q_type)
+    try:
+        content = res.json()['choices'][0]['message']['content']
+    except Exception as e:
+        LOGGER.warning(f'[LLM] 响应格式异常: {e}；body={(res.text or "")[:300]}')
+        raise RuntimeError(f'大模型响应格式异常: {e}')
+    ans = parse_llm_answer(content, q_type)
+    LOGGER.info(f'[LLM] 命中 answer_key={ans["answer_key"]!r} '
+                f'texts={len(ans["text_answers"])}')
+    return ans
 
 
 def parse_llm_answer(content, q_type):
@@ -1156,6 +1169,8 @@ def run_solve_self_test(mode='server', timeout=None, retry=1, base=None, llm_cfg
                         'got': got, 'ms': ms, 'detail': ''})
     if lines:
         lines.append(f'（本次通过「{channel}」通道测试）')
+    for ln in lines:                      # 写进日志文件，事后可追溯（界面弹窗一闪就没了）
+        LOGGER.info(f'[自检/{mode}] {ln}')
     return (bool(results) and all(r['ok'] for r in results)), lines, results
 
 
