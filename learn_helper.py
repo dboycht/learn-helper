@@ -2604,8 +2604,13 @@ class AppConsole:
                 target_page.on('dialog', lambda dialog: dialog.accept())
                 page_counter = 1
                 saved_url = None
+                # 内层 while 的 break 只跳出一层（= 进入下一页）；整个流程是否收尾由它决定，
+                # 否则「终止退出」和「刷完最后一页」都会在外层 while 里无限空转（见 ERROR.md E6）。
+                end_flow = False
 
                 while True:
+                    if self.stop_requested:
+                        break
                     # 浏览器上下文丢失时自动重连，避免 list index out of range 中断流程
                     if not browser.contexts:
                         self.log('[警告] 浏览器上下文丢失，正在重新拉起浏览器...')
@@ -2655,6 +2660,7 @@ class AppConsole:
                     while True:
                         if self.check_pause_and_stop():
                             self.log('[系统] 任务因用户请求退出。')
+                            end_flow = True
                             break
                         self.log(f'\n--- [ 正在处理第 {page_counter} 页 ] ---')
                         try:
@@ -2845,6 +2851,7 @@ class AppConsole:
                                 break
 
                         if self.check_pause_and_stop():
+                            end_flow = True
                             break
 
                         # 翻页
@@ -2852,6 +2859,7 @@ class AppConsole:
                         next_btn, next_frame = find_next_button(target_page)
                         if not next_btn:
                             self.log('[系统] 未找到下一页按钮，刷课流程结束。')
+                            end_flow = True
                             break
                         try:
                             next_btn.scroll_into_view_if_needed()
@@ -2870,6 +2878,7 @@ class AppConsole:
                             self.log('[导航] 等待页面载入...')
                             time.sleep(0.8)
                             if self.stop_requested:
+                                end_flow = True
                                 break
                             page_counter += 1
                             if page_counter % 10 == 0:
@@ -2886,14 +2895,21 @@ class AppConsole:
                             self.log('[系统] 已清理上一页去重缓存。')
                         except Exception as ex:
                             self.log(f'   [警告] 翻页受阻: {ex}')
+                            end_flow = True
                             break
+
+                    if end_flow:
+                        break
 
                 self.log(f'\n[系统] 刷课流程运行完毕，共处理页面数: {page_counter}')
                 self.log(f'总计耗时: {time.time() - start_time:.2f}s')
-                try:
-                    browser.close()
-                except Exception:
-                    pass
+                if self.stop_requested:
+                    self.log('[系统] 已按用户请求停止，保留沙盒浏览器（不关闭，便于查看页面）。')
+                else:
+                    try:
+                        browser.close()
+                    except Exception:
+                        pass
         except Exception as e:
             self.log(f'[错误] 流程异常中断: {e}')
         self.root.after(0, self.reset_control_buttons)
