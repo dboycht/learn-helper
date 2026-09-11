@@ -795,8 +795,12 @@ SOLVE_PROMPT = (
 )
 
 
-def solve_with_llm(image_bytes, q_type, num_blanks, text_source):
-    """把题目截图 + 题干发给自己配置的大模型（OpenAI 兼容接口），返回结果 dict。"""
+def solve_with_llm(image_bytes, q_type, num_blanks, text_source, timeout=180):
+    """把题目截图 + 题干发给自己配置的大模型（OpenAI 兼容接口），返回结果 dict。
+
+    图片以 `image_url` 的 data URL 形式放进 user 消息的 content 数组，
+    并带 `detail: "high"`（保留原分辨率）—— 题目截图字小且密，低分辨率会看错。
+    """
     cfg = get_llm_cfg()
     if not cfg['api_key']:
         raise ValueError('未配置大模型 API Key，请点击「答题设置」→「自配大模型」填写 Base URL / API Key / 模型名')
@@ -815,13 +819,15 @@ def solve_with_llm(image_bytes, q_type, num_blanks, text_source):
             'role': 'user',
             'content': [
                 {'type': 'text', 'text': prompt},
-                {'type': 'image_url', 'image_url': {'url': f'data:image/png;base64,{b64}'}},
+                {'type': 'image_url',
+                 'image_url': {'url': f'data:image/png;base64,{b64}', 'detail': 'high'}},
             ],
         }],
         'temperature': 0.1,
     }
-    LOGGER.info(f'[LLM] 调用 {base}/chat/completions model={cfg["model"]} q_type={q_type}')
-    res = requests.post(f'{base}/chat/completions', json=payload, headers=headers, timeout=180)
+    LOGGER.info(f'[LLM] 调用 {base}/chat/completions model={cfg["model"]} q_type={q_type} '
+                f'img={len(image_bytes)}B')
+    res = requests.post(f'{base}/chat/completions', json=payload, headers=headers, timeout=timeout)
     if res.status_code != 200:
         raise RuntimeError(f'大模型返回 {res.status_code}: {res.text[:300]}')
     content = res.json()['choices'][0]['message']['content']
@@ -982,7 +988,8 @@ def solve_question(image_bytes, q_type, num_blanks, text_source, mode, cfg=None)
         return solve_with_server(image_bytes, q_type, num_blanks, text_source,
                                  timeout=cfg['solver_timeout'], retry=cfg['retry'])
     if mode == 'llm':
-        return solve_with_llm(image_bytes, q_type, num_blanks, text_source)
+        return solve_with_llm(image_bytes, q_type, num_blanks, text_source,
+                              timeout=cfg['solver_timeout'])
     raise RuntimeError('当前答题方式为「仅识别不答题」，不应调用求解')
 
 
@@ -1092,14 +1099,15 @@ def _grade_case(case, ans):
     return good, got, ('pass' if good else 'mismatch')
 
 
-def run_solve_self_test(timeout=None, retry=1):
-    """用内置测试图跑一遍当前「内部答题 API」，逐题给出结论。
+def run_solve_self_test(mode='server', timeout=None, retry=1):
+    """用内置测试图跑一遍指定通道（server=内部答题 API / llm=自配大模型），逐题给出结论。
 
     返回 (ok_all, lines, results)；纯网络调用，界面侧请放到后台线程执行。
     """
     acfg = get_answer_cfg()
     limit = acfg['solver_timeout'] if timeout is None else int(timeout)
     limit = max(10, min(limit, 120))          # 自检不必等满 240s
+    channel = ANSWER_MODE_LABELS.get(mode, mode)
     lines, results = [], []
     for case in TEST_CASES:
         try:
@@ -1111,8 +1119,12 @@ def run_solve_self_test(timeout=None, retry=1):
             continue
         t0 = time.time()
         try:
-            ans = solve_with_server(image, case['question_type'], case['num_blanks'],
-                                    text_source, timeout=limit, retry=retry)
+            if mode == 'server':
+                ans = solve_with_server(image, case['question_type'], case['num_blanks'],
+                                        text_source, timeout=limit, retry=retry)
+            else:
+                ans = solve_with_llm(image, case['question_type'], case['num_blanks'],
+                                     text_source, timeout=limit)
         except Exception as e:
             ms = int((time.time() - t0) * 1000)
             results.append({'name': case['name'], 'ok': False, 'verdict': 'request_fail',
@@ -1136,6 +1148,8 @@ def run_solve_self_test(timeout=None, retry=1):
             lines.append(f'⚠ {case["name"]}：接口正常但答案不符，返回 {got}（期望 {want}）{suffix}')
         results.append({'name': case['name'], 'ok': ok, 'verdict': verdict,
                         'got': got, 'ms': ms, 'detail': ''})
+    if lines:
+        lines.append(f'（本次通过「{channel}」通道测试）')
     return (bool(results) and all(r['ok'] for r in results)), lines, results
 
 
@@ -2125,9 +2139,30 @@ class AppConsole:
         win.resizable(False, False)
         win.configure(bg=self.COLOR_BG)
 
+        # ⚠️ pack 顺序很关键：底部按钮与详情框**先**贴底打包（side=BOTTOM），
+        #    这样内容再高也只会挤压中间的 Notebook，不会把左下角按钮裁掉。
+        #    （曾出现「保存 / 取消」只露出上半截的实测问题，详见 ERROR.md E9）
+        btns = tk.Frame(win, bg=self.COLOR_BG)
+        btns.pack(side=tk.BOTTOM, fill=tk.X, pady=(10, 12))
+
+        detail_wrap = tk.Frame(win, bg=self.COLOR_BG)
+        detail_wrap.pack(side=tk.BOTTOM, fill=tk.X, padx=20, pady=(0, 2))
+        detail = tk.Text(detail_wrap, height=6, wrap='word', font=('Consolas', 9),
+                         bg='#FFFFFF', fg=self.COLOR_TEXT_MAIN, relief=tk.FLAT,
+                         highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER,
+                         state='disabled')
+        detail.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        detail.tag_configure('ok', foreground='#1E7E34')
+        detail.tag_configure('warn', foreground='#B7791F')
+        detail.tag_configure('bad', foreground='#C0392B')
+        detail.tag_configure('dim', foreground=self.COLOR_TEXT_MUTED)
+        _sb = tk.Scrollbar(detail_wrap, command=detail.yview)
+        _sb.pack(side=tk.RIGHT, fill=tk.Y)
+        detail.configure(yscrollcommand=_sb.set)
+
         # 标题区
         head = tk.Frame(win, bg=self.COLOR_BG)
-        head.pack(fill=tk.X, padx=24, pady=(16, 6))
+        head.pack(side=tk.TOP, fill=tk.X, padx=24, pady=(16, 6))
         tk.Label(head, text='答题中心', bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
                  font=('Microsoft YaHei', 13, 'bold')).pack(anchor='w')
         tk.Label(head, text='配置题目的求解方式。保存后写入同目录 config.json（已在 .gitignore 中，不会上传）。',
@@ -2141,7 +2176,7 @@ class AppConsole:
         except Exception:
             pass
         nb = ttk.Notebook(win, style='Answer.TNotebook')
-        nb.pack(fill=tk.BOTH, expand=True, padx=20, pady=(4, 0))
+        nb.pack(side=tk.TOP, fill=tk.BOTH, expand=True, padx=20, pady=(4, 0))
 
         def _entry(parent, var, show=None, width=None):
             return tk.Entry(parent, textvariable=var, show=show, width=width,
@@ -2235,21 +2270,7 @@ class AppConsole:
                              justify='left', anchor='w', wraplength=650)
         lbl_probe.pack(anchor='w', padx=18, pady=(8, 4))
 
-        # 测试详情（等宽只读文本框，带颜色标记）
-        detail_wrap = tk.Frame(tab_api, bg=self.COLOR_BG)
-        detail_wrap.pack(fill=tk.BOTH, expand=True, padx=18, pady=(0, 8))
-        detail = tk.Text(detail_wrap, height=7, wrap='word', font=('Consolas', 9),
-                         bg='#FFFFFF', fg=self.COLOR_TEXT_MAIN, relief=tk.FLAT,
-                         highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER,
-                         state='disabled')
-        detail.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        detail.tag_configure('ok', foreground='#1E7E34')
-        detail.tag_configure('warn', foreground='#B7791F')
-        detail.tag_configure('bad', foreground='#C0392B')
-        detail.tag_configure('dim', foreground=self.COLOR_TEXT_MUTED)
-        sb = tk.Scrollbar(detail_wrap, command=detail.yview)
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        detail.configure(yscrollcommand=sb.set)
+        # 测试详情框已在窗口底部统一创建（两个页签的测试结果都写在那里），此处不再单独建。
 
         def _write_detail(lines, status='', ok=True):
             detail.configure(state='normal')
@@ -2263,10 +2284,13 @@ class AppConsole:
             detail.configure(state='disabled')
             return None
 
-        def _start_test(btn, label, task, pending):
-            """后台执行 task() -> (ok, status, detail_lines)，完成后回写界面。"""
+        def _start_test(btn, label, task, pending, status_lbl):
+            """后台执行 task() -> (ok, status, detail_lines)，完成后回写界面。
+
+            详情统一写到窗口底部的共享详情框，状态写到该页签自己的标签。
+            """
             btn.configure(state='disabled', text=pending)
-            lbl_probe.configure(text=pending, fg=self.COLOR_TEXT_MUTED)
+            status_lbl.configure(text=pending, fg=self.COLOR_TEXT_MUTED)
             _write_detail([], pending, True)
 
             def worker():
@@ -2277,7 +2301,7 @@ class AppConsole:
 
                 def done():
                     btn.configure(state='normal', text=label)
-                    lbl_probe.configure(text=status, fg=('#1E7E34' if ok else '#C0392B'))
+                    status_lbl.configure(text=status, fg=('#1E7E34' if ok else '#C0392B'))
                     _write_detail(lines, status, ok)
                 try:
                     self.root.after(0, done)
@@ -2306,27 +2330,79 @@ class AppConsole:
             return ok, ('连接成功 ✓' if ok else '连接失败 ✗'), lines
 
         def _task_image():
-            if get_answer_cfg()['mode'] != 'server':
-                return (False, '当前答题方式不是「内部答题 API」',
-                        ['请先到「答题方式」页选择「内部答题 API」，再回来测试图片。'])
             guard = _unsaved_guard()
             if guard:
                 return False, '地址未保存，未执行测试', guard.split('\n')
-            _ok, lines, results = run_solve_self_test()
+            ok, lines, results = run_solve_self_test(mode='server')
             status = summarize_self_test(results)
             lines = list(lines)
             lines.append(f'后端: {get_server_url()}')
             lines.append('说明：✗=接口/网络失败，⚠=接口通但答案不符或为空，✓=识别正确。')
-            return status.startswith('自检通过'), status, lines
+            return ok, status, lines
 
-        btn_probe.configure(command=lambda: _start_test(btn_probe, '测试连接', _task_probe, '测试中…'))
+        def _llm_guard():
+            """自配大模型的三个字段改了但没保存时，提示先保存（自检读的是 config.json）。"""
+            saved = get_llm_cfg()
+            typed_url = v_url.get().strip().rstrip('/')
+            typed_model = v_model.get().strip()
+            if not typed_url or not typed_model:
+                return '请先填写 Base URL 与模型名。'
+            if typed_url != (saved['base_url'] or '').rstrip('/') or typed_model != (saved['model'] or ''):
+                return (f'大模型设置已改但尚未保存\n\n请先点「保存」，再测试。\n'
+                        f'当前生效: {saved["base_url"]} / {saved["model"]}')
+            return None
+
+        def _task_llm_probe():
+            guard = _llm_guard()
+            if guard:
+                return False, '设置未保存，未执行测试', guard.split('\n')
+            cfg_now = get_llm_cfg()
+            key = v_key.get().strip()
+            if not key:
+                return False, '未填写 API Key', ['请填写 API Key 并保存后再测试。']
+            try:
+                r = requests.post(f'{cfg_now["base_url"]}/chat/completions',
+                                  headers={'Authorization': f'Bearer {key}',
+                                           'Content-Type': 'application/json'},
+                                  json={'model': cfg_now['model'],
+                                        'messages': [{'role': 'user', 'content': '回复 OK 即可'}],
+                                        'max_tokens': 16},
+                                  timeout=30)
+            except Exception as e:
+                return False, f'连接失败：{e}', [f'POST {cfg_now["base_url"]}/chat/completions',
+                                                f'错误: {e}']
+            if r.status_code == 200:
+                return True, f'连接成功 ✓ 模型: {cfg_now["model"]}', [
+                    f'地址: {cfg_now["base_url"]}', f'模型: {cfg_now["model"]}',
+                    '⚠ 这一步只发纯文本，**不能**证明该模型能读图片 —— 请点「测试图片」。']
+            return False, f'HTTP {r.status_code}', [(r.text or '')[:300]]
+
+        def _task_llm_image():
+            guard = _llm_guard()
+            if guard:
+                return False, '设置未保存，未执行测试', guard.split('\n')
+            cfg_now = get_llm_cfg()
+            if not cfg_now['api_key']:
+                return False, '未配置 API Key', ['请先在「自配大模型」页填写并保存。']
+            ok, lines, results = run_solve_self_test(mode='llm')
+            status = summarize_self_test(results)
+            lines = list(lines)
+            lines.append(f'接口: {cfg_now["base_url"]}   模型: {cfg_now["model"]}')
+            if get_answer_cfg()['mode'] != 'llm':
+                lines.append('提示：当前「答题方式」不是自配大模型，刷课时不会走这个通道。')
+            lines.append('说明：✗=接口/网络失败，⚠=接口通但答案不符或为空，✓=识别正确。')
+            return ok, status, lines
+
+        btn_probe.configure(command=lambda: _start_test(btn_probe, '测试连接', _task_probe,
+                                                        '测试中…', lbl_probe))
         btn_imgtest.configure(command=lambda: _start_test(btn_imgtest, '测试图片', _task_image,
-                                                          '识别中…'))
-        _write_detail(['点「测试图片」会合成下面 3 道题并发给后端 /solve：',
+                                                          '识别中…', lbl_probe))
+        _write_detail(['点「测试图片」会合成下面 3 道题并发给所测通道：',
                        '  · 单选题：中国的首都是哪座城市？ → 期望 B',
                        '  · 多选题：下列哪些属于哺乳动物？（多选）→ 期望 AC',
                        '  · 填空题：一年有 ____ 个月。→ 期望 12',
-                       '结果显示具体返回内容与耗时，便于判断是"接口不通"还是"识图不准"。'],
+                       '结果显示具体返回内容与耗时，便于判断是"接口不通"还是"识图不准"。',
+                       '「内部答题 API」与「自配大模型」两页各有自己的「测试图片」，结果都显示在这里。'],
                       '尚未测试', True)
 
         # ================= 页签 3：自配大模型 =================
@@ -2357,14 +2433,20 @@ class AppConsole:
                                  activebackground=self.COLOR_PRIMARY_DARK)
         btn_llm_test.pack(side=tk.LEFT, ipady=3, padx=(0, 10))
         self.bind_hover(btn_llm_test, self.COLOR_PRIMARY_DARK, self.COLOR_PRIMARY)
+        btn_llm_imgtest = tk.Button(row_llm, text='测试图片', bg='#2E7D32', fg='white',
+                                    font=('Microsoft YaHei', 9, 'bold'), relief=tk.FLAT,
+                                    cursor='hand2', activebackground='#1B5E20')
+        btn_llm_imgtest.pack(side=tk.LEFT, ipady=3, padx=(0, 10))
+        self.bind_hover(btn_llm_imgtest, '#1B5E20', '#2E7D32')
+        tk.Label(row_llm, text='（「测试连接」只发纯文本；要验证能否识图，请点「测试图片」）',
+                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
+                 font=('Microsoft YaHei', 8)).pack(side=tk.LEFT)
         lbl_llm_test = tk.Label(tab_llm, text='尚未测试。该通道直连上面的接口，不经过自建后端。',
                                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8),
-                                justify='left', anchor='w', wraplength=640)
+                                justify='left', anchor='w', wraplength=650)
         lbl_llm_test.pack(anchor='w', padx=18, pady=(8, 0))
 
-        # ================= 底部按钮 =================
-        btns = tk.Frame(win, bg=self.COLOR_BG)
-        btns.pack(fill=tk.X, pady=(14, 14))
+        # ================= 底部按钮（btns 已在窗口创建时贴底打包） =================
         tk.Label(btns, text='Ctrl+S 保存 · Esc 关闭', bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
                  font=('Microsoft YaHei', 8)).pack(side=tk.RIGHT, padx=(0, 22))
 
@@ -2396,45 +2478,16 @@ class AppConsole:
             win.destroy()
             return None
 
-        def _probe_thread(target, btn, lbl, pending):
-            btn.configure(state='disabled', text=pending)
-            lbl.configure(text=pending, fg=self.COLOR_TEXT_MUTED)
-
-            def worker():
-                ok, msg = target()
-                def done():
-                    btn.configure(state='normal', text='测试连接')
-                    lbl.configure(text=msg, fg=('#1E7E34' if ok else '#C0392B'))
-                try:
-                    self.root.after(0, done)
-                except Exception:
-                    pass
-                return None
-
-            threading.Thread(target=worker, daemon=True).start()
-            return None
-
-        def _test_llm():
-            base = v_url.get().strip().rstrip('/')
-            key = v_key.get().strip()
-            model = v_model.get().strip()
-            if not base or not key or not model:
-                return False, '请先填写 Base URL / API Key / 模型名。'
-            try:
-                r = requests.post(f'{base}/chat/completions',
-                                  headers={'Authorization': f'Bearer {key}',
-                                           'Content-Type': 'application/json'},
-                                  json={'model': model,
-                                        'messages': [{'role': 'user', 'content': '回复 OK 即可'}],
-                                        'max_tokens': 16},
-                                  timeout=30)
-            except Exception as e:
-                return False, f'连接失败：{e}'
-            if r.status_code == 200:
-                return True, f'连接成功 ✓  模型：{model}'
-            return False, f'HTTP {r.status_code}：{r.text[:200]}'
-
-        btn_llm_test.configure(command=lambda: _probe_thread(_test_llm, btn_llm_test, lbl_llm_test, '测试中…'))
+        # 两个页签各有一对「测试连接 / 测试图片」，统一走 _start_test（详情写到底部共享框）
+        btn_probe.configure(command=lambda: _start_test(btn_probe, '测试连接', _task_probe,
+                                                        '测试中…', lbl_probe))
+        btn_imgtest.configure(command=lambda: _start_test(btn_imgtest, '测试图片', _task_image,
+                                                          '识别中…', lbl_probe))
+        btn_llm_test.configure(command=lambda: _start_test(btn_llm_test, '测试连接', _task_llm_probe,
+                                                           '测试中…', lbl_llm_test))
+        btn_llm_imgtest.configure(command=lambda: _start_test(btn_llm_imgtest, '测试图片',
+                                                              _task_llm_image, '识别中…',
+                                                              lbl_llm_test))
 
         tk.Button(btns, text='保存', command=_save, bg=self.COLOR_PRIMARY_DARK, fg='white',
                   font=('Microsoft YaHei', 9, 'bold'), relief=tk.FLAT, cursor='hand2',
@@ -2446,6 +2499,13 @@ class AppConsole:
         win.bind('<Control-s>', _save)
         win.bind('<Control-S>', _save)
 
+        # 按实际内容自适应高度（≥700，封顶 900）：字体/DPI 差异下也不会把内容挤掉
+        win.update_idletasks()
+        try:
+            need_h = min(max(700, win.winfo_reqheight()), 900)
+            win.geometry(f'740x{need_h}')
+        except Exception:
+            pass
         win.update_idletasks()
         try:
             px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
