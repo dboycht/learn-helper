@@ -1,14 +1,18 @@
 # -*- coding: utf-8 -*-
 """
 学习助理 · 纯刷课版 (learn-helper)
-版本: 1.0.1      只做「刷课看视频/文档」，答题相关逻辑留待 1.0.2 接入自研 AI API。
+版本: 1.0.2      纯刷课（视频/文档）+ 答题（默认接入自建后端答题模型）。
 
 设计要点
 - 控制逻辑（点击/翻页/刷视频/滚文档）全部本地实现；浏览器内脚本为本地常量注入。
-- 仅保留 3 个远端调用点，可指向自建后端（见 docs/改造方案-纯刷课与自建后端.md）：
+- 远端调用点全部指向同一个自建后端（见 docs/技术文档.md §5）：
     GET  /points            查点数余额
     GET  /check_version     公告 / 强制更新
     POST /video_heartbeat   看课心跳（每累计播放满 600 秒触发一次）
+    POST /solve             内部答题模型：题目截图 + 题干求解（卡密 + 设备指纹）
+    POST /solve/checkout    按本批实际填涂题数合并扣点
+- 答题方式三选一（「答题设置」窗口，存 config.json）：内部答题 API（默认）/
+  自配大模型（OpenAI 兼容）/ 仅识别不答题。
 - 远端地址优先级：环境变量 LH_SERVER_URL > 同目录 config.json 的 server_url > 默认 127.0.0.1:8000。
 """
 
@@ -22,6 +26,7 @@ import time
 import ctypes
 import logging
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from logging.handlers import RotatingFileHandler
 
 try:
@@ -76,6 +81,7 @@ def _load_server_url():
     return os.environ.get('LH_SERVER_URL', default).rstrip('/')
 
 
+# 启动时快照（兼容旧引用）；运行期统一走 get_server_url()，以便 UI 改址即时生效
 SERVER_URL = _load_server_url()
 
 # ----------------------------------------------------------------------------
@@ -556,7 +562,7 @@ def robust_wait_for_tasks_to_render(page, check_func, timeout=8000):
 
 
 # ----------------------------------------------------------------------------
-# 1.0.2 答题（直连自配大模型）：题目识别 / 截图 / 求解 / 填涂 / 提交
+# 答题：题目识别 / 截图 / 求解（内部答题 API 或自配大模型）/ 填涂 / 提交
 # ----------------------------------------------------------------------------
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'config.json')
 
@@ -576,11 +582,38 @@ def load_config():
 
 
 def save_config(cfg):
+    """整体写入 config.json（保留原有内容由调用方负责，见 update_config）。"""
     try:
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
     except Exception as e:
         LOGGER.error(f'保存 config.json 失败: {e}')
+        return False
+
+
+def update_config(patch):
+    """**合并式**写入：只覆盖 patch 里给出的键，其余段落原样保留。
+
+    修复 1.0.2 的缺陷——原 save_config 直接把整个 config.json 覆盖成 {'llm': {...}}，
+    会把用户填过的 server_url 等键整段抹掉。
+    """
+    cfg = load_config()
+    if not isinstance(cfg, dict):
+        cfg = {}
+    for k, v in (patch or {}).items():
+        if isinstance(v, dict) and isinstance(cfg.get(k), dict):
+            merged = dict(cfg[k])
+            merged.update(v)
+            cfg[k] = merged
+        else:
+            cfg[k] = v
+    return save_config(cfg)
+
+
+def get_server_url():
+    """每次调用都重读配置：在「答题设置」里改完地址即时生效，无需重启。"""
+    return _load_server_url()
 
 
 def get_llm_cfg():
@@ -590,6 +623,56 @@ def get_llm_cfg():
         'api_key': cfg.get('api_key') or '',
         'model': cfg.get('model') or DEFAULT_LLM['model'],
     }
+
+
+# ----------------------------------------------------------------------------
+# 答题方式（新版本：接入自建后端答题模型，同原程序 client_app 的 POST /solve 契约）
+#   server —— 走自建后端 /solve：卡密 + 设备指纹 + 点数结算，客户端零配置（默认/推荐）
+#   llm    —— 1.0.2 的自配大模型通道（OpenAI 兼容 /chat/completions），保留可切换
+#   off    —— 只识别题目并记录，不求解、不填涂
+# ----------------------------------------------------------------------------
+DEFAULT_ANSWER = {
+    'mode': 'server',
+    'solver_timeout': 240,   # /solve 单题超时（原程序 150~300s）
+    'workers': 4,            # 并发求解线程数（原程序 ThreadPoolExecutor(max_workers=4)）
+    'retry': 2,              # 单题失败重试次数
+    'checkout': True,        # 批量结束后按实际填涂数 POST /solve/checkout 合并扣点
+}
+
+ANSWER_MODES = (
+    ('server', '内部答题 API',
+     '走自建后端 POST /solve：卡密 + 设备指纹 + 点数结算，客户端无需配置任何密钥（推荐）'),
+    ('llm', '自配大模型',
+     '直连你自己的 OpenAI 兼容接口（Base URL / API Key / 模型名），不消耗后端点数'),
+    ('off', '仅识别不答题',
+     '只识别题型与题干并写入日志，不求解、不填涂、不提交'),
+)
+
+ANSWER_MODE_LABELS = {m: label for m, label, _ in ANSWER_MODES}
+ANSWER_MODE_TIPS = {m: tip for m, _, tip in ANSWER_MODES}
+
+
+def get_answer_cfg():
+    """读取答题配置（缺项自动补默认值）。"""
+    cfg = load_config().get('answer', {}) or {}
+    out = dict(DEFAULT_ANSWER)
+    for k, default in DEFAULT_ANSWER.items():
+        v = cfg.get(k, default)
+        if isinstance(default, bool):
+            out[k] = bool(v)
+        elif isinstance(default, int):
+            try:
+                out[k] = int(v)
+            except (TypeError, ValueError):
+                out[k] = default
+        else:
+            out[k] = v if v else default
+    if out['mode'] not in ANSWER_MODE_LABELS:
+        out['mode'] = DEFAULT_ANSWER['mode']
+    out['solver_timeout'] = max(10, min(600, out['solver_timeout']))
+    out['workers'] = max(1, min(16, out['workers']))
+    out['retry'] = max(0, min(5, out['retry']))
+    return out
 
 
 # 填空/简答答案注入脚本（UEditor / textarea / iframe / input / contenteditable 多轨写入）
@@ -685,7 +768,7 @@ def solve_with_llm(image_bytes, q_type, num_blanks, text_source):
     """把题目截图 + 题干发给自己配置的大模型（OpenAI 兼容接口），返回结果 dict。"""
     cfg = get_llm_cfg()
     if not cfg['api_key']:
-        raise ValueError('未配置大模型 API Key，请点击「模型设置」填写 Base URL / API Key / 模型名')
+        raise ValueError('未配置大模型 API Key，请点击「答题设置」→「自配大模型」填写 Base URL / API Key / 模型名')
     base = cfg['base_url'].rstrip('/')
     b64 = base64.b64encode(image_bytes).decode()
     num_info = f'填空数/选项数: {num_blanks}' if (q_type in ('blank', 'essay')) else f'选项数: {num_blanks}'
@@ -741,6 +824,162 @@ def parse_llm_answer(content, q_type):
     if q_type in ('blank', 'essay'):
         return {'question_type': q_type, 'answer_key': '', 'text_answers': [content]}
     return {'question_type': 'choice', 'answer_key': ''.join(letters[:6]).upper(), 'text_answers': []}
+
+
+# ----------------------------------------------------------------------------
+# 内部答题 API 客户端（自建后端答题模型）
+# 契约同原程序 client_app（见 docs/技术文档.md §5.3 / §5.4）：
+#   POST /solve           {card_key,image(base64),question_type,num_blanks,
+#                          text_hash_source,school_id,device_id}       timeout 150~300
+#        200 {hash_id,answer_key?,text_answers[]?,remaining_points?,cached}
+#   POST /solve/checkout  {card_key,device_id,school_id,solve_count}    timeout 25
+#        200 {remaining_points} / 402 点数不足
+# ----------------------------------------------------------------------------
+class PointsExhausted(Exception):
+    """后端 402：点数不足，调用方应终止流程并提示充值。"""
+
+
+class AnswerAuthError(Exception):
+    """后端 401/403：卡密无效 / 设备未授权。"""
+
+
+def _normalize_answer(data, q_type):
+    """把后端返回统一成 {'question_type','answer_key','text_answers'}（与自配大模型对齐）。"""
+    data = data if isinstance(data, dict) else {}
+    at = data.get('answer_key')
+    at = re.sub(r'[^A-Fa-f]', '', at).upper() if isinstance(at, str) else ''
+    ta = data.get('text_answers')
+    if not isinstance(ta, (list, tuple)):
+        ta = [ta] if ta else []
+    ta = [str(x) for x in ta if x is not None and str(x) != '']
+    qt = str(data.get('question_type') or q_type)
+    if at:
+        return {'question_type': 'multi_choice' if len(at) > 1 else 'choice',
+                'answer_key': at, 'text_answers': []}
+    if ta:
+        return {'question_type': qt if qt in ('blank', 'essay') else q_type,
+                'answer_key': '', 'text_answers': ta}
+    return {'question_type': q_type, 'answer_key': '', 'text_answers': []}
+
+
+def _post_json(url, payload, timeout):
+    """统一的 POST 封装：把 HTTP 错误码翻译成可读中文异常。
+
+    返回 (status_code, data_dict)。requests 层异常原样抛出，由调用方重试。
+    """
+    res = requests.post(url, json=payload, timeout=timeout)
+    detail = ''
+    try:
+        data = res.json()
+        detail = data.get('detail') or data.get('message') or ''
+    except Exception:
+        data = {}
+        detail = (res.text or '')[:200]
+    if res.status_code == 200:
+        return 200, data
+    if res.status_code == 402:
+        raise PointsExhausted(detail or '点数不足')
+    if res.status_code in (401, 403):
+        raise AnswerAuthError(detail or f'HTTP {res.status_code} 卡密或设备校验失败')
+    raise RuntimeError(f'HTTP {res.status_code}: {detail}')
+
+
+def solve_with_server(image_bytes, q_type, num_blanks, text_source, card_key,
+                      timeout=None, retry=None, device_id=None):
+    """向自建后端答题模型请求单题答案（内部答题 API）。
+
+    返回 {'question_type','answer_key','text_answers','hash_id','cached','remaining_points'}。
+    重试只覆盖网络抖动与 5xx；402/401 立即抛出，不做无意义重试。
+    """
+    cfg = get_answer_cfg()
+    timeout = timeout or cfg['solver_timeout']
+    retry = cfg['retry'] if retry is None else retry
+    base = get_server_url()
+    payload = {
+        'card_key': card_key,
+        'image': base64.b64encode(image_bytes).decode(),
+        'question_type': q_type,
+        'num_blanks': num_blanks,
+        'text_hash_source': text_source or '',
+        'school_id': SCHOOL_ID,
+        'device_id': device_id or get_device_id(),
+    }
+    LOGGER.info(f'[内部答题] POST {base}/solve type={q_type} num={num_blanks} '
+                f'img={len(image_bytes)}B card={card_key[:4]}***')
+    last_err = None
+    for attempt in range(retry + 1):
+        try:
+            _, data = _post_json(f'{base}/solve', payload, timeout)
+            ans = _normalize_answer(data, q_type)
+            ans['hash_id'] = data.get('hash_id') or ''
+            ans['cached'] = bool(data.get('cached'))
+            ans['remaining_points'] = data.get('remaining_points')
+            LOGGER.info(f'[内部答题] 命中 answer_key={ans["answer_key"]!r} '
+                        f'texts={len(ans["text_answers"])} cached={ans["cached"]}')
+            return ans
+        except (PointsExhausted, AnswerAuthError):
+            raise
+        except Exception as e:
+            last_err = e
+            if attempt < retry:
+                wait = 1.5 * (attempt + 1)
+                LOGGER.warning(f'[内部答题] 第 {attempt + 1} 次失败({e})，{wait:.1f}s 后重试')
+                time.sleep(wait)
+    raise RuntimeError(f'内部答题接口连续 {retry + 1} 次失败：{last_err}')
+
+
+def checkout_points(card_key, solve_count, timeout=25, device_id=None):
+    """POST /solve/checkout —— 按本批次实际成功填涂的题数合并扣点。
+
+    返回剩余点数（int）。402 抛 PointsExhausted，由调用方 trigger_stop。
+    """
+    if solve_count <= 0:
+        return None
+    base = get_server_url()
+    payload = {
+        'card_key': card_key,
+        'device_id': device_id or get_device_id(),
+        'school_id': SCHOOL_ID,
+        'solve_count': int(solve_count),
+    }
+    _, data = _post_json(f'{base}/solve/checkout', payload, timeout)
+    pts = data.get('remaining_points')
+    LOGGER.info(f'[结算] /solve/checkout count={solve_count} 剩余点数={pts}')
+    return pts
+
+
+def probe_answer_api(card_key, timeout=8):
+    """「测试连接」用：探活后端 /points 并校验卡密。返回 (ok, message)。"""
+    base = get_server_url()
+    try:
+        res = requests.get(f'{base}/points',
+                           params={'card_key': card_key or '', 'device_id': get_device_id(),
+                                   'school_id': SCHOOL_ID},
+                           timeout=timeout)
+    except Exception as e:
+        return False, f'无法连接 {base}\n{e}'
+    detail = ''
+    try:
+        data = res.json()
+        detail = data.get('detail') or ''
+    except Exception:
+        data = {}
+        detail = (res.text or '')[:200]
+    if res.status_code == 200:
+        return True, (f'连接成功 ✓\n\n后端地址: {base}\n卡密余额: {data.get("points")}\n'
+                      f'设备指纹: {get_device_id()}')
+    return False, f'后端返回 HTTP {res.status_code}\n{detail}'
+
+
+def solve_question(image_bytes, q_type, num_blanks, text_source, card_key, mode, cfg=None):
+    """统一求解入口：按「答题方式」分派到内部答题 API / 自配大模型。"""
+    cfg = cfg or get_answer_cfg()
+    if mode == 'server':
+        return solve_with_server(image_bytes, q_type, num_blanks, text_source, card_key,
+                                 timeout=cfg['solver_timeout'], retry=cfg['retry'])
+    if mode == 'llm':
+        return solve_with_llm(image_bytes, q_type, num_blanks, text_source)
+    raise RuntimeError('当前答题方式为「仅识别不答题」，不应调用求解')
 
 
 def scan_page_recursively(page):
@@ -1071,6 +1310,7 @@ class AppConsole:
         self.notice_loop_id = None
 
         self.create_widgets()
+        self.refresh_answer_mode_label()
         # 先让控制面板显示并短暂置顶，避免被随后拉起的浏览器窗口盖住
         self.root.update_idletasks()
         self.root.lift()
@@ -1153,7 +1393,7 @@ class AppConsole:
                                      font=('Microsoft YaHei', 9))
         self.cb_speed.pack(side=tk.LEFT)
 
-        # 做题提交模式 + 大模型设置
+        # 做题提交模式 + 答题中心（新版本：内部答题模型接入）
         row4 = tk.Frame(main, bg=self.COLOR_BG)
         row4.pack(fill=tk.X, pady=(0, 4))
         tk.Label(row4, text='做题提交:', font=('Microsoft YaHei', 9, 'bold'),
@@ -1167,11 +1407,14 @@ class AppConsole:
                                        bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN, selectcolor='white',
                                        font=('Microsoft YaHei', 9))
         self.rad_save.pack(side=tk.LEFT, padx=(6, 0))
-        self.btn_llm = tk.Button(row4, text='模型设置', bg=self.COLOR_PRIMARY, fg='white',
+        self.btn_llm = tk.Button(row4, text='答题设置', bg=self.COLOR_PRIMARY, fg='white',
                                  font=('Microsoft YaHei', 9, 'bold'), relief=tk.FLAT, cursor='hand2',
-                                 command=self.open_llm_settings, activebackground=self.COLOR_PRIMARY_DARK)
+                                 command=self.open_answer_center, activebackground=self.COLOR_PRIMARY_DARK)
         self.btn_llm.pack(side=tk.RIGHT, padx=(0, 10))
         self.bind_hover(self.btn_llm, self.COLOR_PRIMARY_DARK, self.COLOR_PRIMARY)
+        self.lbl_answer_mode = tk.Label(row4, text='答题方式: --', bg=self.COLOR_BG,
+                                        fg=self.COLOR_PRIMARY, font=('Microsoft YaHei', 8))
+        self.lbl_answer_mode.pack(side=tk.RIGHT, padx=(0, 10))
 
         # KPI：视频 / 文档
         dash = tk.Frame(main, bg=self.COLOR_BG)
@@ -1209,6 +1452,9 @@ class AppConsole:
         self.lbl_prog_video = tk.Label(right, text='音视频进度: --', bg=self.COLOR_CARD_BG,
                                        fg=self.COLOR_TEXT_MAIN, font=('Segoe UI', 9))
         self.lbl_prog_video.pack(anchor=tk.W, padx=18, pady=3)
+        self.lbl_prog_quiz = tk.Label(right, text='答题进度: --', bg=self.COLOR_CARD_BG,
+                                      fg=self.COLOR_TEXT_MAIN, font=('Segoe UI', 9))
+        self.lbl_prog_quiz.pack(anchor=tk.W, padx=18, pady=3)
 
         # 控制按钮
         controls = tk.Frame(main, bg=self.COLOR_BG)
@@ -1309,8 +1555,10 @@ class AppConsole:
 
     # ---------------- 远端调用（自建后端） ----------------
     def query_points(self):
-        # 1.0.1：账户信息先写死，不访问后端
-        if USE_STATIC_ACCOUNT:
+        # 1.0.1：账户信息先写死，不访问后端。
+        # 新版本：一旦答题方式切到「内部答题 API」，余额就必须是真实点数（决定能否答题），
+        #         此时即便 USE_STATIC_ACCOUNT=True 也强制走后端查询。
+        if USE_STATIC_ACCOUNT and get_answer_cfg()['mode'] != 'server':
             self.lbl_points.configure(text=f'账户余额: {DEFAULT_BALANCE}')
             return None
         card_key = self.ent_key.get().strip()
@@ -1323,7 +1571,7 @@ class AppConsole:
         def run():
             try:
                 res = requests.get(
-                    f'{SERVER_URL}/points?card_key={card_key}&device_id={get_device_id()}&school_id={SCHOOL_ID}',
+                    f'{get_server_url()}/points?card_key={card_key}&device_id={get_device_id()}&school_id={SCHOOL_ID}',
                     timeout=5)
                 if res.status_code == 200:
                     pts = res.json().get('points')
@@ -1343,7 +1591,7 @@ class AppConsole:
         try:
             card_key = self.ent_key.get().strip() if hasattr(self, 'ent_key') else ''
             res = requests.get(
-                f'{SERVER_URL}/check_version?ver={APP_VERSION}&school_id={SCHOOL_ID}&card_key={card_key}',
+                f'{get_server_url()}/check_version?ver={APP_VERSION}&school_id={SCHOOL_ID}&card_key={card_key}',
                 timeout=5)
             if res.status_code == 200:
                 data = res.json()
@@ -1366,7 +1614,7 @@ class AppConsole:
 
         def run():
             try:
-                res = requests.post(f'{SERVER_URL}/video_heartbeat',
+                res = requests.post(f'{get_server_url()}/video_heartbeat',
                                     json={'card_key': card_key, 'device_id': get_device_id(),
                                           'school_id': SCHOOL_ID}, timeout=10)
                 if res.status_code == 200:
@@ -1490,93 +1738,302 @@ class AppConsole:
         return None
 
     # ---------------- 运行控制 ----------------
+    # ---------------- 答题中心（新版本：内部答题模型接入） ----------------
     def open_llm_settings(self):
-        """大模型配置窗口：Base URL / API Key / 模型名，保存到 config.json。"""
-        cfg = get_llm_cfg()
+        """兼容旧入口（主界面旧按钮名），统一跳到「答题中心」。"""
+        return self.open_answer_center()
+
+    def open_answer_center(self):
+        """答题中心窗口：答题方式切换 / 内部答题 API / 自配大模型，保存到 config.json。
+
+        保存走 update_config（合并式），不会再像 1.0.2 那样把 server_url 等键整段抹掉。
+        """
+        acfg = get_answer_cfg()
+        lcfg = get_llm_cfg()
+        v_mode = tk.StringVar(value=acfg['mode'])
+        v_server = tk.StringVar(value=load_config().get('server_url') or get_server_url())
+        v_card = tk.StringVar(value=self.ent_key.get().strip())
+        v_timeout = tk.StringVar(value=str(acfg['solver_timeout']))
+        v_workers = tk.StringVar(value=str(acfg['workers']))
+        v_retry = tk.StringVar(value=str(acfg['retry']))
+        v_checkout = tk.BooleanVar(value=acfg['checkout'])
+        v_url = tk.StringVar(value=lcfg['base_url'])
+        v_key = tk.StringVar(value=lcfg['api_key'])
+        v_model = tk.StringVar(value=lcfg['model'])
+        v_show_key = tk.BooleanVar(value=False)
+
         win = tk.Toplevel(self.root)
-        win.title('大模型配置 (1.0.2 答题)')
-        win.geometry('600x360')
+        win.title(f'答题中心 · learn-helper v{APP_VERSION}')
+        win.geometry('720x600')
         win.resizable(False, False)
         win.configure(bg=self.COLOR_BG)
 
-        v_url = tk.StringVar(value=cfg['base_url'])
-        v_key = tk.StringVar(value=cfg['api_key'])
-        v_model = tk.StringVar(value=cfg['model'])
-        v_show_key = tk.BooleanVar(value=False)
+        # 标题区
+        head = tk.Frame(win, bg=self.COLOR_BG)
+        head.pack(fill=tk.X, padx=24, pady=(16, 6))
+        tk.Label(head, text='答题中心', bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
+                 font=('Microsoft YaHei', 13, 'bold')).pack(anchor='w')
+        tk.Label(head, text='配置题目的求解方式。保存后写入同目录 config.json（已在 .gitignore 中，不会上传）。',
+                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
+                 font=('Microsoft YaHei', 8)).pack(anchor='w', pady=(2, 0))
 
-        frame = tk.Frame(win, bg=self.COLOR_BG)
-        frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(18, 6))
-        frame.columnconfigure(1, weight=1)
-        rows = [
-            ('Base URL', v_url, 'OpenAI 兼容地址，例如 https://api.openai.com/v1（需带 /v1）'),
-            ('API Key', v_key, 'Bearer 令牌，如 sk-...'),
-            ('模型名', v_model, '例如 gpt-4o / qwen-vl-max / glm-4v / deepseek-vl'),
-        ]
-        entries = {}
-        for idx, (label, var, tip) in enumerate(rows):
-            r = idx * 2
-            tk.Label(frame, text=label, bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
-                     font=('Microsoft YaHei', 9, 'bold')).grid(row=r, column=0, sticky='w', pady=(10, 2))
-            e = tk.Entry(frame, textvariable=var, show='*' if label == 'API Key' else None,
-                         font=('Segoe UI', 10), bg='#FFFFFF', fg=self.COLOR_TEXT_MAIN,
-                         highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER)
-            e.grid(row=r, column=1, sticky='ew', pady=(10, 2), padx=(10, 0), ipady=2)
-            entries[label] = e
-            if label == 'API Key':
-                tk.Checkbutton(frame, text='显示', variable=v_show_key, bg=self.COLOR_BG,
+        style = ttk.Style(win)
+        try:
+            style.configure('Answer.TNotebook', background=self.COLOR_BG, borderwidth=0)
+            style.configure('Answer.TNotebook.Tab', font=('Microsoft YaHei', 9), padding=(14, 5))
+        except Exception:
+            pass
+        nb = ttk.Notebook(win, style='Answer.TNotebook')
+        nb.pack(fill=tk.BOTH, expand=True, padx=20, pady=(4, 0))
+
+        def _entry(parent, var, show=None, width=None):
+            return tk.Entry(parent, textvariable=var, show=show, width=width,
+                            font=('Segoe UI', 10), bg='#FFFFFF', fg=self.COLOR_TEXT_MAIN,
+                            highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER,
+                            highlightcolor=self.COLOR_PRIMARY)
+
+        def _tip(parent, text):
+            return tk.Label(parent, text=text, bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
+                            font=('Microsoft YaHei', 8), justify='left', anchor='w')
+
+        # ================= 页签 1：答题方式 =================
+        tab_mode = tk.Frame(nb, bg=self.COLOR_BG)
+        nb.add(tab_mode, text='  答题方式  ')
+        tk.Label(tab_mode, text='选择客户端如何得到答案（三种方式互斥，随时可切换）：',
+                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
+                 font=('Microsoft YaHei', 9, 'bold')).pack(anchor='w', padx=18, pady=(14, 8))
+        for mode, label, tip in ANSWER_MODES:
+            card = tk.Frame(tab_mode, bg=self.COLOR_CARD_BG, highlightthickness=1,
+                            highlightbackground=self.COLOR_CARD_BORDER)
+            card.pack(fill=tk.X, padx=18, pady=5)
+            rb = tk.Radiobutton(card, text=label, value=mode, variable=v_mode,
+                                bg=self.COLOR_CARD_BG, fg=self.COLOR_TEXT_MAIN, selectcolor='white',
+                                activebackground=self.COLOR_CARD_BG, cursor='hand2',
+                                font=('Microsoft YaHei', 10, 'bold'))
+            rb.pack(anchor='w', padx=12, pady=(9, 0))
+            tk.Label(card, text=tip, bg=self.COLOR_CARD_BG, fg=self.COLOR_TEXT_MUTED,
+                     font=('Microsoft YaHei', 8), justify='left', anchor='w',
+                     wraplength=630).pack(anchor='w', padx=34, pady=(0, 9))
+        tk.Label(tab_mode, text='说明：方式为「内部答题 API」时，未识别到答案解析失败不会中断刷课；\n'
+                                '方式为「仅识别不答题」时，程序只把题型与题干写进日志，便于排查平台改版。',
+                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8),
+                 justify='left').pack(anchor='w', padx=18, pady=(10, 0))
+
+        # ================= 页签 2：内部答题 API =================
+        tab_api = tk.Frame(nb, bg=self.COLOR_BG)
+        nb.add(tab_api, text='  内部答题 API  ')
+        grid = tk.Frame(tab_api, bg=self.COLOR_BG)
+        grid.pack(fill=tk.X, padx=18, pady=(14, 0))
+        grid.columnconfigure(1, weight=1)
+
+        tk.Label(grid, text='后端地址', bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
+                 font=('Microsoft YaHei', 9, 'bold')).grid(row=0, column=0, sticky='w', pady=(8, 0))
+        _entry(grid, v_server).grid(row=0, column=1, sticky='ew', padx=(10, 0), pady=(8, 0), ipady=3)
+        _tip(grid, '答题模型的部署地址，与「点数/公告/心跳」共用同一个后端，'
+                   '例如 http://127.0.0.1:8000（也可用环境变量 LH_SERVER_URL）'
+             ).grid(row=1, column=1, sticky='w', padx=(10, 0), pady=(2, 0))
+
+        tk.Label(grid, text='账户卡密', bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
+                 font=('Microsoft YaHei', 9, 'bold')).grid(row=2, column=0, sticky='w', pady=(10, 0))
+        _entry(grid, v_card).grid(row=2, column=1, sticky='ew', padx=(10, 0), pady=(10, 0), ipady=3)
+        _tip(grid, '内部答题按卡密扣点，必须填真实卡密；保存后会同步到主界面输入框'
+             ).grid(row=3, column=1, sticky='w', padx=(10, 0), pady=(2, 0))
+
+        box = tk.Frame(tab_api, bg=self.COLOR_CARD_BG, highlightthickness=1,
+                       highlightbackground=self.COLOR_CARD_BORDER)
+        box.pack(fill=tk.X, padx=18, pady=(14, 0))
+        tk.Label(box, text='请求参数', bg=self.COLOR_CARD_BG, fg=self.COLOR_TEXT_MAIN,
+                 font=('Microsoft YaHei', 9, 'bold')).grid(row=0, column=0, columnspan=6,
+                                                           sticky='w', padx=12, pady=(10, 4))
+        _spin = lambda var, lo, hi: tk.Spinbox(box, from_=lo, to=hi, textvariable=var, width=5,
+                                               font=('Segoe UI', 10), bg='#FFFFFF',
+                                               highlightthickness=1,
+                                               highlightbackground=self.COLOR_CARD_BORDER)
+        for col, (lab, var, lo, hi) in enumerate((
+                ('单题超时(秒)', v_timeout, 10, 600),
+                ('并发求解', v_workers, 1, 16),
+                ('失败重试', v_retry, 0, 5))):
+            tk.Label(box, text=lab, bg=self.COLOR_CARD_BG, fg=self.COLOR_TEXT_MAIN,
+                     font=('Microsoft YaHei', 9)).grid(row=1, column=col * 2, sticky='w',
+                                                       padx=(12 if col == 0 else 14, 4), pady=(2, 12))
+            _spin(var, lo, hi).grid(row=1, column=col * 2 + 1, sticky='w', pady=(2, 12))
+        tk.Checkbutton(box, text='批次结束后按实际填涂题数自动结算扣点（POST /solve/checkout）',
+                       variable=v_checkout, bg=self.COLOR_CARD_BG, fg=self.COLOR_TEXT_MAIN,
+                       selectcolor='white', activebackground=self.COLOR_CARD_BG,
+                       font=('Microsoft YaHei', 8), anchor='w', justify='left'
+                       ).grid(row=2, column=0, columnspan=6, sticky='w', padx=12, pady=(0, 10))
+
+        row_test = tk.Frame(tab_api, bg=self.COLOR_BG)
+        row_test.pack(fill=tk.X, padx=18, pady=(12, 0))
+        btn_probe = tk.Button(row_test, text='测试连接', bg=self.COLOR_PRIMARY, fg='white',
+                              font=('Microsoft YaHei', 9, 'bold'), relief=tk.FLAT, cursor='hand2',
+                              activebackground=self.COLOR_PRIMARY_DARK)
+        btn_probe.pack(side=tk.LEFT, ipady=3, padx=(0, 10))
+        self.bind_hover(btn_probe, self.COLOR_PRIMARY_DARK, self.COLOR_PRIMARY)
+        lbl_probe = tk.Label(tab_api, text='尚未测试。点「测试连接」会请求后端 /points，校验地址与卡密。',
+                             bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8),
+                             justify='left', anchor='w', wraplength=640)
+        lbl_probe.pack(anchor='w', padx=18, pady=(8, 0))
+
+        # ================= 页签 3：自配大模型 =================
+        tab_llm = tk.Frame(nb, bg=self.COLOR_BG)
+        nb.add(tab_llm, text='  自配大模型  ')
+        g2 = tk.Frame(tab_llm, bg=self.COLOR_BG)
+        g2.pack(fill=tk.X, padx=18, pady=(14, 0))
+        g2.columnconfigure(1, weight=1)
+        for idx, (lab, var, tip, is_key) in enumerate((
+                ('Base URL', v_url, 'OpenAI 兼容地址，需带 /v1，例如 https://api.openai.com/v1', False),
+                ('API Key', v_key, 'Bearer 令牌，如 sk-...（仅存本地 config.json）', True),
+                ('模型名', v_model, '需支持图片输入，例如 gpt-4o / qwen-vl-max / glm-4v', False))):
+            tk.Label(g2, text=lab, bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
+                     font=('Microsoft YaHei', 9, 'bold')).grid(row=idx * 2, column=0,
+                                                               sticky='w', pady=(10, 0))
+            ent = _entry(g2, var, show='*' if is_key else None)
+            ent.grid(row=idx * 2, column=1, sticky='ew', padx=(10, 0), pady=(10, 0), ipady=3)
+            if is_key:
+                tk.Checkbutton(g2, text='显示', variable=v_show_key, bg=self.COLOR_BG,
                                activebackground=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
-                               command=lambda: entries['API Key'].config(
-                                   show='' if v_show_key.get() else '*')
-                               ).grid(row=r, column=2, sticky='w', padx=(4, 0))
-            if tip:
-                tk.Label(frame, text=tip, anchor='w', justify='left', bg=self.COLOR_BG,
-                         fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8)
-                         ).grid(row=r + 1, column=0, columnspan=3, sticky='w',
-                                padx=(10, 0), pady=(0, 2))
+                               command=lambda e=ent: e.config(show='' if v_show_key.get() else '*')
+                               ).grid(row=idx * 2, column=2, sticky='w', padx=(6, 0))
+            _tip(g2, tip).grid(row=idx * 2 + 1, column=1, sticky='w', padx=(10, 0), pady=(2, 0))
+        row_llm = tk.Frame(tab_llm, bg=self.COLOR_BG)
+        row_llm.pack(fill=tk.X, padx=18, pady=(14, 0))
+        btn_llm_test = tk.Button(row_llm, text='测试连接', bg=self.COLOR_PRIMARY, fg='white',
+                                 font=('Microsoft YaHei', 9, 'bold'), relief=tk.FLAT, cursor='hand2',
+                                 activebackground=self.COLOR_PRIMARY_DARK)
+        btn_llm_test.pack(side=tk.LEFT, ipady=3, padx=(0, 10))
+        self.bind_hover(btn_llm_test, self.COLOR_PRIMARY_DARK, self.COLOR_PRIMARY)
+        lbl_llm_test = tk.Label(tab_llm, text='尚未测试。该通道直连上面的接口，不消耗后端点数。',
+                                bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8),
+                                justify='left', anchor='w', wraplength=640)
+        lbl_llm_test.pack(anchor='w', padx=18, pady=(8, 0))
 
-        tk.Label(win, text='保存后自动写入同目录 config.json（已加入 .gitignore，不上网）。',
-                 bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8)).pack()
-
+        # ================= 底部按钮 =================
         btns = tk.Frame(win, bg=self.COLOR_BG)
-        btns.pack(pady=14)
+        btns.pack(fill=tk.X, pady=(14, 14))
+        tk.Label(btns, text='Ctrl+S 保存 · Esc 关闭', bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
+                 font=('Microsoft YaHei', 8)).pack(side=tk.RIGHT, padx=(0, 22))
 
-        def on_save():
-            save_config({'llm': {
-                'base_url': v_url.get().strip(), 'api_key': v_key.get().strip(),
-                'model': v_model.get().strip()}})
-            self.log(f'[模型设置] 已保存: {v_url.get().strip()}  | 模型: {v_model.get().strip()}')
+        def _save(_event=None):
+            url = v_server.get().strip().rstrip('/')
+            card = v_card.get().strip()
+            if v_mode.get() == 'server' and not url:
+                messagebox.showwarning('答题中心', '选择「内部答题 API」时必须填写后端地址。')
+                return
+            try:
+                timeout = max(10, min(600, int(v_timeout.get())))
+                workers = max(1, min(16, int(v_workers.get())))
+                retry = max(0, min(5, int(v_retry.get())))
+            except (TypeError, ValueError):
+                messagebox.showwarning('答题中心', '单题超时 / 并发求解 / 失败重试 必须填整数。')
+                return
+            ok = update_config({
+                'server_url': url,
+                'answer': {'mode': v_mode.get(), 'solver_timeout': timeout, 'workers': workers,
+                           'retry': retry, 'checkout': bool(v_checkout.get())},
+                'llm': {'base_url': v_url.get().strip().rstrip('/'), 'api_key': v_key.get().strip(),
+                        'model': v_model.get().strip()},
+            })
+            if card != self.ent_key.get().strip():
+                self.ent_key.delete(0, tk.END)
+                self.ent_key.insert(0, card)
+            self.refresh_answer_mode_label()
+            self.query_points()
+            self.log(f'[答题中心] 已保存：方式={ANSWER_MODE_LABELS.get(v_mode.get(), v_mode.get())} | '
+                     f'后端={url or "(空)"} | 超时={timeout}s 并发={workers} 重试={retry} '
+                     f'自动结算={"开" if v_checkout.get() else "关"}')
+            if not ok:
+                messagebox.showerror('答题中心', '写入 config.json 失败，详见 logs/learn_helper.log。')
+                return
             win.destroy()
+            return None
 
-        def on_test():
+        def _probe_thread(target, btn, lbl, pending):
+            btn.configure(state='disabled', text=pending)
+            lbl.configure(text=pending, fg=self.COLOR_TEXT_MUTED)
+
+            def worker():
+                ok, msg = target()
+                def done():
+                    btn.configure(state='normal', text='测试连接')
+                    lbl.configure(text=msg, fg=('#1E7E34' if ok else '#C0392B'))
+                try:
+                    self.root.after(0, done)
+                except Exception:
+                    pass
+                return None
+
+            threading.Thread(target=worker, daemon=True).start()
+            return None
+
+        def _test_api():
+            card = v_card.get().strip()
+            if not card:
+                return False, '请先填写账户卡密。'
+            saved = load_config().get('server_url') or ''
+            typed = v_server.get().strip().rstrip('/')
+            if typed and typed != saved:
+                return False, (f'后端地址已改但尚未保存。\n请先点「保存」，再测试连接。\n\n'
+                               f'（当前生效地址: {saved or get_server_url()}）')
+            return probe_answer_api(card)
+
+        def _test_llm():
             base = v_url.get().strip().rstrip('/')
             key = v_key.get().strip()
             model = v_model.get().strip()
             if not base or not key or not model:
-                messagebox.showwarning('模型测试', '请先填写 Base URL / API Key / 模型名。')
-                return
+                return False, '请先填写 Base URL / API Key / 模型名。'
             try:
                 r = requests.post(f'{base}/chat/completions',
-                                  headers={'Authorization': f'Bearer {key}', 'Content-Type': 'application/json'},
+                                  headers={'Authorization': f'Bearer {key}',
+                                           'Content-Type': 'application/json'},
                                   json={'model': model,
                                         'messages': [{'role': 'user', 'content': '回复 OK 即可'}],
                                         'max_tokens': 16},
                                   timeout=30)
-                if r.status_code == 200:
-                    msg = f'连接成功 ✓  模型: {model}'
-                else:
-                    msg = f'HTTP {r.status_code}: {r.text[:200]}'
             except Exception as e:
-                msg = f'连接失败: {e}'
-            messagebox.showinfo('模型测试', msg)
+                return False, f'连接失败：{e}'
+            if r.status_code == 200:
+                return True, f'连接成功 ✓  模型：{model}'
+            return False, f'HTTP {r.status_code}：{r.text[:200]}'
 
-        tk.Button(btns, text='测试连接', command=on_test, bg=self.COLOR_PRIMARY, fg='white',
-                  font=('Microsoft YaHei', 9), relief=tk.FLAT, cursor='hand2',
-                  activebackground=self.COLOR_PRIMARY_DARK).pack(side=tk.LEFT, padx=6, ipady=3)
-        tk.Button(btns, text='保存', command=on_save, bg=self.COLOR_PRIMARY_DARK, fg='white',
-                  font=('Microsoft YaHei', 9), relief=tk.FLAT, cursor='hand2').pack(side=tk.LEFT, padx=6, ipady=3)
+        btn_probe.configure(command=lambda: _probe_thread(_test_api, btn_probe, lbl_probe, '测试中…'))
+        btn_llm_test.configure(command=lambda: _probe_thread(_test_llm, btn_llm_test, lbl_llm_test, '测试中…'))
+
+        tk.Button(btns, text='保存', command=_save, bg=self.COLOR_PRIMARY_DARK, fg='white',
+                  font=('Microsoft YaHei', 9, 'bold'), relief=tk.FLAT, cursor='hand2',
+                  activebackground=self.COLOR_PRIMARY).pack(side=tk.LEFT, padx=(22, 6), ipady=4)
         tk.Button(btns, text='取消', command=win.destroy, bg=self.COLOR_TEXT_MUTED, fg='white',
-                  font=('Microsoft YaHei', 9), relief=tk.FLAT, cursor='hand2').pack(side=tk.LEFT, padx=6, ipady=3)
+                  font=('Microsoft YaHei', 9), relief=tk.FLAT, cursor='hand2',
+                  activebackground='#95A5A6').pack(side=tk.LEFT, padx=6, ipady=4)
+        win.bind('<Escape>', lambda e: win.destroy())
+        win.bind('<Control-s>', _save)
+        win.bind('<Control-S>', _save)
+
+        win.update_idletasks()
+        try:
+            px, py = self.root.winfo_rootx(), self.root.winfo_rooty()
+            pw, ph = self.root.winfo_width(), self.root.winfo_height()
+            w, h = win.winfo_width(), win.winfo_height()
+            win.geometry(f'+{max(0, px + (pw - w) // 2)}+{max(0, py + (ph - h) // 3)}')
+        except Exception:
+            pass
+        win.focus_force()
         return None
+
+    def refresh_answer_mode_label(self):
+        """把当前生效的答题方式刷新到主界面。"""
+        if not hasattr(self, 'lbl_answer_mode'):
+            return None
+        mode = get_answer_cfg()['mode']
+        color = self.COLOR_PRIMARY if mode == 'server' else (
+            '#B7791F' if mode == 'llm' else self.COLOR_TEXT_MUTED)
+        text = ANSWER_MODE_LABELS.get(mode, mode)
+        if mode == 'server':
+            text = f'{text} · 已扣点'
+        self.lbl_answer_mode.configure(text=f'答题方式: {text}', fg=color)
+        return None
+
     def diagnose_current_page(self):
         """连接浏览器，把当前页（或所选网页）的识别详情写入日志/界面。"""
         selected = self.cb_pages.get().strip()
@@ -1714,6 +2171,7 @@ class AppConsole:
         self.update_task_perception(0, 0)
         self.update_progress_task('闲置中')
         self.update_progress_video('--')
+        self.update_progress_quiz('--')
         return None
 
     def start_solver_thread(self):
@@ -1737,6 +2195,162 @@ class AppConsole:
 
     def update_progress_video(self, percent_text):
         self.root.after(0, lambda: self.lbl_prog_video.configure(text=f'音视频进度: {percent_text}'))
+        return None
+
+    def update_progress_quiz(self, text):
+        """答题进度（1.0.2 答题流程调用但此前漏定义，会抛 AttributeError）。"""
+        self.root.after(0, lambda: self.lbl_prog_quiz.configure(text=f'答题进度: {text}'))
+        return None
+
+    # ---------------- 答题批次（新版本：接入内部答题 API） ----------------
+    def _solve_question_batch(self, questions, target_page):
+        """一批题目的完整处理：识别 → 并发求解 → 填涂 → 结算扣点 → 提交/暂存。
+
+        线程约定：Playwright 的 sync API 绑定创建它的线程，因此**截图、题型识别与填涂
+        都留在本方法所在线程（刷课线程）**，只有纯网络的求解放进 ThreadPoolExecutor 并发。
+        """
+        acfg = get_answer_cfg()
+        mode = acfg['mode']
+        card_key = self.ent_key.get().strip()
+        total_q = len(questions)
+
+        # 仅识别：把题型/题干写进日志，便于平台改版后维护选择器
+        if mode == 'off':
+            self.log(f'      [测验] 探测到文字题 {total_q} 道；当前为「仅识别不答题」，只记录不填涂。')
+            self.update_progress_quiz(f'仅识别 {total_q} 题')
+            for i, q in enumerate(questions):
+                try:
+                    q_type, num_inputs = detect_question_type_and_inputs(q)
+                    text_source = extract_clean_text_with_latex(q)
+                    self.log(f'         [题 {i + 1}/{total_q}] 类型={q_type} 数量={num_inputs} '
+                             f'题干={(text_source or "(无题干)")[:60]}')
+                except Exception as e:
+                    self.log(f'         [题 {i + 1}/{total_q}] 识别失败: {e}')
+            return None
+
+        if mode == 'server' and not card_key:
+            self.log('      [跳过] 答题方式为「内部答题 API」，但账户卡密为空——本卡片不答题。'
+                     '请在「答题设置 → 内部答题 API」填写卡密。')
+            self.update_progress_quiz('缺卡密')
+            return None
+
+        label = ANSWER_MODE_LABELS.get(mode, mode)
+        self.log(f'      [测验] 探测到文字题 {total_q} 道，使用「{label}」求解'
+                 f'（并发 {acfg["workers"]}，单题超时 {acfg["solver_timeout"]}s）...')
+        self.update_progress_task(f'自动做题中（{label}）')
+        self.update_progress_quiz(f'识别到 {total_q} 题')
+
+        # ---- 阶段 1（刷课线程）：截图 + 题型/题干识别 ----
+        items = []
+        for i, q in enumerate(questions):
+            if self.check_pause_and_stop():
+                break
+            try:
+                q.scroll_into_view_if_needed()
+                time.sleep(0.05)
+                img_bytes = q.screenshot()
+                q_type, num_inputs = detect_question_type_and_inputs(q)
+                text_source = extract_clean_text_with_latex(q)
+                items.append({
+                    'idx': i, 'locator': q, 'image': img_bytes,
+                    'q_type': q_type, 'num': num_inputs, 'text': text_source,
+                    'answer': None, 'error': None,
+                })
+                self.log(f'         [题 {i + 1}/{total_q}] 类型={q_type} 数量={num_inputs} '
+                         f'题干={(text_source or "(无题干)")[:40]}')
+            except Exception as e:
+                self.log(f'         [题 {i + 1}/{total_q}] 截图/识别失败: {e}')
+        if not items:
+            self.log('      [警告] 本卡片题目截图/识别全部失败，跳过答题。')
+            self.update_progress_quiz('识别失败')
+            return None
+
+        # ---- 阶段 2（工作线程）：并发求解 ----
+        def _work(it):
+            try:
+                it['answer'] = solve_question(it['image'], it['q_type'], it['num'], it['text'],
+                                              card_key, mode, acfg)
+            except PointsExhausted as e:
+                it['error'] = ('points', str(e))
+            except Exception as e:
+                it['error'] = ('error', str(e))
+            return it
+
+        self.update_progress_quiz(f'求解 0/{len(items)}')
+        done = 0
+        use_pool = acfg['workers'] > 1 and len(items) > 1
+        if use_pool:
+            with ThreadPoolExecutor(max_workers=min(acfg['workers'], len(items))) as pool:
+                for it in pool.map(_work, items):
+                    done += 1
+                    self.update_progress_quiz(f'求解 {done}/{len(items)}')
+        else:
+            for it in items:
+                _work(it)
+                done += 1
+                self.update_progress_quiz(f'求解 {done}/{len(items)}')
+
+        # 点数不足：不再填涂/提交，直接终止并提示充值
+        starved = next((it for it in items if it['error'] and it['error'][0] == 'points'), None)
+        if starved:
+            msg = starved['error'][1]
+            self.log(f'      [终止] 后端点数不足：{msg}。已停止填涂与提交，请充值后重试。')
+            self.update_progress_quiz('点数不足')
+            self.root.after(0, lambda m=msg: messagebox.showwarning(
+                '点数不足', f'内部答题接口返回点数不足：\n{m}\n\n流程已终止，请充值后重试。'))
+            self.trigger_stop()
+            return None
+
+        # ---- 阶段 3（刷课线程）：填涂 ----
+        nc = 0
+        ok_q = 0
+        for it in items:
+            if self.check_pause_and_stop():
+                break
+            if it['error']:
+                self.log(f'         [题 {it["idx"] + 1}] 求解失败: {it["error"][1]}')
+                continue
+            resp = it['answer'] or {}
+            show = resp.get('answer_key') or ', '.join(resp.get('text_answers', []))
+            tag = ' [后端缓存命中]' if resp.get('cached') else ''
+            self.log(f'         [题 {it["idx"] + 1}] 答案: {show or "(空)"}{tag}')
+            ok_q += 1
+            try:
+                if fill_and_click_smart(it['locator'], resp):
+                    nc += 1
+                    self.update_progress_quiz(f'已填涂 {nc}/{total_q}')
+                    time.sleep(0.1)
+                else:
+                    self.log(f'         [题 {it["idx"] + 1}] 答案未能写入页面（选择器可能已失效）')
+            except Exception as e:
+                self.log(f'         [题 {it["idx"] + 1}] 填涂异常: {e}')
+
+        self.log(f'      [完成] 本卡片求解 {ok_q} 题、成功填涂 {nc}/{total_q} 题。')
+        self.update_progress_quiz(f'完成 {nc}/{total_q}')
+
+        # ---- 阶段 4：按「实际填涂成功数」合并结算扣点（与原程序口径一致）----
+        if mode == 'server' and acfg['checkout'] and nc > 0:
+            try:
+                pts = checkout_points(card_key, nc)
+                if pts is not None:
+                    self.root.after(0, lambda p=pts: self.lbl_points.configure(text=f'账户余额: {p}'))
+                self.log(f'      [结算] 已按 {nc} 题合并扣点，后端剩余点数: {pts}')
+            except PointsExhausted as e:
+                self.log(f'      [终止] 结算时后端返回点数不足：{e}')
+                self.update_progress_quiz('点数不足')
+                self.root.after(0, lambda m=str(e): messagebox.showwarning(
+                    '点数不足', f'结算扣点时后端返回点数不足：\n{m}\n\n流程已终止，请充值后重试。'))
+                self.trigger_stop()
+                return None
+            except Exception as e:
+                self.log(f'      [警告] 结算扣点失败：{e}（题目已填涂，本次未扣点）')
+
+        # ---- 阶段 5：提交 / 暂存 ----
+        if nc > 0 and not self.check_pause_and_stop():
+            if self.var_auto_submit.get():
+                self._do_submit_target_page(target_page)
+            else:
+                self._do_save_target_page(target_page)
         return None
 
     # ---------------- 自动化核心 ----------------
@@ -2105,45 +2719,14 @@ class AppConsole:
                                 pass
                             time.sleep(0.3)
 
-                            # ---- 答题（1.0.2：直连本地配置的大模型）----
+                            # ---- 答题（新版本：内部答题模型 / 自配大模型 / 仅识别）----
                             questions, target_frame = scan_page_recursively(target_page)
                             if questions:
                                 if check_quiz_completed(questions, target_frame):
                                     self.log('      [跳过] 该测验任务点已被平台标记完成。')
                                     self.update_progress_quiz('已完成')
                                 else:
-                                    total_q = len(questions)
-                                    self.log(f'      [测验] 探测到文字题 {total_q} 道，正在截图并调用大模型...')
-                                    self.update_progress_task('自动做题中')
-                                    self.update_progress_quiz(f'识别到 {total_q} 题')
-                                    nc = 0
-                                    for i, q in enumerate(questions):
-                                        if self.check_pause_and_stop():
-                                            break
-                                        try:
-                                            q.scroll_into_view_if_needed()
-                                            time.sleep(0.05)
-                                            img_bytes = q.screenshot()
-                                            q_type, num_inputs = detect_question_type_and_inputs(q)
-                                            text_source = extract_clean_text_with_latex(q)
-                                            self.log(f'         [题 {i + 1}/{total_q}] 类型={q_type} '
-                                                     f'数量={num_inputs} 题干={(text_source or "(无题干)")[:40]}')
-                                            resp = solve_with_llm(img_bytes, q_type, num_inputs, text_source)
-                                            show = resp.get('answer_key') or ', '.join(resp.get('text_answers', []))
-                                            self.log(f'         [题 {i + 1}] 模型答案: {show or "(空)"}')
-                                            if fill_and_click_smart(q, resp):
-                                                nc += 1
-                                                self.update_progress_quiz(f'已填涂 {nc}/{total_q}')
-                                                time.sleep(0.1)
-                                        except Exception as e:
-                                            self.log(f'         [题 {i + 1}] 失败: {e}')
-                                    self.log(f'      [完成] 本卡片填涂 {nc}/{total_q} 题。')
-                                    self.update_progress_quiz(f'完成 {nc}/{total_q}')
-                                    if nc > 0 and not self.check_pause_and_stop():
-                                        if self.var_auto_submit.get():
-                                            self._do_submit_target_page(target_page)
-                                        else:
-                                            self._do_save_target_page(target_page)
+                                    self._solve_question_batch(questions, target_page)
                             else:
                                 self.update_progress_quiz('无题目')
 
