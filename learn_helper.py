@@ -1980,13 +1980,36 @@ class AppConsole:
                 saved_url = None
 
                 while True:
-                    context = browser.contexts[0]
+                    # 浏览器上下文丢失时自动重连，避免 list index out of range 中断流程
+                    if not browser.contexts:
+                        self.log('[警告] 浏览器上下文丢失，正在重新拉起浏览器...')
+                        try:
+                            kill_and_launch_browser()
+                            time.sleep(1.0)
+                            browser = p.chromium.connect_over_cdp('http://127.0.0.1:9222')
+                        except Exception as e:
+                            self.log(f'[错误] 浏览器重连失败: {e}')
+                            break
+                    try:
+                        context = browser.contexts[0]
+                    except Exception:
+                        context = None
+                    if context is None:
+                        self.log('[错误] 浏览器上下文不可用，流程结束。')
+                        break
                     if not context.pages:
-                        target_page = context.new_page()
+                        try:
+                            target_page = context.new_page()
+                        except Exception as e:
+                            self.log(f'[错误] 新建标签页失败: {e}')
+                            break
                         time.sleep(0.5)
                     elif saved_url:
-                        target_page = context.pages[-1]
-                        target_page.goto(saved_url)
+                        target_page = context.pages[-1] if context.pages else context.new_page()
+                        try:
+                            target_page.goto(saved_url)
+                        except Exception as e:
+                            self.log(f'[警告] 返回目标页失败: {e}')
                         self.log('[系统] 🌟 浏览器重启完毕，已返回目标页，继续刷课...')
                         saved_url = None
                     else:
@@ -1999,7 +2022,7 @@ class AppConsole:
                             except Exception:
                                 pass
                         if not target_page:
-                            target_page = context.pages[-1]
+                            target_page = context.pages[-1] if context.pages else context.new_page()
                     self.log(f'[系统] 锁定当前网页: 【{target_page.title()}】')
                     target_page.on('dialog', lambda dialog: dialog.accept())
 
