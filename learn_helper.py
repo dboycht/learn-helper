@@ -1495,13 +1495,14 @@ class AppConsole:
         cfg = get_llm_cfg()
         win = tk.Toplevel(self.root)
         win.title('大模型配置 (1.0.2 答题)')
-        win.geometry('560x300')
+        win.geometry('600x360')
         win.resizable(False, False)
         win.configure(bg=self.COLOR_BG)
 
         v_url = tk.StringVar(value=cfg['base_url'])
         v_key = tk.StringVar(value=cfg['api_key'])
         v_model = tk.StringVar(value=cfg['model'])
+        v_show_key = tk.BooleanVar(value=False)
 
         frame = tk.Frame(win, bg=self.COLOR_BG)
         frame.pack(fill=tk.BOTH, expand=True, padx=24, pady=(18, 6))
@@ -1511,16 +1512,27 @@ class AppConsole:
             ('API Key', v_key, 'Bearer 令牌，如 sk-...'),
             ('模型名', v_model, '例如 gpt-4o / qwen-vl-max / glm-4v / deepseek-vl'),
         ]
-        for i, (label, var, tip) in enumerate(rows):
+        entries = {}
+        for idx, (label, var, tip) in enumerate(rows):
+            r = idx * 2
             tk.Label(frame, text=label, bg=self.COLOR_BG, fg=self.COLOR_TEXT_MAIN,
-                     font=('Microsoft YaHei', 9, 'bold')).grid(row=i, column=0, sticky='w', pady=(8, 2))
-            tk.Entry(frame, textvariable=var, show='*' if label == 'API Key' else None,
-                     font=('Segoe UI', 10), bg='#FFFFFF', fg=self.COLOR_TEXT_MAIN,
-                     highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER
-                     ).grid(row=i, column=1, sticky='ew', pady=(8, 2), padx=(10, 0))
+                     font=('Microsoft YaHei', 9, 'bold')).grid(row=r, column=0, sticky='w', pady=(10, 2))
+            e = tk.Entry(frame, textvariable=var, show='*' if label == 'API Key' else None,
+                         font=('Segoe UI', 10), bg='#FFFFFF', fg=self.COLOR_TEXT_MAIN,
+                         highlightthickness=1, highlightbackground=self.COLOR_CARD_BORDER)
+            e.grid(row=r, column=1, sticky='ew', pady=(10, 2), padx=(10, 0), ipady=2)
+            entries[label] = e
+            if label == 'API Key':
+                tk.Checkbutton(frame, text='显示', variable=v_show_key, bg=self.COLOR_BG,
+                               activebackground=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
+                               command=lambda: entries['API Key'].config(
+                                   show='' if v_show_key.get() else '*')
+                               ).grid(row=r, column=2, sticky='w', padx=(4, 0))
             if tip:
-                tk.Label(frame, text=tip, bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED,
-                         font=('Microsoft YaHei', 8)).grid(row=i, column=1, sticky='w', padx=(10, 0))
+                tk.Label(frame, text=tip, anchor='w', justify='left', bg=self.COLOR_BG,
+                         fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8)
+                         ).grid(row=r + 1, column=0, columnspan=3, sticky='w',
+                                padx=(10, 0), pady=(0, 2))
 
         tk.Label(win, text='保存后自动写入同目录 config.json（已加入 .gitignore，不上网）。',
                  bg=self.COLOR_BG, fg=self.COLOR_TEXT_MUTED, font=('Microsoft YaHei', 8)).pack()
