@@ -1560,6 +1560,7 @@ class AppConsole:
         self.solver_thread = None
         self.solver_running = False
         self.shutting_down = False
+        self._last_saved_url = None
 
         self.notice_text = '正在连接服务器并同步版本信息...'
         self.scroll_index = 0
@@ -1953,6 +1954,10 @@ class AppConsole:
                         context.new_page()
                         time.sleep(0.5)
                     pages_list, _used_url = collect_page_labels(context, attempts=6)
+                    if not pages_list:
+                        # 浏览器被关过、或只剩空白页：尝试自动跳回上次记住的学习页
+                        if self._reopen_last_page(context) is not None:
+                            pages_list, _used_url = collect_page_labels(context, attempts=6)
                     browser.close()
                     self.root.after(0, lambda: self.update_pages_dropdown(pages_list))
             except Exception as ex:
@@ -1994,6 +1999,101 @@ class AppConsole:
     def update_pages_dropdown(self, pages_list):
         self.btn_refresh.configure(state='normal', text='检测/刷新网页')
         self._fill_dropdown(self._clean_pages(pages_list), quiet=False)
+        return None
+
+    # ---------------- 目标页面定位 / 自动恢复 ----------------
+    @staticmethod
+    def _locate_page(context, selected_title):
+        """按下拉框里的标题（或冷启动时的 URL 兜底）找目标标签页；找不到返回 None。"""
+        want = (selected_title or '').strip()
+        if not want:
+            return None
+        try:
+            pages = list(context.pages)
+        except Exception:
+            return None
+        for pg in pages:
+            try:
+                if (pg.title() or '').strip() == want:
+                    return pg
+            except Exception:
+                pass
+        for pg in pages:                        # 标题没匹配上，再按 URL 匹配一次
+            try:
+                if (pg.url or '').strip() == want:
+                    return pg
+            except Exception:
+                pass
+        return None
+
+    def remember_page(self, page):
+        """记住当前学习页地址，供"页面被关掉后自动跳回"使用（同址不重复写盘）。"""
+        try:
+            url = (page.url or '').strip()
+        except Exception:
+            return None
+        if not url or url == 'about:blank' or url == self._last_saved_url:
+            return None
+        try:
+            title = (page.title() or '').strip()
+        except Exception:
+            title = ''
+        self._last_saved_url = url
+        update_config({'last_page_url': url, 'last_page_title': title})
+        LOGGER.info(f'[系统] 已记住学习页: {title or url}')
+        return None
+
+    def _reopen_last_page(self, context):
+        """所选页面已不存在时，自动跳回 config.json 里记住的上次学习页。
+
+        成功返回 page 对象；没有记录或跳转失败返回 None。只使用记住的 URL，不猜地址。
+        """
+        cfg = load_config()
+        url = (cfg.get('last_page_url') or '').strip()
+        title = (cfg.get('last_page_title') or '').strip()
+        if not url or url == 'about:blank':
+            self.log('[系统] 没有记住的学习页地址，无法自动恢复页面。')
+            return None
+        self.log(f'[系统] 所选页面已不存在，正在自动跳回上次的学习页：{title or url}')
+        page = None
+        try:
+            for pg in list(context.pages):
+                try:
+                    if (pg.url or '').strip() in ('', 'about:blank'):
+                        page = pg
+                        break
+                except Exception:
+                    pass
+            if page is None:
+                page = context.new_page()
+            page.goto(url, wait_until='domcontentloaded', timeout=30000)
+        except Exception as e:
+            self.log(f'[警告] 自动跳回学习页失败：{e}')
+            return None
+        for _ in range(20):                     # 最多再等 10 秒让标题出来
+            try:
+                if (page.title() or '').strip():
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        try:
+            label = (page.title() or '').strip() or (page.url or '')
+        except Exception:
+            label = url
+        self.log(f'[系统] ✅ 已自动恢复学习页：【{label}】')
+        return page
+
+    def _warn_page_lost(self, selected_title):
+        """页面丢失且无法自动恢复：明确提示并停止，不空跑。"""
+        msg = (f'未找到所选页面「{selected_title}」，也没有可自动恢复的学习页记录。\n\n'
+               f'请在沙盒浏览器里登录并打开学习页，点「检测/刷新网页」重新选择后再启动。')
+        self.log('[错误] 未找到所选页面且无法自动恢复，已停止本次刷课。')
+        self.update_progress_task('已停止：页面丢失')
+        try:
+            self.root.after(0, lambda m=msg: messagebox.showwarning('页面已丢失', m))
+        except Exception:
+            pass
         return None
 
     # ---------------- 运行控制 ----------------
@@ -2497,6 +2597,15 @@ class AppConsole:
         self.btn_stop.configure(state='normal')
         return None
 
+    def _finish_run(self):
+        """刷课线程的统一收尾：复位运行标志并恢复按钮态。"""
+        self.solver_running = False
+        try:
+            self.root.after(0, self.reset_control_buttons)
+        except Exception:
+            pass
+        return None
+
     def reset_control_buttons(self):
         self.solver_running = False
         self.btn_run.configure(state='normal', text='启动刷课')
@@ -2850,7 +2959,7 @@ class AppConsole:
         selected_title = self.cb_pages.get().strip()
         if (not selected_title) or '[请点击' in selected_title or '[安全浏览器' in selected_title:
             messagebox.showwarning('提示', '请先在浏览器中点开学习页，并在下拉框中选择要刷的网页！')
-            self.solver_running = False
+            self._finish_run()
             return None
 
         self.stop_requested = False
@@ -2867,7 +2976,7 @@ class AppConsole:
             self.browser_proc = proc
         else:
             self.log('[错误] 浏览器挂载失败，请先手动打开一个 Edge 窗口。')
-            self.root.after(0, self.reset_control_buttons)
+            self._finish_run()
             return None
 
         start_time = time.time()
@@ -2878,22 +2987,16 @@ class AppConsole:
                 browser = p.chromium.connect_over_cdp('http://127.0.0.1:9222')
                 context = browser.contexts[0]
 
-                if not context.pages:
-                    self.log('[警告] 浏览器无活动标签页，正在自动新建...')
-                    target_page = context.new_page()
-                    time.sleep(0.5)
-                else:
-                    target_page = None
-                    for pg in context.pages:
-                        try:
-                            if pg.title() == selected_title:
-                                target_page = pg
-                                break
-                        except Exception:
-                            pass
-                    if not target_page:
-                        target_page = context.pages[-1]
+                target_page = self._locate_page(context, selected_title)
+                if target_page is None:
+                    # 页面被关掉 / 浏览器被关过重启：先尝试自动跳回上次记住的学习页
+                    target_page = self._reopen_last_page(context)
+                if target_page is None:
+                    self._finish_run()          # 先复位按钮态，再写提示（否则提示会被覆盖成"闲置中"）
+                    self._warn_page_lost(selected_title)
+                    return None
 
+                self.remember_page(target_page)
                 self.log(f'[系统] 锁定当前网页: 【{target_page.title()}】')
                 target_page.on('dialog', lambda dialog: dialog.accept())
                 page_counter = 1
@@ -2938,16 +3041,19 @@ class AppConsole:
                         self.log('[系统] 🌟 浏览器重启完毕，已返回目标页，继续刷课...')
                         saved_url = None
                     else:
-                        target_page = None
-                        for pg in context.pages:
+                        found = self._locate_page(context, selected_title)
+                        if found is not None:
+                            target_page = found
+                        elif not context.pages:
+                            target_page = context.new_page()
+                        elif target_page is not None:
                             try:
-                                if pg.title() == selected_title:
-                                    target_page = pg
-                                    break
+                                target_page.url          # 还在就继续用它
                             except Exception:
-                                pass
-                        if not target_page:
-                            target_page = context.pages[-1] if context.pages else context.new_page()
+                                target_page = context.pages[-1]
+                        else:
+                            target_page = context.pages[-1]
+                    self.remember_page(target_page)
                     self.log(f'[系统] 锁定当前网页: 【{target_page.title()}】')
                     target_page.on('dialog', lambda dialog: dialog.accept())
 
@@ -3206,11 +3312,7 @@ class AppConsole:
                         pass
         except Exception as e:
             self.log(f'[错误] 流程异常中断: {e}')
-        self.solver_running = False
-        try:
-            self.root.after(0, self.reset_control_buttons)
-        except Exception:
-            pass
+        self._finish_run()
         return None
 
 
