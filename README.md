@@ -12,6 +12,7 @@
 
 ## 文件
 - `learn_helper.py` —— 刷课 + 答题客户端（Tkinter + Playwright/CDP 9222）
+- **`docs/对接文档.md`** —— **后端 / 答题模型对接文档**（接口契约、参考实现、内置自检与排错）
 - `client_app_reconstructed.py` —— 原软件的反编译重建（研究参考，见 `docs/技术文档.md`）
 - `docs/技术文档.md` —— 反编译技术文档（**描述原始 exe**，含其原始接口契约）
 

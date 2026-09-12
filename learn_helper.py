@@ -51,7 +51,7 @@ except Exception as _imp_err:
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext
 
-APP_VERSION = '1.0.2'
+APP_VERSION = '1.0.3'
 SCHOOL_ID = 'nuaa'
 
 # 全局退出信号：置位后并发求解会放弃剩余在途请求（见 run_parallel / shutdown_and_exit）
@@ -906,10 +906,17 @@ def _normalize_answer(data, q_type):
     return {'question_type': q_type, 'answer_key': '', 'text_answers': []}
 
 
+class SolverHTTPError(RuntimeError):
+    """4xx（路由不存在 / 鉴权失败 / 请求体不合规范）：重试无意义，调用方应立即放弃。"""
+
+
 def _post_json(url, payload, timeout):
     """统一的 POST 封装：把 HTTP 错误码翻译成可读中文异常。
 
-    返回 (status_code, data_dict)。requests 层异常原样抛出，由调用方重试。
+    返回 (status_code, data_dict)。
+    · 4xx → 抛 SolverHTTPError（**不可重试**）
+    · 5xx → 抛 RuntimeError（可重试）
+    · requests 层异常（超时/断连）原样抛出，由调用方重试
     """
     res = requests.post(url, json=payload, timeout=timeout)
     detail = ''
@@ -922,10 +929,12 @@ def _post_json(url, payload, timeout):
     if res.status_code == 200:
         return 200, data
     if res.status_code in (401, 403):
-        raise RuntimeError(f'后端拒绝访问（HTTP {res.status_code}）：'
-                           f'{detail or "接口可能需要鉴权或设备未授权"}')
+        raise SolverHTTPError(f'后端拒绝访问（HTTP {res.status_code}）：'
+                              f'{detail or "接口可能需要鉴权或设备未授权"}')
     if res.status_code == 404:
-        raise RuntimeError(f'后端没有该接口（HTTP 404）：{detail or url}')
+        raise SolverHTTPError(f'后端没有该接口（HTTP 404）：{detail or url}')
+    if 400 <= res.status_code < 500:
+        raise SolverHTTPError(f'请求被后端拒绝（HTTP {res.status_code}）：{detail}')
     raise RuntimeError(f'HTTP {res.status_code}: {detail}')
 
 
@@ -963,6 +972,8 @@ def solve_with_server(image_bytes, q_type, num_blanks, text_source,
             LOGGER.info(f'[内部答题] 命中 answer_key={ans["answer_key"]!r} '
                         f'texts={len(ans["text_answers"])} cached={ans["cached"]}')
             return ans
+        except SolverHTTPError:
+            raise                      # 4xx：重试没有意义，立即放弃
         except Exception as e:
             last_err = e
             if attempt < retry:
