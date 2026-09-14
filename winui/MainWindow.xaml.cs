@@ -3,6 +3,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Reflection;
+using System.Threading.Tasks;
 using Microsoft.UI;
 using Microsoft.UI.Windowing;
 using Microsoft.UI.Xaml;
@@ -133,6 +134,26 @@ public sealed partial class MainWindow : Window
         Closed += OnClosed;
 
         AppendLog("[界面] WinUI 3 界面已启动。");
+
+        // ---- Python backend (1.0.4): start it and subscribe to its push channel ----
+        // Deferred to after the first paint so the connection log lands in a laid-out
+        // log surface; the backend itself is launched off the UI thread.
+        RootGrid.Loaded += (_, _) =>
+        {
+            InitializeBackend();
+
+            // Verification hook (agent cannot click): drive one backend action by name.
+            var backendAction = Environment.GetEnvironmentVariable("LH_UI_BACKEND");
+            if (!string.IsNullOrWhiteSpace(backendAction))
+            {
+                DispatcherQueue.TryEnqueue(Microsoft.UI.Dispatching.DispatcherQueuePriority.Low,
+                    async () =>
+                    {
+                        await Task.Delay(1500);
+                        await RunBackendScriptedActionAsync(backendAction);
+                    });
+            }
+        };
 
         // Verification hook: open a drawer programmatically so a script can exercise it
         // (the agent cannot click). Harmless in normal runs - the variable is unset.
@@ -1200,6 +1221,10 @@ public sealed partial class MainWindow : Window
 
     private void OnClosed(object sender, WindowEventArgs args)
     {
+        // Stop the backend (and the browser it owns) with the window: leaving either
+        // behind would keep the sandbox Edge profile locked for the next run.
+        ShutdownBackend();
+
         if (_backdrop != null)
         {
             _backdrop.Enabled = false;
@@ -1227,12 +1252,5 @@ public sealed partial class MainWindow : Window
         FlyoutStateText.Text =
             $"当前生效：{active}\n材质层回报：{_materialStatus}\n表面画刷：{surfaceNote}\n" +
             $"设置文件：{SettingsService.SettingsPath}";
-    }
-
-    private void AppendLog(string line)
-    {
-        var stamp = DateTime.Now.ToString("HH:mm:ss");
-        LogText.Text += $"[{stamp}] {line}{Environment.NewLine}";
-        LogScroll.ChangeView(null, LogScroll.ScrollableHeight, null, true);
     }
 }

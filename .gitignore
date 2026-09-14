@@ -4,10 +4,18 @@ logs/
 browser_profile/
 config.json
 
-# WinUI 3 (C#) build outputs
+# WinUI 3 (C#) build outputs -- kept as the fallback UI line
 winui/bin/
 winui/obj/
 *.user
+
+# native Rust UI (default since 2.1.1) build outputs
+native/target/
+native/native-capture.png
+
+# release staging (built by native/build_release.ps1)
+dist/
+.runtime/
 
 # Dev-only docs and artifacts (never pushed)
 DEVELOPMENT.md

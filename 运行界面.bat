@@ -1,17 +1,18 @@
 @echo off
 chcp 65001 >nul
 rem ============================================================
-rem  learn-helper WinUI 3 -- double-click launcher (developer build)
+rem  learn-helper 2.x -- native default launcher (developer build)
 rem
-rem  Why this exists: the real exe lives deep inside
-rem  winui\bin\x64\Debug\net9.0-windows10.0.19041.0\win-x64\
-rem  which is painful to find. This just runs it.
+rem  The product UI since 2.1.1 is the ZERO-DEPENDENCY Rust Win32 app
+rem  (native\), a single exe of about 0.3 MB that needs no runtime install.
+rem  The former WinUI 3 build is kept as a fallback and has its own
+rem  launcher: winui\RunWinUI.bat
 rem
-rem  If it says "not built yet", run:
-rem      dotnet build winui\LearnHelper.App.csproj -p:Platform=x64
+rem  If it says "not built yet", build it with:
+rem      cd native  &&  cargo build --release
 rem ============================================================
 
-set "EXE=%~dp0winui\bin\x64\Debug\net9.0-windows10.0.19041.0\win-x64\LearnHelper.App.exe"
+set "EXE=%~dp0native\target\release\learn-helper-native.exe"
 
 if not exist "%EXE%" (
     echo.
@@ -19,18 +20,21 @@ if not exist "%EXE%" (
     echo       %EXE%
     echo.
     echo   Build it first with:
-    echo       dotnet build winui\LearnHelper.App.csproj -p:Platform=x64
+    echo       cd native ^&^& cargo build --release
+    echo.
+    echo   Or try the fallback WinUI build:
+    echo       winui\RunWinUI.bat
     echo.
     pause
     exit /b 1
 )
 
 echo.
-echo   Starting learn-helper ^(WinUI 3^) ...
-echo   Settings file:
-echo       %~dp0winui\bin\x64\Debug\net9.0-windows10.0.19041.0\win-x64\ui-settings.json
+echo   Starting learn-helper ^(native Win32^) ...
 echo   Diagnostics log:
-echo       %~dp0winui\bin\x64\Debug\net9.0-windows10.0.19041.0\win-x64\ui-diag.log
+echo       %~dp0native\target\release\native-diag.log
+echo   Backend log:
+echo       %~dp0logs\learn_helper.log
 echo.
 
 start "" "%EXE%"

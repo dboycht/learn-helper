@@ -208,7 +208,7 @@
                         <TextBlock Text="系统公告" FontSize="11" FontWeight="SemiBold"
                                    Foreground="{StaticResource GlassAccentBrush}" Tag="accent" />
                     </Border>
-                    <TextBlock Text="界面已迁移到 WinUI 3（Mica/Acrylic 玻璃）· 后端为 Python 服务"
+                    <TextBlock x:Name="NoticeText" Text="正在连接 Python 后端服务…"
                                FontSize="12" VerticalAlignment="Center"
                                Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
                 </StackPanel>
@@ -239,13 +239,19 @@
                 <StackPanel Orientation="Horizontal" Spacing="14">
                     <TextBlock Text="当前网页" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"
                                Foreground="{StaticResource GlassTextMainBrush}" Tag="textMain" />
-                    <ComboBox x:Name="PageCombo" MinWidth="380" SelectedIndex="0"
+                    <ComboBox x:Name="PageCombo" MinWidth="340" SelectedIndex="0"
+                              SelectionChanged="OnPageSelectionChanged"
                               IsTabStop="False"
                               FocusVisualPrimaryThickness="0"
                               FocusVisualSecondaryThickness="0"
                               FocusVisualMargin="0">
-                        <ComboBoxItem Content="[待检测] 点击刷新获取浏览器标签页" />
+                        <ComboBoxItem Content="[待检测] 点击右侧刷新获取浏览器标签页" />
                     </ComboBox>
+                    <Button x:Name="RefreshPagesButton" Content="检测/刷新网页"
+                            Click="OnRefreshPagesClick" MinWidth="120" Height="32"
+                            Style="{StaticResource FlatAccentButtonStyle}"
+                            IsTabStop="False" FocusVisualPrimaryThickness="0"
+                            FocusVisualSecondaryThickness="0" />
                 </StackPanel>
             </Border>
 
@@ -267,7 +273,7 @@
                             <Border x:Name="KpiTile1" Width="96" Height="76" CornerRadius="10"
                                     Background="{StaticResource GlassCardHiBrush}">
                                 <StackPanel VerticalAlignment="Center" Spacing="4">
-                                    <TextBlock Text="3" FontSize="24" FontWeight="Bold"
+                                    <TextBlock x:Name="KpiVideoValue" Text="0" FontSize="24" FontWeight="Bold"
                                                HorizontalAlignment="Center"
                                                Foreground="{StaticResource GlassAccentBrush}" Tag="accent" />
                                     <TextBlock Text="视频任务" FontSize="11" HorizontalAlignment="Center"
@@ -277,7 +283,7 @@
                             <Border x:Name="KpiTile2" Width="96" Height="76" CornerRadius="10"
                                     Background="{StaticResource GlassCardHiBrush}">
                                 <StackPanel VerticalAlignment="Center" Spacing="4">
-                                    <TextBlock Text="1" FontSize="24" FontWeight="Bold"
+                                    <TextBlock x:Name="KpiDocValue" Text="0" FontSize="24" FontWeight="Bold"
                                                HorizontalAlignment="Center"
                                                Foreground="{StaticResource GlassSuccessBrush}" Tag="success" />
                                     <TextBlock Text="文档阅读" FontSize="11" HorizontalAlignment="Center"
@@ -287,7 +293,7 @@
                             <Border x:Name="KpiTile3" Width="96" Height="76" CornerRadius="10"
                                     Background="{StaticResource GlassCardHiBrush}">
                                 <StackPanel VerticalAlignment="Center" Spacing="4">
-                                    <TextBlock Text="5" FontSize="24" FontWeight="Bold"
+                                    <TextBlock x:Name="KpiQuizValue" Text="0" FontSize="24" FontWeight="Bold"
                                                HorizontalAlignment="Center"
                                                Foreground="{StaticResource GlassWarnBrush}" Tag="warn" />
                                     <TextBlock Text="测验题目" FontSize="11" HorizontalAlignment="Center"
@@ -305,11 +311,11 @@
                     <StackPanel Spacing="8">
                         <TextBlock Text="实时执行进度" FontSize="12" FontWeight="SemiBold"
                                    Foreground="{StaticResource GlassTextMainBrush}" Tag="textMain" />
-                        <TextBlock Text="当前状态   闲置中" FontSize="12"
+                        <TextBlock x:Name="ProgressTaskText" Text="当前状态   闲置中" FontSize="12"
                                    Foreground="{StaticResource GlassAccentBrush}" Tag="accent" />
-                        <TextBlock Text="音视频进度 --" FontSize="12"
+                        <TextBlock x:Name="ProgressVideoText" Text="音视频进度 --" FontSize="12"
                                    Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
-                        <TextBlock Text="答题进度   --" FontSize="12"
+                        <TextBlock x:Name="ProgressQuizText" Text="答题进度   --" FontSize="12"
                                    Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
                     </StackPanel>
                 </Border>
@@ -318,14 +324,19 @@
             <!-- controls -->
             <StackPanel Grid.Row="4" Orientation="Horizontal" Spacing="10" Margin="0,4,0,10">
                 <Button x:Name="StartButton" Content="启动刷课" MinWidth="140"
+                        Click="OnStartClick"
                         Style="{StaticResource FlatAccentButtonStyle}" />
-                <Button Content="暂停进程" MinWidth="96" Height="38" IsEnabled="False"
+                <Button x:Name="PauseButton" Content="暂停进程" MinWidth="96" Height="38" IsEnabled="False"
+                        Click="OnPauseClick"
                         CornerRadius="{StaticResource GlassControlRadius}" />
-                <Button Content="答题设置" MinWidth="96" Height="38"
+                <Button x:Name="AnswerButton" Content="答题设置" MinWidth="96" Height="38"
+                        Click="OnAnswerSettingsClick"
                         CornerRadius="{StaticResource GlassControlRadius}" />
-                <Button Content="诊断页面" MinWidth="90" Height="38"
+                <Button x:Name="DiagnoseButton" Content="诊断页面" MinWidth="90" Height="38"
+                        Click="OnDiagnoseClick"
                         CornerRadius="{StaticResource GlassControlRadius}" />
-                <Button Content="终止并退出" MinWidth="110" Height="38"
+                <Button x:Name="StopButton" Content="终止并退出" MinWidth="110" Height="38"
+                        Click="OnStopClick"
                         CornerRadius="{StaticResource GlassControlRadius}" />
             </StackPanel>
 

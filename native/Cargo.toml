@@ -1,0 +1,19 @@
+[package]
+name = "learn-helper-native"
+version = "2.1.1"
+edition = "2021"
+description = "学习助理 · 原生 Win32 界面（零依赖、单 exe）"
+
+# 目标：体积最小、零运行时依赖。
+# • 不用 windows-rs：直接声明需要的 Win32/WinHTTP 函数（FFI），省掉整包元数据与
+#   生成胶水代码的链接体积。
+# • 不用 reqwest/openssl：HTTP 走系统自带的 WinHTTP，连 TLS 都由 OS 提供。
+# • 唯一的 crate 依赖是 serde_json —— 为后续接管道事件预留（可选）。
+[dependencies]
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
