@@ -35,6 +35,21 @@ enum Theme {
     Light,
 }
 
+/// 无边框窗口的拖拽 / 缩放模式（我们自己实现，因为去掉了 WS_CAPTION/WS_THICKFRAME）。
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Grab {
+    None,
+    Move,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
 #[derive(Clone, Copy)]
 struct Colors {
     bg: u32,
@@ -129,6 +144,13 @@ pub struct App {
     last_mouse: POINT,
     timer_ui_armed: bool,
     theme_glyph: u32,
+
+    // ---- 自实现的窗口拖拽 / 缩放（无系统标题栏）----
+    grab: Grab,
+    grab_origin: POINT,      // 按下时的**屏幕**坐标
+    grab_window: RECT,       // 按下时的窗口矩形
+    last_click_ms: u64,      // 双击最大化用
+    last_click_pt: POINT,
 }
 
 impl App {
@@ -159,6 +181,11 @@ impl App {
             last_mouse: POINT { x: 0, y: 0 },
             timer_ui_armed: false,
             theme_glyph: 0xE706,
+            grab: Grab::None,
+            grab_origin: POINT { x: 0, y: 0 },
+            grab_window: RECT::default(),
+            last_click_ms: 0,
+            last_click_pt: POINT { x: 0, y: 0 },
         };
         app.init_fonts();
         app
@@ -372,6 +399,17 @@ impl App {
         }
     }
 
+    /// 渲染探针：把**客户区**按当前状态重绘到给定 hdc（不经过 DWM、不碰屏幕）。
+    ///
+    /// 为什么需要它：`PrintWindow` 在无边框窗口上取不到客户区（返回的是 DWM 合成的背板），
+    /// 于是"界面到底画成什么样"就没法自动化验证。这里直接调用我们自己的绘制代码，
+    /// 把同一份布局画进内存 DC，落盘成 BMP 供核对 —— 见 `--render-probe`。
+    pub fn render_to(&mut self, hdc: HDC, w: i32, h: i32) {
+        self.w = w;
+        self.h = h;
+        self.paint(hdc);
+    }
+
     // ================================================================ 绘制
     pub fn paint(&mut self, hdc: HDC) {
         let w = self.w;
@@ -404,13 +442,13 @@ impl App {
             server_url: state.server_url.clone(),
             logs: state.logs.clone(),
             last_error: state.engine.last_error.clone(),
-        };
-        drop(state);
+            maximized: unsafe { IsZoomed(self.hwnd) } != 0,
+        };        drop(state);
 
         // 背景
         gdi::fill_rect(hdc, RECT { left: 0, top: 0, right: w, bottom: h }, colors.bg);
 
-        self.paint_title_bar(hdc, w);
+        self.paint_title_bar(hdc, w, state_for_paint.maximized);
         self.paint_card(hdc, layout.status, colors, &state_for_paint);
         self.paint_page_card(hdc, layout.page, colors, &state_for_paint);
         self.paint_kpi_progress(hdc, layout.kpi, layout.progress, colors, &state_for_paint);
@@ -418,7 +456,7 @@ impl App {
         self.paint_log(hdc, layout.log, colors, &state_for_paint);
     }
 
-    fn paint_title_bar(&mut self, hdc: HDC, w: i32) {
+    fn paint_title_bar(&mut self, hdc: HDC, w: i32, maximized: bool) {
         let colors = self.colors;
         let th = self.title_h();
         let title_rc = RECT {
@@ -439,7 +477,7 @@ impl App {
         let controls = [
             (Ctl::Theme, x_start - btn_w, 0, btn_w, btn_h, glyph_theme),
             (Ctl::Min, x_start, 0, btn_w, btn_h, 0xE921),
-            (Ctl::Max, x_start + btn_w, 0, btn_w, btn_h, if unsafe { IsZoomed(self.hwnd) } != 0 { 0xE923 } else { 0xE922 }),
+            (Ctl::Max, x_start + btn_w, 0, btn_w, btn_h, if maximized { 0xE923 } else { 0xE922 }),
             (Ctl::Close, x_start + btn_w * 2, 0, btn_w, btn_h, 0xE8BB),
         ];
         for (ctl, x, y, bw, bh, glyph) in controls {
@@ -704,6 +742,27 @@ impl App {
     }
 
     // ================================================================ 鼠标
+    /// 无边框窗口的边框命中：返回属于哪条边（用于自实现缩放）。
+    /// 判据：距客户区边缘 < EDGE 像素；四角优先（同时命中两条边）。
+    fn border_hit(&self, x: i32, y: i32) -> Grab {
+        const EDGE: i32 = 6;
+        let left = x < EDGE;
+        let right = x >= self.w - EDGE;
+        let top = y < EDGE;
+        let bottom = y >= self.h - EDGE;
+        match (left, right, top, bottom) {
+            (true, _, true, _) => Grab::TopLeft,
+            (_, true, true, _) => Grab::TopRight,
+            (true, _, _, true) => Grab::BottomLeft,
+            (_, true, _, true) => Grab::BottomRight,
+            (true, _, _, _) => Grab::Left,
+            (_, true, _, _) => Grab::Right,
+            (_, _, true, _) => Grab::Top,
+            (_, _, _, true) => Grab::Bottom,
+            _ => Grab::None,
+        }
+    }
+
     fn hit_test(&self, x: i32, y: i32) -> Option<Ctl> {
         let layout = self.layout();
         let th = self.title_h();
@@ -749,29 +808,115 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: i32, y: i32) {
+        // 正在拖拽/缩放：直接按位移算新矩形
+        if self.grab != Grab::None {
+            let mut pt = POINT { x, y };
+            unsafe {
+                crate::native::ClientToScreen(self.hwnd, &mut pt);
+            }
+            let dx = pt.x - self.grab_origin.x;
+            let dy = pt.y - self.grab_origin.y;
+            let mut rc = self.grab_window;
+            let min_w = (640 * self.dpi as i32 / 96).max(520);
+            let min_h = (520 * self.dpi as i32 / 96).max(420);
+            match self.grab {
+                Grab::Move => {
+                    rc.left += dx;
+                    rc.top += dy;
+                    rc.right += dx;
+                    rc.bottom += dy;
+                }
+                Grab::Left => rc.left += dx,
+                Grab::Right => rc.right += dx,
+                Grab::Top => rc.top += dy,
+                Grab::Bottom => rc.bottom += dy,
+                Grab::TopLeft => {
+                    rc.left += dx;
+                    rc.top += dy;
+                }
+                Grab::TopRight => {
+                    rc.right += dx;
+                    rc.top += dy;
+                }
+                Grab::BottomLeft => {
+                    rc.left += dx;
+                    rc.bottom += dy;
+                }
+                Grab::BottomRight => {
+                    rc.right += dx;
+                    rc.bottom += dy;
+                }
+                Grab::None => {}
+            }
+            if rc.width() < min_w {
+                if matches!(self.grab, Grab::Left | Grab::TopLeft | Grab::BottomLeft) {
+                    rc.left = rc.right - min_w;
+                } else {
+                    rc.right = rc.left + min_w;
+                }
+            }
+            if rc.height() < min_h {
+                if matches!(self.grab, Grab::Top | Grab::TopLeft | Grab::TopRight) {
+                    rc.top = rc.bottom - min_h;
+                } else {
+                    rc.bottom = rc.top + min_h;
+                }
+            }
+            unsafe {
+                SetWindowPos(
+                    self.hwnd,
+                    std::ptr::null_mut(),
+                    rc.left,
+                    rc.top,
+                    rc.width(),
+                    rc.height(),
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
+            return;
+        }
+
         let hit = self.hit_test(x, y);
         if hit != self.hover {
             self.hover = hit;
             unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
         }
-        // 边缘缩放光标
-        let w = self.w;
-        let h = self.h;
-        let edge = 6;
-        let cursor = if x < edge || x >= w - edge || y < edge || y >= h - edge { 6 } else { 0 };
-        if cursor != 0 {
-            unsafe {
-                let cur = LoadCursorW(std::ptr::null_mut(), if cursor == 6 { 32645u16 as *const u16 } else { IDC_ARROW as *const u16 });
-                if !cur.is_null() {
-                    SetCursor(cur);
-                }
+
+        // 边框光标（无系统边框，自己按命中区域换光标）
+        let border = self.border_hit(x, y);
+        unsafe {
+            let id = match border {
+                Grab::Left | Grab::Right => 32644usize,   // IDC_SIZEWE
+                Grab::Top | Grab::Bottom => 32645usize,   // IDC_SIZENS
+                Grab::TopLeft | Grab::BottomRight => 32642usize, // IDC_SIZENWSE
+                Grab::TopRight | Grab::BottomLeft => 32643usize, // IDC_SIZENESW
+                _ => return,
+            };
+            let cur = LoadCursorW(std::ptr::null_mut(), id as *const u16);
+            if !cur.is_null() {
+                SetCursor(cur);
             }
         }
     }
 
     fn on_lbutton_down(&mut self, x: i32, y: i32) {
+        // 先看边框（缩放优先）
+        let border = self.border_hit(x, y);
+        if border != Grab::None {
+            self.grab = border;
+            let mut pt = POINT { x, y };
+            let mut rc = RECT::default();
+            unsafe {
+                crate::native::ClientToScreen(self.hwnd, &mut pt);
+                GetWindowRect(self.hwnd, &mut rc);
+                SetCapture(self.hwnd);
+            }
+            self.grab_origin = pt;
+            self.grab_window = rc;
+            return;
+        }
+
         if y < self.title_h() {
-            // 标题栏：非按钮区域 = 拖拽窗口
             let hit = self.hit_test(x, y);
             match hit {
                 Some(Ctl::Min) | Some(Ctl::Max) | Some(Ctl::Close) | Some(Ctl::Theme) => {
@@ -779,17 +924,32 @@ impl App {
                     unsafe { SetCapture(self.hwnd) };
                 }
                 _ => {
-                    // 交给系统做标题栏拖拽（保留贴边分屏）
-                    unsafe {
-                        let mut pt = POINT { x, y };
-                        crate::native::ClientToScreen(self.hwnd, &mut pt);
-                        let lparam = ((pt.y as u32) << 16) | (pt.x as u32 & 0xFFFF);
-                        SendMessageW(self.hwnd, WM_NCLBUTTONDOWN, HTCAPTION as usize, lparam as isize);
+                    // 标题栏空白 = 拖动窗口；双击 = 最大化/还原（自己实现）
+                    let now = unsafe { GetTickCount() } as u64;
+                    let is_double = now.saturating_sub(self.last_click_ms) < 400
+                        && (x - self.last_click_pt.x).abs() < 6
+                        && (y - self.last_click_pt.y).abs() < 6;
+                    self.last_click_ms = now;
+                    self.last_click_pt = POINT { x, y };
+                    if is_double {
+                        self.toggle_maximize();
+                        return;
                     }
+                    self.grab = Grab::Move;
+                    let mut pt = POINT { x, y };
+                    let mut rc = RECT::default();
+                    unsafe {
+                        crate::native::ClientToScreen(self.hwnd, &mut pt);
+                        GetWindowRect(self.hwnd, &mut rc);
+                        SetCapture(self.hwnd);
+                    }
+                    self.grab_origin = pt;
+                    self.grab_window = rc;
                 }
             }
             return;
         }
+
         let hit = self.hit_test(x, y);
         if hit.is_some() {
             self.pressed = hit;
@@ -798,7 +958,23 @@ impl App {
         self.last_mouse = POINT { x, y };
     }
 
+    fn toggle_maximize(&mut self) {
+        unsafe {
+            if IsZoomed(self.hwnd) != 0 {
+                ShowWindow(self.hwnd, SW_RESTORE);
+            } else {
+                ShowWindow(self.hwnd, SW_MAXIMIZE);
+            }
+            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+        }
+    }
+
     fn on_lbutton_up(&mut self, x: i32, y: i32) {
+        if self.grab != Grab::None {
+            self.grab = Grab::None;
+            unsafe { ReleaseCapture() };
+            return;
+        }
         let was = self.pressed;
         self.pressed = None;
         self.dragging = false;
@@ -960,8 +1136,33 @@ impl App {
             WM_GETMINMAXINFO => {
                 let info = lp as *mut MINMAXINFO;
                 if !info.is_null() {
+                    let scale = self.dpi as i32 / 96;
                     unsafe {
-                        (*info).ptMinTrackSize = POINT { x: 640, y: 520 };
+                        (*info).ptMinTrackSize = POINT {
+                            x: (640 * scale).max(520),
+                            y: (520 * scale).max(420),
+                        };
+                        // 无边框窗口默认"最大化"会盖住任务栏，必须自己夹到工作区
+                        let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+                        let mut mi = MONITORINFO {
+                            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                            ..Default::default()
+                        };
+                        if !mon.is_null() && GetMonitorInfoW(mon, &mut mi) != 0 {
+                            let work_w = mi.rcWork.width();
+                            let work_h = mi.rcWork.height();
+                            // 以"相对显示器工作区原点"的形式给出最大跟踪尺寸
+                            // （POINT 与 RECT 前 8 字节同构，直接转型）
+                            SetRect(
+                                &mut (*info).ptMaxPosition as *mut POINT as *mut RECT,
+                                mi.rcWork.left - mi.rcMonitor.left,
+                                mi.rcWork.top - mi.rcMonitor.top,
+                                0,
+                                0,
+                            );
+                            (*info).ptMaxSize = POINT { x: work_w, y: work_h };
+                            (*info).ptMaxTrackSize = POINT { x: work_w, y: work_h };
+                        }
                     }
                 }
                 0
@@ -996,6 +1197,7 @@ struct PaintState {
     server_url: String,
     logs: Vec<String>,
     last_error: String,
+    maximized: bool,
 }
 
 fn spawn_action(shared: Arc<Shared>, action: &'static str, params: Option<Value>) {
@@ -1071,14 +1273,13 @@ pub fn create_main_window(app_ptr: *mut App) -> HWND {
         RegisterClassExW(&wc);
 
         let title_w = wide("学习助理");
-        let style = WS_OVERLAPPED
-            | WS_CAPTION
-            | WS_SYSMENU
-            | WS_THICKFRAME
-            | WS_MINIMIZEBOX
-            | WS_MAXIMIZEBOX
-            | WS_VISIBLE
-            | WS_CLIPCHILDREN;
+        // ⚠️ **必须用 WS_POPUP，不能用 WS_OVERLAPPED**（ERROR.md E33 实测）：
+        // `WS_OVERLAPPED` 的值就是 0x00000000，等于"不指定任何样式"，
+        // 于是 CreateWindowEx 套用**默认顶层窗口样式**（含 WS_CAPTION | WS_SYSMENU |
+        // WS_MINIMIZEBOX | WS_MAXIMIZEBOX）—— 实测窗口样式读回来是 0x16C00000，
+        // `CAPTION=True`，标题栏仍由 DWM 画。WS_POPUP 才是真正的"无边框"。
+        // WS_EX_APPWINDOW 保证它仍然出现在任务栏与 Alt+Tab 里。
+        let style = WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN;
 
         // 按屏幕 DPI 缩放并居中：固定 880x720 在 150% 缩放下会超出屏幕被裁掉（实测 E30）
         let screen_w = GetSystemMetrics(0);
@@ -1109,6 +1310,13 @@ pub fn create_main_window(app_ptr: *mut App) -> HWND {
         );
         if hwnd.is_null() {
             return hwnd;
+        }
+        // 客户区底色用窗口类画刷兜底：我们的自绘是"每帧全画"，
+        // 但窗口首次显示/尺寸变化时系统可能先擦一遍背景，
+        // 若 hbrBackground 为空会露出背板（实测：露出一条浅蓝色带，见 ERROR.md E33）。
+        let bg = CreateSolidBrush(rgb(0x10, 0x14, 0x18));
+        if !bg.is_null() {
+            SetClassLongPtrW(hwnd, GCLP_HBRBACKGROUND, bg as isize);
         }
         ShowWindow(hwnd, SW_SHOW);
         hwnd

@@ -62,6 +62,32 @@ fn main() {
         trace::trace("native: 窗口已创建");
         ui::App::bootstrap(hwnd, &mut *app_ptr);
 
+        // 渲染探针：把客户区画进内存 DC 并落盘为 BMP（不依赖 PrintWindow / 不碰屏幕）。
+        // 用法：learn-helper-native.exe --render-probe [宽 高 输出路径]
+        if std::env::args().any(|a| a == "--render-probe") {
+            let args: Vec<String> = std::env::args().collect();
+            let w: i32 = args
+                .iter()
+                .position(|a| a == "--render-probe")
+                .and_then(|i| args.get(i + 1))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(1173);
+            let h: i32 = args
+                .iter()
+                .position(|a| a == "--render-probe")
+                .and_then(|i| args.get(i + 2))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(960);
+            let out = args
+                .iter()
+                .position(|a| a == "--render-probe")
+                .and_then(|i| args.get(i + 3))
+                .cloned()
+                .unwrap_or_else(|| "native-render.bmp".to_string());
+            native::render_client_to_bmp(&mut *app_ptr, w, h, &out);
+            std::process::exit(0);
+        }
+
         // 事件循环：GetMessage 阻塞在消息上，除非有新事件（定时器/后端消息）
         let mut msg: MSG = std::mem::zeroed();
         loop {

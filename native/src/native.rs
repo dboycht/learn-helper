@@ -29,6 +29,10 @@ pub const NULL_HANDLE: *mut c_void = std::ptr::null_mut();
 
 // ---------------------------------------------------------------- 窗口样式
 pub const WS_OVERLAPPED: u32 = 0x0000_0000;
+/// ⚠️ 无边框窗口**必须**用 WS_POPUP（0x8000_0000）。
+/// `WS_OVERLAPPED` 是 0x00000000 = "不指定样式"，CreateWindowEx 会套默认顶层样式
+/// （含 WS_CAPTION）⇒ 标题栏仍被系统画出来（实测踩到，见 ERROR.md E33）。
+pub const WS_POPUP: u32 = 0x8000_0000;
 pub const WS_CAPTION: u32 = 0x00C0_0000;
 pub const WS_SYSMENU: u32 = 0x0008_0000;
 pub const WS_THICKFRAME: u32 = 0x0004_0000;
@@ -119,7 +123,17 @@ pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const GWL_STYLE: i32 = -16;
 pub const GWL_EXSTYLE: i32 = -20;
 pub const GWLP_USERDATA: i32 = -21;
+pub const GCLP_HBRBACKGROUND: i32 = -10;
 pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MONITORINFO {
+    pub cbSize: u32,
+    pub rcMonitor: RECT,
+    pub rcWork: RECT,
+    pub dwFlags: u32,
+}
 pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
 pub const IDC_ARROW: usize = 32512;
 pub const IDC_SIZENS: usize = 32645;
@@ -297,6 +311,7 @@ extern "system" {
     pub fn LoadCursorW(inst: HINSTANCE, name: *const u16) -> HCURSOR;
     pub fn SetWindowLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
     pub fn GetWindowLongPtrW(hwnd: HWND, index: i32) -> isize;
+    pub fn SetClassLongPtrW(hwnd: HWND, index: i32, value: isize) -> isize;
     pub fn SetWindowPos(
         hwnd: HWND,
         after: HWND,
@@ -320,8 +335,9 @@ extern "system" {
     pub fn GetForegroundWindow() -> HWND;
     pub fn FindWindowW(class: *const u16, title: *const u16) -> HWND;
     pub fn MessageBoxW(hwnd: HWND, text: *const u16, caption: *const u16, flags: u32) -> i32;
-    pub fn GetMonitorInfoW(monitor: *mut c_void, info: *mut c_void) -> BOOL;
+    pub fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MONITORINFO) -> BOOL;
     pub fn MonitorFromWindow(hwnd: HWND, flags: u32) -> *mut c_void;
+    pub fn SetRect(rc: *mut RECT, l: i32, t: i32, r: i32, b: i32) -> BOOL;
 }
 
 pub const MB_OK: u32 = 0x0000_0000;
@@ -334,6 +350,7 @@ extern "system" {
     pub fn GetLastError() -> u32;
     pub fn SetLastError(code: u32);
     pub fn CreateMutexW(attrs: *mut c_void, initial_owner: BOOL, name: *const u16) -> *mut c_void;
+    pub fn GetTickCount() -> u32;
 }
 
 #[link(name = "gdi32")]
@@ -384,6 +401,15 @@ extern "system" {
     pub fn DeleteDC(hdc: HDC) -> BOOL;
     pub fn LineTo(hdc: HDC, x: i32, y: i32) -> BOOL;
     pub fn MoveToEx(hdc: HDC, x: i32, y: i32, prev: *mut POINT) -> BOOL;
+    pub fn GetDIBits(
+        hdc: HDC,
+        hbm: HBITMAP,
+        start: u32,
+        lines: u32,
+        bits: *mut c_void,
+        info: *mut BITMAPINFO,
+        usage: u32,
+    ) -> i32;
 }
 
 #[link(name = "dwmapi")]
@@ -450,4 +476,134 @@ pub fn windows_build() -> u32 {
         }
     }
     0
+}
+
+/// 把客户区按当前状态画进**内存位图**并写 24 位 BMP。
+///
+/// 这是本项目**唯一可信的界面截图手段**：`PrintWindow` 在无边框窗口上返回的是 DWM 合成的
+/// 背板（实测四角采到的仍是壁纸蓝），根本取不到我们自绘的客户区；而 `CopyFromScreen`
+/// 会抓到用户的屏幕内容（红线，绝不使用）。直接调用自己的绘制代码则完全绕开这两者。
+pub fn render_client_to_bmp(app: &mut crate::ui::App, w: i32, h: i32, out_path: &str) {
+    unsafe {
+        let screen = GetDC(std::ptr::null_mut());
+        if screen.is_null() {
+            crate::trace::trace("probe: GetDC(NULL) 失败");
+            return;
+        }
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        if mem.is_null() || bmp.is_null() {
+            crate::trace::trace("probe: 创建内存 DC/位图失败");
+            ReleaseDC(std::ptr::null_mut(), screen);
+            return;
+        }
+        let old = SelectObject(mem, bmp as HGDIOBJ);
+
+        // 用我们自己的绘制路径渲染（与屏幕上看到的同一份代码）
+        app.render_to(mem, w, h);
+
+        // 取回像素
+        let mut bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER {
+                biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                biWidth: w,
+                biHeight: h, // 正数 = 自底向上
+                biPlanes: 1,
+                biBitCount: 32,
+                biCompression: 0, // BI_RGB
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(
+            mem,
+            bmp,
+            0,
+            h as u32,
+            pixels.as_mut_ptr() as *mut c_void,
+            &mut bi,
+            0, // DIB_RGB_COLORS
+        );
+
+        if lines > 0 {
+            write_bmp24(out_path, w, h, &pixels);
+            crate::trace::trace(&format!("probe: 已渲染 {}x{} -> {}", w, h, out_path));
+        } else {
+            crate::trace::trace("probe: GetDIBits 失败");
+        }
+
+        SelectObject(mem, old);
+        DeleteObject(bmp as HGDIOBJ);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+    }
+}
+
+fn write_bmp24(path: &str, w: i32, h: i32, bgra: &[u8]) {
+    use std::io::Write;
+    let row_in = (w as usize) * 4;
+    let row_out = ((w as usize) * 3 + 3) / 4 * 4; // 4 字节对齐
+    let data_size = row_out * (h as usize);
+    let file_size = 54 + data_size;
+    let hh = h as usize;
+
+    let mut out: Vec<u8> = Vec::with_capacity(file_size);
+    // BITMAPFILEHEADER
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&(file_size as u32).to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&54u32.to_le_bytes());
+    // BITMAPINFOHEADER
+    out.extend_from_slice(&40u32.to_le_bytes());
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes());
+    out.extend_from_slice(&1u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    out.extend_from_slice(&(data_size as u32).to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut row_buf = vec![0u8; row_out];
+    for y in 0..hh {
+        let src = &bgra[y * row_in..y * row_in + row_in];
+        for x in 0..(w as usize) {
+            row_buf[x * 3] = src[x * 4];
+            row_buf[x * 3 + 1] = src[x * 4 + 1];
+            row_buf[x * 3 + 2] = src[x * 4 + 2];
+        }
+        out.extend_from_slice(&row_buf);
+    }
+
+    if let Ok(mut f) = std::fs::File::create(path) {
+        let _ = f.write_all(&out);
+        let _ = f.flush();
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BITMAPINFOHEADER {
+    pub biSize: u32,
+    pub biWidth: i32,
+    pub biHeight: i32,
+    pub biPlanes: u16,
+    pub biBitCount: u16,
+    pub biCompression: u32,
+    pub biSizeImage: u32,
+    pub biXPelsPerMeter: i32,
+    pub biYPelsPerMeter: i32,
+    pub biClrUsed: u32,
+    pub biClrImportant: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct BITMAPINFO {
+    pub bmiHeader: BITMAPINFOHEADER,
+    pub bmiColors: [u32; 3],
 }

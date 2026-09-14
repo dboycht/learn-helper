@@ -1,4 +1,4 @@
-__pycache__/
+﻿__pycache__/
 *.pyc
 logs/
 browser_profile/
@@ -12,6 +12,9 @@ winui/obj/
 # native Rust UI (default since 2.1.1) build outputs
 native/target/
 native/native-capture.png
+native/render-probe.bmp
+native/render-probe.png
+native/native-render.bmp
 
 # release staging (built by native/build_release.ps1)
 dist/
