@@ -240,6 +240,46 @@ impl App {
         }
         crate::trace::trace("ui: timers armed, starting backend");
 
+        // 可脚本驱动的动作钩子（代理点不了界面，验证按钮链路只能靠它）：
+        //   LH_UI_ACTION=refresh_pages|diagnose|pause|resume|start|stop
+        // 启动 2.5s 后（等后端握手完）自动触发一次，并把结果写进 trace。
+        if let Ok(action) = std::env::var("LH_UI_ACTION") {
+            let action = action.trim().to_string();
+            if !action.is_empty() {
+                let shared = app.shared.clone();
+                let hwnd_raw = hwnd as isize;
+                crate::trace::trace(&format!("ui: scripted action queued: {}", action));
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(2500));
+                    let shared_for_action = shared.clone();
+                    let result = backend::control(&shared_for_action, &action, None);
+                    {
+                        let mut st = shared.lock();
+                        match &result {
+                            Ok(msg) => st.push_log(&format!("[verify] {} → {}", action, msg)),
+                            Err(err) => st.push_log(&format!("[verify] {} 失败：{}", action, err)),
+                        }
+                    }
+                    crate::trace::trace(&format!(
+                        "ui: scripted action '{}' -> {:?}",
+                        action, result
+                    ));
+                    // 让 UI 重绘，便于随后抓图核对
+                    if hwnd_raw != 0 {
+                        unsafe {
+                            PostMessageW(hwnd_raw as HWND, WM_APP_BACKEND, 0, 0);
+                        }
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    crate::trace::trace(&format!(
+                        "ui: state after '{}': {:?}",
+                        action,
+                        crate::backend::describe_state(&shared.lock())
+                    ));
+                });
+            }
+        }
+
         backend::start_async(app.shared.clone());
     }
 
