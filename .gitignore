@@ -3,3 +3,15 @@ __pycache__/
 logs/
 browser_profile/
 config.json
+
+# WinUI 3 (C#) build outputs
+winui/bin/
+winui/obj/
+*.user
+
+# Dev-only docs and artifacts (never pushed)
+DEVELOPMENT.md
+ERROR.md
+_release/
+_research/
+*.log

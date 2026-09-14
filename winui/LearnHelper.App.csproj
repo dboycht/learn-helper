@@ -1,0 +1,37 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net9.0-windows10.0.19041.0</TargetFramework>
+    <TargetPlatformMinVersion>10.0.17763.0</TargetPlatformMinVersion>
+    <RootNamespace>LearnHelper.App</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <Platforms>x64</Platforms>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <UseWinUI>true</UseWinUI>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <!-- Single source of truth for the UI version, surfaced in the title bar.
+         Keep in step with learn_helper.py's APP_VERSION at release time. -->
+    <Version>1.0.3</Version>
+    <InformationalVersion>1.0.3</InformationalVersion>
+    <!-- memory/03 section 1: unpackaged + self-contained, no MSIX, no certificate. -->
+    <WindowsPackageType>None</WindowsPackageType>
+    <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
+    <SelfContained>true</SelfContained>
+    <EnableMsixTooling>false</EnableMsixTooling>
+    <!-- Needed for COM interop (named pipe / shell APIs are not COM, but keep for later). -->
+    <BuiltInComInteropSupport>true</BuiltInComInteropSupport>
+    <EnableDefaultXamlItems>true</EnableDefaultXamlItems>
+    <!-- XAML compiler diagnostics are easier to read without the trimming noise. -->
+    <PublishTrimmed>false</PublishTrimmed>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Pinned to the versions already present in the local NuGet cache, so the first
+         build needs no network. Bump deliberately (and re-verify the toolchain). -->
+    <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.0" />
+    <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4654" />
+  </ItemGroup>
+
+</Project>

@@ -1,0 +1,720 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Window
+    x:Class="LearnHelper.App.MainWindow"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:d="http://schemas.microsoft.com/expression/blend/2008"
+    xmlns:mc="http://schemas.openxmlformats.org/markup-compatibility/2006"
+    mc:Ignorable="d">
+
+    <!-- ================================================================
+         W2: theme settings added.
+
+         All colours are referenced with ThemeResource (not StaticResource) so a
+         runtime theme switch actually repaints them - see App.xaml note.
+
+         RootGrid MUST stay Background="Transparent" or the system backdrop is
+         covered by our own fill (memory/03 section 4).
+         ================================================================ -->
+    <Grid x:Name="RootGrid" Background="Transparent">
+        <Grid.Resources>
+            <!-- Panel-local styles: label column + control column -->
+            <Style x:Key="SectionLabelStyle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="12" />
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="Foreground" Value="{StaticResource GlassTextMainBrush}" />
+                <Setter Property="Margin" Value="0,10,0,2" />
+            </Style>
+            <Style x:Key="HintStyle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="11" />
+                <Setter Property="TextWrapping" Value="Wrap" />
+                <Setter Property="Foreground" Value="{StaticResource GlassTextMutedBrush}" />
+            </Style>
+            <Style x:Key="ValueLabelStyle" TargetType="TextBlock">
+                <Setter Property="FontSize" Value="11" />
+                <Setter Property="FontFamily" Value="Consolas" />
+                <Setter Property="Foreground" Value="{StaticResource GlassAccentBrush}" />
+            </Style>
+
+            <!-- Real controls carry a focus ring. On our transparent/drawer surfaces that
+                 renders as a stray white box around the glyph (user report 2026-09-12),
+                 so every radio in these panels uses this style. Keyboard nav is not lost -
+                 arrow keys still move the selection without a visual ring. -->
+            <Style x:Key="PanelRadioStyle" TargetType="RadioButton">
+                <Setter Property="FocusVisualPrimaryThickness" Value="0" />
+                <Setter Property="FocusVisualSecondaryThickness" Value="0" />
+                <Setter Property="FocusVisualMargin" Value="0" />
+            </Style>
+
+            <!-- ============================================================
+                 Flat accent button: no template visual states at all.
+
+                 A normal Button resolves its foreground from the theme's visual states, and
+                 on the light theme that produced GREY text on the dark blue fill (measured
+                 rgb(90,102,116) on rgb(13,99,150) - contrast 1.0, i.e. invisible) while the
+                 dark theme rendered white. Same control, same code, different result per
+                 theme: the same class of problem as the log box and the combo box
+                 (ERROR.md E21/E22/E24).
+
+                 The template below is just <ContentPresenter> wrapping a Border, so the
+                 Background/Foreground set from code are the colours that render. That is
+                 the same "use primitives with no state" rule that fixed the log box.
+                 ============================================================ -->
+            <Style x:Key="FlatAccentButtonStyle" TargetType="Button">
+                <Setter Property="Background" Value="{StaticResource GlassAccentFillBrush}" />
+                <Setter Property="FontWeight" Value="SemiBold" />
+                <Setter Property="MinHeight" Value="38" />
+                <Setter Property="UseSystemFocusVisuals" Value="False" />
+                <!-- The label is an explicit TextBlock, not the Button's Content string.
+                     Setting Button.Foreground was NOT enough on the light theme: the label
+                     rendered grey rgb(90,102,116) on the blue fill (contrast 1.11) even
+                     though the property held white, through BOTH the default template and a
+                     custom ContentPresenter template. Colouring the TextBlock itself removes
+                     that layer from the equation - the same rule that fixed the log box. -->
+                <Setter Property="ContentTemplate">
+                    <Setter.Value>
+                        <DataTemplate>
+                            <TextBlock Text="{Binding}"
+                                       FontWeight="SemiBold"
+                                       Foreground="{StaticResource GlassOnAccentBrush}" Tag="onAccent" />
+                        </DataTemplate>
+                    </Setter.Value>
+                </Setter>
+                <Setter Property="Template">
+                    <Setter.Value>
+                        <ControlTemplate TargetType="Button">
+                            <Border x:Name="AccentFill"
+                                    Background="{TemplateBinding Background}"
+                                    CornerRadius="{StaticResource GlassControlRadius}">
+                                <VisualStateManager.VisualStateGroups>
+                                    <VisualStateGroup x:Name="CommonStates">
+                                        <VisualState x:Name="Normal" />
+                                        <!-- No WPF-style <Trigger> in WinUI: visual states are the
+                                             only supported mechanism. Only OPACITY changes, so the
+                                             colours the code assigns are never replaced - a disabled
+                                             button still needs to LOOK disabled though. -->
+                                        <VisualState x:Name="PointerOver">
+                                            <Storyboard>
+                                                <DoubleAnimation Storyboard.TargetName="AccentFill"
+                                                                 Storyboard.TargetProperty="Opacity"
+                                                                 To="0.88" Duration="0:0:0.1" />
+                                            </Storyboard>
+                                        </VisualState>
+                                        <VisualState x:Name="Pressed">
+                                            <Storyboard>
+                                                <DoubleAnimation Storyboard.TargetName="AccentFill"
+                                                                 Storyboard.TargetProperty="Opacity"
+                                                                 To="0.72" Duration="0:0:0.05" />
+                                            </Storyboard>
+                                        </VisualState>
+                                        <VisualState x:Name="Disabled">
+                                            <Storyboard>
+                                                <DoubleAnimation Storyboard.TargetName="AccentFill"
+                                                                 Storyboard.TargetProperty="Opacity"
+                                                                 To="0.45" Duration="0" />
+                                            </Storyboard>
+                                        </VisualState>
+                                    </VisualStateGroup>
+                                </VisualStateManager.VisualStateGroups>
+                                <ContentPresenter HorizontalAlignment="Center"
+                                                  VerticalAlignment="Center"
+                                                  Padding="14,6" />
+                            </Border>
+                        </ControlTemplate>
+                    </Setter.Value>
+                </Setter>
+            </Style>
+        </Grid.Resources>
+
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <!-- ================= self-drawn title bar ================= -->
+        <Grid x:Name="AppTitleBar" Grid.Row="0" Height="48" Background="Transparent">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="Auto" />
+                <ColumnDefinition Width="*" />
+                <ColumnDefinition Width="Auto" />
+            </Grid.ColumnDefinitions>
+
+            <StackPanel Grid.Column="0" Orientation="Horizontal" VerticalAlignment="Center"
+                        Margin="16,0,0,0" Spacing="10">
+                <Border x:Name="BrandMark" Width="22" Height="22" CornerRadius="6"
+                        Background="{StaticResource GlassAccentBrush}" />
+                <TextBlock x:Name="AppNameText" Text="学习助理" FontSize="13" FontWeight="SemiBold"
+                           Foreground="{StaticResource GlassTextMainBrush}" Tag="textMain"
+                           VerticalAlignment="Center" />
+                <Border x:Name="VersionPill" CornerRadius="9" Padding="8,2"
+                        Background="{StaticResource GlassAccentSoftBrush}" VerticalAlignment="Center">
+                    <TextBlock x:Name="AppVersionText" Text="v0.0.0" FontSize="11"
+                               Foreground="{StaticResource GlassAccentBrush}" Tag="accent" />
+                </Border>
+
+                <!-- Quick actions live on the LEFT on purpose: the right end of an
+                     ExtendsContentIntoTitleBar window is reserved for the system
+                     caption buttons (- □ ×), which would otherwise cover them. -->
+                <Button x:Name="ThemeToggleButton" Click="OnToggleThemeClick"
+                        Background="Transparent" BorderThickness="0" Padding="8,4"
+                        IsTabStop="False" FocusVisualPrimaryThickness="0"
+                        FocusVisualSecondaryThickness="0"
+                        ToolTipService.ToolTip="快速切换浅色 / 深色">
+                    <TextBlock x:Name="ThemeToggleGlyph" Text="&#xE706;" FontFamily="Segoe MDL2 Assets"
+                               FontSize="14" Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
+                </Button>
+
+                <Button x:Name="ThemeSettingsButton" Click="OnOpenAppearanceClick"
+                        Background="Transparent" BorderThickness="0" Padding="8,4"
+                        IsTabStop="False" FocusVisualPrimaryThickness="0"
+                        FocusVisualSecondaryThickness="0"
+                        ToolTipService.ToolTip="外观设置">
+                    <StackPanel Orientation="Horizontal" Spacing="6">
+                        <TextBlock Text="&#xE713;" FontFamily="Segoe MDL2 Assets" FontSize="14"
+                                   Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" VerticalAlignment="Center" />
+                        <TextBlock Text="外观" FontSize="12" VerticalAlignment="Center"
+                                   Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
+                    </StackPanel>
+                </Button>
+            </StackPanel>
+            <!-- Right column stays inside the 140px the system reserves for its
+                 caption buttons (- □ ×) in an ExtendsContentIntoTitleBar window.
+                 Our own controls therefore live in the LEFT column. -->
+            <TextBlock x:Name="BackdropStatusText" Grid.Column="2" FontSize="11"
+                       VerticalAlignment="Center" HorizontalAlignment="Right"
+                       Margin="0,0,146,0"
+                       Foreground="{StaticResource GlassTextMutedBrush}" Tag="textMuted" />
+        </Grid>
+
+        <!-- ================= content ================= -->
+        <Grid Grid.Row="1" Margin="18,4,18,16">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- notice bar -->
+            <Border x:Name="NoticeBar" Grid.Row="0" Margin="0,0,0,12" Padding="12,8"
+                    CornerRadius="{StaticResource GlassCardRadius}"
+                    Background="{StaticResource GlassDeepBrush}"
+                    BorderBrush="{StaticResource GlassDividerBrush}" BorderThickness="1">
+                <StackPanel Orientation="Horizontal" Spacing="10">
+                    <Border x:Name="NoticePill" CornerRadius="6" Padding="8,3" Background="{StaticResource GlassAccentSoftBrush}">
+                        <TextBlock Text="系统公告" FontSize="11" FontWeight="SemiBold"
+                                   Foreground="{StaticResource GlassAccentBrush}" Tag="accent" />
+                    </Border>
+                    <TextBlock Text="界面已迁移到 WinUI 3（Mica/Acrylic 玻璃）· 后端为 Python 服务"
+                               FontSize="12" VerticalAlignment="Center"
+                               Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
+                </StackPanel>
+            </Border>
+
+            <!-- runtime status card -->
+            <Border x:Name="StatusCard" Grid.Row="1" Margin="0,0,0,10" Padding="16,12"
+                    CornerRadius="{StaticResource GlassCardRadius}"
+                    Background="{StaticResource GlassCardBrush}"
+                    BorderBrush="{StaticResource GlassDividerBrush}" BorderThickness="1">
+                <StackPanel Orientation="Horizontal" Spacing="14">
+                    <TextBlock Text="后端" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"
+                               Foreground="{StaticResource GlassTextMainBrush}" Tag="textMain" />
+                    <TextBlock x:Name="BackendText" Text="待连接…" FontSize="12"
+                               FontFamily="Consolas" VerticalAlignment="Center"
+                               Foreground="{StaticResource GlassAccentBrush}" Tag="accent" />
+                    <TextBlock x:Name="DeviceText" Text="" FontSize="11" Margin="24,0,0,0"
+                               FontFamily="Consolas" VerticalAlignment="Center"
+                               Foreground="{StaticResource GlassTextMutedBrush}" Tag="textMuted" />
+                </StackPanel>
+            </Border>
+
+            <!-- page picker card -->
+            <Border x:Name="PageCard" Grid.Row="2" Margin="0,0,0,10" Padding="16,12"
+                    CornerRadius="{StaticResource GlassCardRadius}"
+                    Background="{StaticResource GlassCardBrush}"
+                    BorderBrush="{StaticResource GlassDividerBrush}" BorderThickness="1">
+                <StackPanel Orientation="Horizontal" Spacing="14">
+                    <TextBlock Text="当前网页" FontSize="12" FontWeight="SemiBold" VerticalAlignment="Center"
+                               Foreground="{StaticResource GlassTextMainBrush}" Tag="textMain" />
+                    <ComboBox x:Name="PageCombo" MinWidth="380" SelectedIndex="0"
+                              IsTabStop="False"
+                              FocusVisualPrimaryThickness="0"
+                              FocusVisualSecondaryThickness="0"
+                              FocusVisualMargin="0">
+                        <ComboBoxItem Content="[待检测] 点击刷新获取浏览器标签页" />
+                    </ComboBox>
+                </StackPanel>
+            </Border>
+
+            <!-- KPI + progress -->
+            <Grid Grid.Row="3" Margin="0,0,0,10">
+                <Grid.ColumnDefinitions>
+                    <ColumnDefinition Width="*" />
+                    <ColumnDefinition Width="*" />
+                </Grid.ColumnDefinitions>
+
+                <Border x:Name="KpiCard" Grid.Column="0" Margin="0,0,5,0" Padding="16,14"
+                        CornerRadius="{StaticResource GlassCardRadius}"
+                        Background="{StaticResource GlassCardBrush}"
+                        BorderBrush="{StaticResource GlassDividerBrush}" BorderThickness="1">
+                    <StackPanel Spacing="12">
+                        <TextBlock Text="当前页面任务感知" FontSize="12" FontWeight="SemiBold"
+                                   Foreground="{StaticResource GlassTextMainBrush}" Tag="textMain" />
+                        <StackPanel Orientation="Horizontal" Spacing="12">
+                            <Border x:Name="KpiTile1" Width="96" Height="76" CornerRadius="10"
+                                    Background="{StaticResource GlassCardHiBrush}">
+                                <StackPanel VerticalAlignment="Center" Spacing="4">
+                                    <TextBlock Text="3" FontSize="24" FontWeight="Bold"
+                                               HorizontalAlignment="Center"
+                                               Foreground="{StaticResource GlassAccentBrush}" Tag="accent" />
+                                    <TextBlock Text="视频任务" FontSize="11" HorizontalAlignment="Center"
+                                               Foreground="{StaticResource GlassTextMutedBrush}" Tag="textMuted" />
+                                </StackPanel>
+                            </Border>
+                            <Border x:Name="KpiTile2" Width="96" Height="76" CornerRadius="10"
+                                    Background="{StaticResource GlassCardHiBrush}">
+                                <StackPanel VerticalAlignment="Center" Spacing="4">
+                                    <TextBlock Text="1" FontSize="24" FontWeight="Bold"
+                                               HorizontalAlignment="Center"
+                                               Foreground="{StaticResource GlassSuccessBrush}" Tag="success" />
+                                    <TextBlock Text="文档阅读" FontSize="11" HorizontalAlignment="Center"
+                                               Foreground="{StaticResource GlassTextMutedBrush}" Tag="textMuted" />
+                                </StackPanel>
+                            </Border>
+                            <Border x:Name="KpiTile3" Width="96" Height="76" CornerRadius="10"
+                                    Background="{StaticResource GlassCardHiBrush}">
+                                <StackPanel VerticalAlignment="Center" Spacing="4">
+                                    <TextBlock Text="5" FontSize="24" FontWeight="Bold"
+                                               HorizontalAlignment="Center"
+                                               Foreground="{StaticResource GlassWarnBrush}" Tag="warn" />
+                                    <TextBlock Text="测验题目" FontSize="11" HorizontalAlignment="Center"
+                                               Foreground="{StaticResource GlassTextMutedBrush}" Tag="textMuted" />
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </StackPanel>
+                </Border>
+
+                <Border x:Name="ProgressCard" Grid.Column="1" Margin="5,0,0,0" Padding="16,14"
+                        CornerRadius="{StaticResource GlassCardRadius}"
+                        Background="{StaticResource GlassCardBrush}"
+                        BorderBrush="{StaticResource GlassDividerBrush}" BorderThickness="1">
+                    <StackPanel Spacing="8">
+                        <TextBlock Text="实时执行进度" FontSize="12" FontWeight="SemiBold"
+                                   Foreground="{StaticResource GlassTextMainBrush}" Tag="textMain" />
+                        <TextBlock Text="当前状态   闲置中" FontSize="12"
+                                   Foreground="{StaticResource GlassAccentBrush}" Tag="accent" />
+                        <TextBlock Text="音视频进度 --" FontSize="12"
+                                   Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
+                        <TextBlock Text="答题进度   --" FontSize="12"
+                                   Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
+                    </StackPanel>
+                </Border>
+            </Grid>
+
+            <!-- controls -->
+            <StackPanel Grid.Row="4" Orientation="Horizontal" Spacing="10" Margin="0,4,0,10">
+                <Button x:Name="StartButton" Content="启动刷课" MinWidth="140"
+                        Style="{StaticResource FlatAccentButtonStyle}" />
+                <Button Content="暂停进程" MinWidth="96" Height="38" IsEnabled="False"
+                        CornerRadius="{StaticResource GlassControlRadius}" />
+                <Button Content="答题设置" MinWidth="96" Height="38"
+                        CornerRadius="{StaticResource GlassControlRadius}" />
+                <Button Content="诊断页面" MinWidth="90" Height="38"
+                        CornerRadius="{StaticResource GlassControlRadius}" />
+                <Button Content="终止并退出" MinWidth="110" Height="38"
+                        CornerRadius="{StaticResource GlassControlRadius}" />
+            </StackPanel>
+
+            <!-- log -->
+            <Border x:Name="LogCard" Grid.Row="5" Padding="14,12"
+                    CornerRadius="{StaticResource GlassCardRadius}"
+                    Background="{StaticResource GlassCardBrush}"
+                    BorderBrush="{StaticResource GlassDividerBrush}" BorderThickness="1">
+                <Grid>
+                    <Grid.RowDefinitions>
+                        <RowDefinition Height="Auto" />
+                        <RowDefinition Height="*" />
+                    </Grid.RowDefinitions>
+                    <TextBlock Grid.Row="0" Text="运行日志" FontSize="12" FontWeight="SemiBold"
+                               Margin="0,0,0,8" Foreground="{StaticResource GlassTextMainBrush}" Tag="textMain" />
+                    <!-- A read-only TextBox was replaced by Border + ScrollViewer + TextBlock.
+                         The TextBox template kept resolving its own theme brushes and stayed
+                         exactly inverted on every hot theme switch even though its Background
+                         and Foreground properties reported the correct colours (verified in the
+                         trace). These three primitives have no template and no visual states,
+                         so the colours below are the colours rendered. -->
+                    <Border x:Name="LogSurface" Grid.Row="1" CornerRadius="6"
+                            Background="{StaticResource GlassSurfaceBrush}">
+                        <ScrollViewer x:Name="LogScroll" Padding="10,8"
+                                      VerticalScrollBarVisibility="Auto"
+                                      HorizontalScrollBarVisibility="Auto">
+                            <TextBlock x:Name="LogText" TextWrapping="NoWrap"
+                                       FontFamily="Consolas" FontSize="12"
+                                       Foreground="{StaticResource GlassTextSubBrush}" Tag="textSub" />
+                        </ScrollViewer>
+                    </Border>
+                </Grid>
+            </Border>
+
+            <!-- self-report line (memory/04 section 2) -->
+            <TextBlock x:Name="SelfCheckText" Grid.Row="6" Margin="0,8,0,0"
+                       FontSize="11" TextWrapping="Wrap"
+                       Foreground="{StaticResource GlassTextMutedBrush}" Tag="textMuted" />
+        </Grid>
+
+        <!-- ==================================================================
+             Appearance settings - a NON-MODAL side drawer.
+
+             Why not a ContentDialog (2026-09-12 user feedback):
+               * a dialog dims the whole window with a scrim, and this panel exists to
+                 retune the window you are looking at - covering it defeats the purpose;
+               * it also added no opening animation.
+             The drawer slides in from the right, keeps the window fully visible, and the
+             scrim (when shown) is nearly transparent and only closes on click - it never
+             darkens what you are tuning.
+
+             Width 430 is enough for the label + value layout; a Flyout was rejected
+             earlier because it is clamped to its placement target (~376) and clipped values.
+             Controls keep their x:Name so the code-behind is unchanged.
+             ================================================================== -->
+        <Grid x:Name="AppearanceScrim" Grid.Row="0" Grid.RowSpan="2"
+              Background="#01000000" Visibility="Collapsed"
+              Tapped="OnAppearanceScrimTapped" />
+
+        <!-- The PANEL occupies only the content row (Row 1), so it begins BELOW the title
+             bar. Spanning the title bar put the drawer's own close (X) underneath the system
+             caption buttons in the top-right corner, which covered it (user report
+             2026-09-12). The scrim still spans both rows so a click anywhere dismisses. -->
+        <Grid x:Name="AppearancePanel" Grid.Row="0" Grid.RowSpan="2" Canvas.ZIndex="20"
+              Width="440" HorizontalAlignment="Left"
+              Background="#FF161B22" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <!-- Close button on the LEFT of the header.
+                 It used to sit at the panel's right edge, which is the window's top-right
+                 corner - exactly where the system caption buttons (- [] X) live, so the
+                 window's X covered it (user report 2026-09-12). -->
+            <StackPanel Grid.Row="0" Margin="14,16,18,6" Orientation="Horizontal" Spacing="10">
+                <Button Content="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12"
+                        Background="Transparent" BorderThickness="0"
+                        Padding="8,4" Click="OnAppearanceCloseClick"
+                        VerticalAlignment="Center"
+                        IsTabStop="False" FocusVisualPrimaryThickness="0"
+                        FocusVisualSecondaryThickness="0"
+                        Foreground="#FFAEBAC8"
+                        ToolTipService.ToolTip="关闭（未应用的改动会撤销）" />
+                <TextBlock x:Name="AppTitleText" Text="外观设置" FontSize="16" FontWeight="SemiBold"
+                           VerticalAlignment="Center" Foreground="#FFF2F6FA" />
+            </StackPanel>
+
+            <ScrollViewer Grid.Row="1" Padding="18,0,14,0"
+                          VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+                <StackPanel Spacing="2">
+
+                    <!-- ===== UI mode ===== -->
+                    <TextBlock x:Name="AppUiModeLabel" Text="界面样式" FontSize="12"
+                               FontWeight="SemiBold" Margin="0,10,0,2" Foreground="#FFF2F6FA" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <RadioButton x:Name="ModeGlassRadio" Content="玻璃" GroupName="UiMode"
+                                     Style="{StaticResource PanelRadioStyle}" Checked="OnUiModeChanged" />
+                        <RadioButton x:Name="ModePlainRadio" Content="一般（无玻璃）" GroupName="UiMode"
+                                     Style="{StaticResource PanelRadioStyle}" Checked="OnUiModeChanged" />
+                    </StackPanel>
+                    <TextBlock x:Name="AppUiModeHint" FontSize="11" TextWrapping="Wrap"
+                               Foreground="#FFAEBAC8"
+                               Text="「一般」= 传统不透明界面，关闭全部玻璃与半透明，兼容性最好。" />
+                    <TextBlock x:Name="GlassUnavailableNote" FontSize="11" TextWrapping="Wrap"
+                               Foreground="#FFE8B44B" Visibility="Collapsed"
+                               Text="⚠️ 本机拿不到系统材质（可能被虚拟显示适配器/省电/关闭透明效果挡住），该样式会回退为纯色。" />
+
+                    <!-- ===== theme mode ===== -->
+                    <TextBlock x:Name="AppThemeModeLabel" Text="主题模式" FontSize="12"
+                               FontWeight="SemiBold" Margin="0,10,0,2" Foreground="#FFF2F6FA" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <RadioButton x:Name="ModeDarkRadio" Content="深色" GroupName="ThemeMode"
+                                     Style="{StaticResource PanelRadioStyle}" Checked="OnThemeModeChanged" />
+                        <RadioButton x:Name="ModeLightRadio" Content="浅色" GroupName="ThemeMode"
+                                     Style="{StaticResource PanelRadioStyle}" Checked="OnThemeModeChanged" />
+                    </StackPanel>
+
+                    <!-- ===== card surface opacity ===== -->
+                    <TextBlock x:Name="AppCardOpacityLabel" Text="卡片不透明度" FontSize="12"
+                               FontWeight="SemiBold" Margin="0,10,0,2" Foreground="#FFF2F6FA" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Slider x:Name="CardOpacitySlider" Grid.Column="0"
+                                Minimum="0.80" Maximum="1.0" StepFrequency="0.02"
+                                ValueChanged="OnCardOpacityChanged" />
+                        <TextBlock x:Name="CardOpacityValue" Grid.Column="1"
+                                   Style="{StaticResource ValueLabelStyle}"
+                                   VerticalAlignment="Center" MinWidth="46" TextAlignment="Right" />
+                    </Grid>
+                    <TextBlock x:Name="AppCardOpacityHint" FontSize="11" TextWrapping="Wrap"
+                               Foreground="#FFAEBAC8"
+                               Text="⭐ 玻璃感的主要旋钮：调低它，卡片才会透出背后的模糊。下限 0.80 —— 再低文字就会糊掉。" />
+
+                    <!-- ===== glass kind ===== -->
+                    <TextBlock x:Name="AppGlassKindLabel" Text="玻璃材质（仅玻璃样式生效）" FontSize="12"
+                               FontWeight="SemiBold" Margin="0,10,0,2" Foreground="#FFF2F6FA" />
+                    <StackPanel Orientation="Horizontal" Spacing="8">
+                        <RadioButton x:Name="KindThinRadio" Content="Thin（更通透）" GroupName="GlassKind"
+                                     Style="{StaticResource PanelRadioStyle}" Checked="OnGlassKindChanged" />
+                        <RadioButton x:Name="KindBaseRadio" Content="Base（更厚实）" GroupName="GlassKind"
+                                     Style="{StaticResource PanelRadioStyle}" Checked="OnGlassKindChanged" />
+                    </StackPanel>
+
+                    <!-- ===== tint opacity ===== -->
+                    <TextBlock x:Name="AppTintOpacityLabel" Text="玻璃浓度（TintOpacity）" FontSize="12"
+                               FontWeight="SemiBold" Margin="0,10,0,2" Foreground="#FFF2F6FA" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Slider x:Name="TintOpacitySlider" Grid.Column="0"
+                                Minimum="0" Maximum="0.95" StepFrequency="0.05"
+                                ValueChanged="OnTintOpacityChanged" />
+                        <TextBlock x:Name="TintOpacityValue" Grid.Column="1"
+                                   Style="{StaticResource ValueLabelStyle}"
+                                   VerticalAlignment="Center" MinWidth="46" TextAlignment="Right" />
+                    </Grid>
+                    <TextBlock x:Name="AppTintOpacityHint" FontSize="11" TextWrapping="Wrap"
+                               Foreground="#FFAEBAC8"
+                               Text="窗口自身色调的浓淡：越大越遮住桌面、文字越清楚。" />
+
+                    <!-- ===== luminosity opacity ===== -->
+                    <TextBlock x:Name="AppLuminosityLabel" Text="亮度层（LuminosityOpacity）" FontSize="12"
+                               FontWeight="SemiBold" Margin="0,10,0,2" Foreground="#FFF2F6FA" />
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="Auto" />
+                        </Grid.ColumnDefinitions>
+                        <Slider x:Name="LuminositySlider" Grid.Column="0"
+                                Minimum="0" Maximum="1" StepFrequency="0.05"
+                                ValueChanged="OnLuminosityChanged" />
+                        <TextBlock x:Name="LuminosityValue" Grid.Column="1"
+                                   Style="{StaticResource ValueLabelStyle}"
+                                   VerticalAlignment="Center" MinWidth="46" TextAlignment="Right" />
+                    </Grid>
+                    <TextBlock x:Name="AppLuminosityHint" FontSize="11" TextWrapping="Wrap"
+                               Foreground="#FFAEBAC8"
+                               Text="材质亮度层：浅色主题建议 0.25、深色 0.35。设 0 会让模糊看起来像实心。" />
+
+                    <!-- ===== live state ===== -->
+                    <Border Margin="0,12,0,0" Padding="10,8" CornerRadius="8"
+                            Background="#224CC2FF">
+                        <TextBlock x:Name="FlyoutStateText" FontSize="11" TextWrapping="Wrap"
+                                   Foreground="#FFAEBAC8" />
+                    </Border>
+
+                    <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,12,0,0"
+                                HorizontalAlignment="Left">
+                        <Button x:Name="DevModeButton" Content="开发者模式（配色）"
+                                Click="OnOpenDevModeClick"
+                                ToolTipService.ToolTip="逐个调整颜色令牌：点选预设色或直接填 #RRGGBB，实时预览并给对比度提示" />
+                        <Button x:Name="ResetButton" Content="恢复默认" Click="OnResetThemeClick" />
+                    </StackPanel>
+                    <StackPanel Orientation="Horizontal" Spacing="8" Margin="0,8,0,0"
+                                HorizontalAlignment="Left">
+                        <Button x:Name="RestartButton" Content="重启并生效" Click="OnRestartAppClick"
+                                ToolTipService.ToolTip="设置已立即生效；若某个窗口特效需要重建窗口，用它重启应用" />
+                        <Button x:Name="OpenSettingsFileButton" Content="打开设置文件"
+                                Click="OnOpenSettingsFileClick" />
+                    </StackPanel>
+                    <TextBlock x:Name="AppApplyHint" FontSize="11" TextWrapping="Wrap" Margin="0,8,0,0"
+                               Foreground="#FFAEBAC8"
+                               Text="改动即时预览在左侧窗口上；点「应用并保存」才会写盘，直接关闭会撤销未应用的改动。" />
+                </StackPanel>
+            </ScrollViewer>
+
+            <Border x:Name="AppearancePanelFooter" Grid.Row="2" Padding="18,10,14,16"
+                    BorderThickness="0,1,0,0" BorderBrush="#FF2C333C">
+                <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                    <Button x:Name="AppearanceCloseButton" Content="关闭" Click="OnAppearanceCloseClick" />
+                    <Button x:Name="AppearanceApplyButton" Content="应用并保存"
+                            Click="OnAppearanceApplyClick"
+                            IsEnabled="False"
+                            Style="{StaticResource FlatAccentButtonStyle}" />
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- ==================================================================
+             Developer mode: pick the final palette by hand.
+
+             Layout is two columns (token | controls) so the hex box, the swatch and the
+             contrast readout always fit; the preview on the right shows the LIVE palette
+             plus the draft you are editing, so the effect of a change is visible before
+             committing it.
+             ================================================================== -->
+        <!-- ==================================================================
+             Developer mode: hand-pick the palette.
+
+             Also a non-modal drawer (not a dialog) so the window being retuned stays
+             visible. Two ways to set a colour, because typing hex alone proved useless in
+             practice (user report 2026-09-12):
+               * CLICK a token row to select it, then click a colour chip in the palette
+                 row below - the quick path for everyday tweaks;
+               * or type #RRGGBB into the row's box - the precise path.
+             The right column previews the draft against the live palette and reports the
+             contrast ratios, so a bad choice is visible before it is applied.
+             ================================================================== -->
+        <Grid x:Name="DevScrim" Grid.Row="0" Grid.RowSpan="2"
+              Background="#01000000" Visibility="Collapsed"
+              Tapped="OnDevScrimTapped" />
+
+        <Grid x:Name="DevPanel" Grid.Row="0" Grid.RowSpan="2" Canvas.ZIndex="20"
+              Width="470" HorizontalAlignment="Left"
+              Background="#FF161B22" Visibility="Collapsed">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="Auto" />
+                <RowDefinition Height="*" />
+                <RowDefinition Height="Auto" />
+            </Grid.RowDefinitions>
+
+            <StackPanel Grid.Row="0" Margin="14,16,18,6" Orientation="Horizontal" Spacing="10">
+                <Button Content="&#xE711;" FontFamily="Segoe MDL2 Assets" FontSize="12"
+                        Background="Transparent" BorderThickness="0"
+                        Padding="8,4" Click="OnDevCloseClick"
+                        VerticalAlignment="Center"
+                        IsTabStop="False" FocusVisualPrimaryThickness="0"
+                        FocusVisualSecondaryThickness="0"
+                        Foreground="#FFAEBAC8"
+                        ToolTipService.ToolTip="关闭（未应用的改动会撤销）" />
+                <TextBlock x:Name="DevTitleText" Text="开发者模式 · 配色" FontSize="16"
+                           FontWeight="SemiBold" VerticalAlignment="Center" Foreground="#FFF2F6FA" />
+            </StackPanel>
+
+            <StackPanel Grid.Row="1" Margin="18,0,14,8" Spacing="6">
+                <StackPanel Orientation="Horizontal" Spacing="14">
+                    <TextBlock x:Name="DevEditLabel" Text="编辑主题：" FontSize="12"
+                               VerticalAlignment="Center" Foreground="#FFF2F6FA" />
+                    <RadioButton x:Name="DevDarkRadio" Content="深色" GroupName="DevTheme"
+                                 Foreground="#FFF2F6FA" Checked="OnDevThemeChanged" />
+                    <RadioButton x:Name="DevLightRadio" Content="浅色" GroupName="DevTheme"
+                                 Foreground="#FFF2F6FA" Checked="OnDevThemeChanged" />
+                </StackPanel>
+
+                <TextBlock x:Name="DevSelectedText" FontSize="11" TextWrapping="Wrap"
+                           Foreground="#FFAEBAC8"
+                           Text="① 点一行选中颜色项　② 点下面的色块应用（或直接改色值）" />
+
+                <!-- Click-to-apply swatch palette: the fast path. -->
+                <Border x:Name="DevSwatchBand" CornerRadius="8" Padding="8">
+                    <StackPanel Spacing="6">
+                        <ItemsControl x:Name="DevSwatchRow1">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal" Spacing="4" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                        <ItemsControl x:Name="DevSwatchRow2">
+                            <ItemsControl.ItemsPanel>
+                                <ItemsPanelTemplate>
+                                    <StackPanel Orientation="Horizontal" Spacing="4" />
+                                </ItemsPanelTemplate>
+                            </ItemsControl.ItemsPanel>
+                        </ItemsControl>
+                    </StackPanel>
+                </Border>
+            </StackPanel>
+
+            <ScrollViewer Grid.Row="2" Padding="18,0,14,0"
+                          VerticalScrollBarVisibility="Auto"
+                          HorizontalScrollBarVisibility="Disabled">
+                <StackPanel x:Name="DevTokenList" Spacing="1" />
+            </ScrollViewer>
+
+            <Border Grid.Row="3" Padding="18,10,14,16"
+                    BorderThickness="0,1,0,0"
+                    BorderBrush="#FF2C333C">
+                <StackPanel Spacing="8">
+                    <Grid>
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*" />
+                            <ColumnDefinition Width="*" />
+                        </Grid.ColumnDefinitions>
+                        <StackPanel Grid.Column="0" Margin="0,0,6,0" Spacing="4">
+                            <TextBlock x:Name="DevPreviewDraftCaption" Text="正在编辑" FontSize="11"
+                                       Foreground="#FFAEBAC8" />
+                            <Border x:Name="DevPreviewDraft" CornerRadius="10" Padding="10" Height="104"
+                                    BorderThickness="1">
+                                <StackPanel Spacing="4">
+                                    <TextBlock x:Name="DevDraftMain" Text="正文 Aa 123" FontSize="12" />
+                                    <TextBlock x:Name="DevDraftSub" Text="次要 Aa 123" FontSize="11" />
+                                    <Border x:Name="DevDraftPill" CornerRadius="9" Padding="8,2"
+                                            HorizontalAlignment="Left">
+                                        <TextBlock x:Name="DevDraftPillText" Text="胶囊" FontSize="10" />
+                                    </Border>
+                                    <Border x:Name="DevDraftLog" CornerRadius="6" Padding="6,4">
+                                        <TextBlock Text="日志区" FontSize="11" FontFamily="Consolas" />
+                                    </Border>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                        <StackPanel Grid.Column="1" Margin="6,0,0,0" Spacing="4">
+                            <TextBlock x:Name="DevPreviewLiveCaption" Text="当前生效" FontSize="11"
+                                       Foreground="#FFAEBAC8" />
+                            <Border x:Name="DevPreviewLive" CornerRadius="10" Padding="10" Height="104"
+                                    BorderThickness="1">
+                                <StackPanel Spacing="4">
+                                    <TextBlock x:Name="DevLiveMain" Text="正文 Aa 123" FontSize="12" />
+                                    <TextBlock x:Name="DevLiveSub" Text="次要 Aa 123" FontSize="11" />
+                                    <Border x:Name="DevLivePill" CornerRadius="9" Padding="8,2"
+                                            HorizontalAlignment="Left">
+                                        <TextBlock x:Name="DevLivePillText" Text="胶囊" FontSize="10" />
+                                    </Border>
+                                    <Border x:Name="DevLiveLog" CornerRadius="6" Padding="6,4">
+                                        <TextBlock Text="日志区" FontSize="11" FontFamily="Consolas" />
+                                    </Border>
+                                </StackPanel>
+                            </Border>
+                        </StackPanel>
+                    </Grid>
+
+                    <TextBlock x:Name="DevContrastText" FontSize="11" TextWrapping="Wrap"
+                               Foreground="#FFAEBAC8" />
+
+                    <StackPanel Orientation="Horizontal" Spacing="8" HorizontalAlignment="Right">
+                        <Button x:Name="DevResetOneThemeButton" Content="恢复该主题默认"
+                                Click="OnDevResetThemeClick" />
+                        <Button x:Name="DevRevertButton" Content="撤销改动" Click="OnDevRevertClick" />
+                        <Button x:Name="DevCloseButton" Content="关闭" Click="OnDevCloseClick" />
+                        <Button x:Name="DevApplyButton" Content="应用到界面" Click="OnDevApplyClick"
+                                Style="{StaticResource FlatAccentButtonStyle}" />
+                    </StackPanel>
+                </StackPanel>
+            </Border>
+        </Grid>
+
+        <!-- ================================================================
+             Capture marker (verification only) - LAST child, so it paints above the
+             opaque title bar and the drawers.
+
+             Top-centre on purpose: the drawers cover the left/right edges and the bottom
+             row is the log area, so centre-top is the one spot nothing else occupies.
+             A full-frame search for this colour produced false positives, so the capture
+             script only looks near here - a single, predictable location is what makes the
+             "is this really our window?" check trustworthy.
+             Visibility is driven by LH_UI_PROBE; normal runs never show it.
+             ================================================================ -->
+        <Border x:Name="ProbeMarker" HorizontalAlignment="Center" VerticalAlignment="Top"
+                Width="64" Height="10" Margin="0,4,0,0"
+                Background="#FFFF00FF" Visibility="Collapsed" />
+    </Grid>
+</Window>
