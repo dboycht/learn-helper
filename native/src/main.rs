@@ -45,8 +45,19 @@ fn main() {
     }
 
     unsafe {
-        // 进程级 DPI 感知（PerMonitorV2），避免高 DPI 下自绘发虚
-        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+        // 进程级 DPI 感知。
+        // ⚠️ 必须**确认真的生效**：`SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)` 会失败
+        // （例如 manifest/系统策略已固定了别的方式），失败后进程**不是 DPI 感知**的，
+        // Windows 就会替我们做**坐标虚拟化** —— 表现为
+        // `GetMonitorInfo` 给物理像素(2560x1600)、`GetWindowRect` 给逻辑像素(1707x1067)，
+        // 两套坐标混用必然出错（实测拖拽夹取算不对，见 ERROR.md E37）。
+        let dpi_ctx_ok = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) != 0;
+        let dpi_aware_ok = dpi_ctx_ok || SetProcessDpiAwareness(2) == 0; // 2 = PROCESS_PER_MONITOR_DPI_AWARE
+        trace::trace(&format!(
+            "native: dpi awareness ctx_ok={} aware_ok={}",
+            dpi_ctx_ok, dpi_aware_ok
+        ));
+
         let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
 
         let app = ui::App::new();

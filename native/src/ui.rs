@@ -904,6 +904,34 @@ impl App {
         None
     }
 
+    /// 取窗口所在显示器的工作区（排除任务栏）。返回 (工作区矩形, 显示器左上角)。
+    /// 拖拽夹取用它，保证窗口不会被推入任务栏或完全移出屏幕。
+    fn monitor_work_area_for(&self, rc: RECT) -> (RECT, (i32, i32)) {
+        unsafe {
+            let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !mon.is_null() && GetMonitorInfoW(mon, &mut mi) != 0 {
+                return (mi.rcWork, (mi.rcMonitor.left, mi.rcMonitor.top));
+            }
+            // 兜底：拿不到显示器信息时，用"整屏逻辑尺寸"当工作区，宁可夹得保守
+            let _ = rc;
+            let w = GetSystemMetrics(0);
+            let h = GetSystemMetrics(1);
+            (
+                RECT {
+                    left: 0,
+                    top: 0,
+                    right: w,
+                    bottom: h,
+                },
+                (0, 0),
+            )
+        }
+    }
+
     fn on_mouse_move(&mut self, x: i32, y: i32) {
         // 正在拖拽/缩放：直接按位移算新矩形
         if self.grab != Grab::None {
@@ -922,6 +950,39 @@ impl App {
                     rc.top += dy;
                     rc.right += dx;
                     rc.bottom += dy;
+                    // ⚠️ **必须夹取到显示器工作区**：实测往右下连拖 8 次会把窗口整块推出
+                    // 屏幕（用户看到的就是"窗口消失了"，而且没有兜底找不回来）。
+                    // 坐标已统一为**物理像素**（进程真正 DPI 感知后 GetWindowRect 与
+                    // GetMonitorInfo 才在同一坐标系，见 ERROR.md E37）。
+                    //
+                    // 规则（两条同时满足，拖动过程与松手后都不会出界）：
+                    //  1. 标题栏必须留在工作区内（否则抓不回来）；
+                    //  2. 窗口整体不能被拖出工作区（下方也要留得住）。
+                    let keep_x = self.px(140);          // 水平方向至少露出这么宽
+                    let title_h = self.title_h();
+                    let (work, mon_org) = self.monitor_work_area_for(rc);
+                    let w = self.grab_window.width();
+                    let h = self.grab_window.height();
+
+                    // 水平：左右各留 keep_x
+                    let min_left = work.left - (w - keep_x);
+                    let max_left = work.right - keep_x;
+                    // 垂直：标题栏整体留在工作区内（上边界），且窗口底边不越过工作区底边
+                    // （下边界）。两条一起夹 ⇒ 拖动/松手后都不会有"抓不着"的状态。
+                    let min_top = mon_org.1;
+                    let max_top_by_title = work.bottom - title_h;
+                    let max_top_by_bottom = work.bottom - h;
+                    // 窗口比工作区高时，优先保证标题栏可见
+                    let max_top = if max_top_by_bottom < min_top {
+                        max_top_by_title.max(min_top)
+                    } else {
+                        max_top_by_title.min(max_top_by_bottom).max(min_top)
+                    };
+
+                    rc.left = rc.left.clamp(min_left.min(max_left), max_left);
+                    rc.top = rc.top.clamp(min_top, max_top);
+                    rc.right = rc.left + w;
+                    rc.bottom = rc.top + h;
                 }
                 Grab::Left => rc.left += dx,
                 Grab::Right => rc.right += dx,
@@ -1032,6 +1093,13 @@ impl App {
                         self.toggle_maximize();
                         return;
                     }
+                    // 最大化状态下拖标题栏：先还原成普通窗口再拖（Windows 的标准行为），
+                    // 否则会把"铺满屏幕的窗口"整体搬走，看起来同样像界面消失。
+                    if unsafe { IsZoomed(self.hwnd) } != 0 {
+                        unsafe {
+                            ShowWindow(self.hwnd, SW_RESTORE);
+                        }
+                    }
                     self.grab = Grab::Move;
                     let mut pt = POINT { x, y };
                     let mut rc = RECT::default();
@@ -1066,10 +1134,58 @@ impl App {
         }
     }
 
+    /// 兜底：松手后确认窗口**还能被抓到**。若因任何原因（多显示器变化、夹取算错、
+    /// 系统还原窗口位置）跑到工作区外，就把它拉回来。
+    /// 这是"窗口拖走后再也找不回来"的最后一道保险（用户实测反馈过，见 ERROR.md E37）。
+    fn ensure_on_screen(&mut self) {
+        unsafe {
+            let mut rc = RECT::default();
+            if GetWindowRect(self.hwnd, &mut rc) == 0 {
+                return;
+            }
+            let (work, mon_org) = self.monitor_work_area_for(rc);
+            let title_h = self.title_h();
+
+            // 垂直：标题栏必须完整落在工作区内
+            let mut top = rc.top.max(mon_org.1);
+            let max_top = (work.bottom - title_h).max(mon_org.1);
+            if top > max_top {
+                top = max_top;
+            }
+            // 水平：至少留 px(140) 宽在工作区内
+            let keep = self.px(140);
+            let mut left = rc.left;
+            if left + rc.width() < work.left + keep {
+                left = work.left + keep - rc.width();
+            }
+            if left > work.right - keep {
+                left = work.right - keep;
+            }
+
+            if left != rc.left || top != rc.top {
+                SetWindowPos(
+                    self.hwnd,
+                    std::ptr::null_mut(),
+                    left,
+                    top,
+                    0,
+                    0,
+                    SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                crate::trace::trace(&format!(
+                    "ui: ensure_on_screen ({},{}) -> ({},{})",
+                    rc.left, rc.top, left, top
+                ));
+            }
+        }
+    }
+
     fn on_lbutton_up(&mut self, x: i32, y: i32) {
         if self.grab != Grab::None {
             self.grab = Grab::None;
             unsafe { ReleaseCapture() };
+            // 拖拽结束做一次"还能抓到吗"的兜底检查
+            self.ensure_on_screen();
             return;
         }
         let was = self.pressed;
