@@ -144,7 +144,11 @@ pub struct App {
     pressed: Option<Ctl>,
     dragging: bool,
     last_mouse: POINT,
-    timer_ui_armed: bool,
+    /// 上一次绘制时的状态版本号：只有它变了才重绘（避免每 250ms 无条件重画整窗）
+    painted_rev: u64,
+    /// 累计重绘次数（诊断用：LH_UI_PAINT_REPORT 时周期性落盘）。
+    /// 用原子量而不是 App 字段，方便后台线程读取（App 本身不是 Send）。
+    paint_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
     theme_glyph: u32,
 
     // ---- 自实现的窗口拖拽 / 缩放（无系统标题栏）----
@@ -181,7 +185,8 @@ impl App {
             pressed: None,
             dragging: false,
             last_mouse: POINT { x: 0, y: 0 },
-            timer_ui_armed: false,
+            painted_rev: 0,
+            paint_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             theme_glyph: 0xE706,
             grab: Grab::None,
             grab_origin: POINT { x: 0, y: 0 },
@@ -260,6 +265,25 @@ impl App {
             SetTimer(hwnd, TIMER_POLL, 1500, std::ptr::null_mut());
         }
         crate::trace::trace("ui: timers armed, starting backend");
+
+        // 诊断：每 5 秒把累计重绘次数落盘一次（验证"空闲时不再周期性重画"）。
+        // 修复前应当 ≈ 4 次/秒（250ms 无条件重绘）；修复后空闲期应接近 0。
+        if std::env::var("LH_UI_PAINT_REPORT").is_ok() {
+            let counter = app.paint_count.clone();
+            std::thread::spawn(move || {
+                let mut last = 0u64;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                    let now = counter.load(std::sync::atomic::Ordering::Relaxed);
+                    crate::trace::trace(&format!(
+                        "paint-report: paints in last 5s = {} (total {})",
+                        now.saturating_sub(last),
+                        now
+                    ));
+                    last = now;
+                }
+            });
+        }
 
         // 可脚本驱动的动作钩子（代理点不了界面，验证按钮链路只能靠它）：
         //   LH_UI_ACTION=refresh_pages|diagnose|pause|resume|start|stop|speed
@@ -1260,9 +1284,32 @@ impl App {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = unsafe { BeginPaint(self.hwnd, &mut ps) };
                 if !hdc.is_null() {
-                    self.paint(hdc);
+                    // **双缓冲**：先画进内存 DC，再一次性 BitBlt 到屏幕。
+                    // 直接往屏幕 DC 逐块画会看到中间过程（文字/卡片"闪一下"），
+                    // 这是用户报的"一抽一抽"的第二个成因（见 ERROR.md E38）。
+                    let w = self.w.max(1);
+                    let h = self.h.max(1);
+                    let mem = unsafe { CreateCompatibleDC(hdc) };
+                    let bmp = unsafe { CreateCompatibleBitmap(hdc, w, h) };
+                    if !mem.is_null() && !bmp.is_null() {
+                        let old = unsafe { SelectObject(mem, bmp as HGDIOBJ) };
+                        self.paint(mem);
+                        unsafe {
+                            BitBlt(hdc, 0, 0, w, h, mem, 0, 0, SRCCOPY);
+                            SelectObject(mem, old);
+                            DeleteObject(bmp as HGDIOBJ);
+                            DeleteDC(mem);
+                        }
+                    } else {
+                        // 内存 DC 建立失败也不能白屏：退回直接绘制
+                        self.paint(hdc);
+                    }
                     unsafe { EndPaint(self.hwnd, &ps) };
                 }
+                self.painted_rev = self.shared.lock().rev;
+                // 重绘计数（验证"空闲时不再每 250ms 重画"用；见 ERROR.md E38）
+                self.paint_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 0
             }
             WM_SIZE => {
@@ -1308,17 +1355,13 @@ impl App {
             }
             WM_TIMER => {
                 if wp == TIMER_UI {
-                    // 检查是否有日志要补充（简单起见：有更新就重绘）
-                    let has_new = {
-                        let st = self.shared.lock();
-                        st.logs.len() > 0
-                    };
-                    if has_new && !self.timer_ui_armed {
-                        self.timer_ui_armed = true;
+                    // ⚠️ **只在状态真的变了才重绘**。
+                    // 之前这里是无条件 `InvalidateRect`，等于每 250ms 把整个窗口重画一遍，
+                    // 加上没有双缓冲 ⇒ 界面上的文字一直"一抽一抽"（用户实测反馈，见 ERROR.md E38）。
+                    let rev = self.shared.lock().rev;
+                    if rev != self.painted_rev {
+                        unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
                     }
-                    // 每 250ms 抽一次：如果 backend 事件改过 state，重绘
-                    let _ = has_new;
-                    unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
                 } else if wp == TIMER_POLL {
                     let st = self.shared.lock();
                     let connected = st.connected;

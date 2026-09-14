@@ -74,6 +74,10 @@ pub struct CoreState {
     /// 需要 UI 处理的提示（弹窗/追加日志），由 UI 线程消费后清空。
     pub flash: Option<String>,
     pub backend_exe: String,
+    /// **重绘版本号**：任何会影响画面的改动都必须 +1。
+    /// UI 线程据此判断"要不要重绘"——没有它就只能定时无条件重绘，
+    /// 表现就是界面上文字一直"一抽一抽"（实测踩过，见 ERROR.md E38）。
+    pub rev: u64,
 }
 
 impl CoreState {
@@ -99,6 +103,11 @@ pub struct Shared {
     pub hwnd: Arc<Mutex<isize>>,
     pub stop: AtomicBool,
     pub child: Mutex<Option<Child>>,
+    /// 上一次"可见状态"的指纹：只有它变了才递增 rev。
+    /// ⚠️ 不能"每次 notify 就 +1"：兜底轮询每 1.5s 无条件调一次 notify，
+    /// 那样界面仍会以 ~1/1.5s 的频率持续重绘，用户看到的就是文字"一抽一抽"
+    /// （实测：修复前空闲期 6 次/5 秒，见 ERROR.md E38）。
+    last_fp: Mutex<u64>,
 }
 
 impl Shared {
@@ -112,6 +121,7 @@ impl Shared {
             hwnd: Arc::new(Mutex::new(0)),
             stop: AtomicBool::new(false),
             child: Mutex::new(None),
+            last_fp: Mutex::new(0),
         })
     }
 
@@ -119,8 +129,56 @@ impl Shared {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// 通知 UI 线程：有新数据，重绘（不阻塞后台线程）。
+    /// "画面上看得见的东西"的指纹。只包含**会改变画面**的状态，
+    /// 不包含 uptime 这类每帧都在变但界面不显示的量。
+    fn fingerprint(st: &CoreState) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        st.connected.hash(&mut h);
+        st.status_text.hash(&mut h);
+        st.device_id.hash(&mut h);
+        st.base_url.hash(&mut h);
+        st.pages.hash(&mut h);
+        st.selected_page.hash(&mut h);
+        st.answer_mode.hash(&mut h);
+        st.video_speed.to_bits().hash(&mut h);
+        st.auto_submit.hash(&mut h);
+        st.log_seq.hash(&mut h);
+        st.logs.len().hash(&mut h);
+        st.engine.running.hash(&mut h);
+        st.engine.paused.hash(&mut h);
+        st.engine.page_count.hash(&mut h);
+        st.engine.video_count.hash(&mut h);
+        st.engine.doc_count.hash(&mut h);
+        st.engine.task_text.hash(&mut h);
+        st.engine.video_text.hash(&mut h);
+        st.engine.quiz_text.hash(&mut h);
+        st.engine.last_error.hash(&mut h);
+        h.finish()
+    }
+
+    /// 通知 UI 线程：**只有可见状态真变了**才请求重绘（不阻塞后台线程）。
     pub fn notify_ui(&self) {
+        let fp = {
+            let st = self.lock();
+            Self::fingerprint(&st)
+        };
+        let changed = {
+            let mut last = self.last_fp.lock().unwrap_or_else(|e| e.into_inner());
+            if *last == fp {
+                false
+            } else {
+                *last = fp;
+                true
+            }
+        };
+        if !changed {
+            return;
+        }
+        {
+            let mut st = self.lock();
+            st.rev = st.rev.wrapping_add(1);
+        }
         let hwnd = *self.hwnd.lock().unwrap_or_else(|e| e.into_inner());
         if hwnd != 0 {
             unsafe {
