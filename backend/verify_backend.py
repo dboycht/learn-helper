@@ -134,8 +134,10 @@ def test_process_lifecycle():
               r.json().get('ok') and r.json().get('protocol') == 1 and r.json().get('pipe'))
 
         st = http_get(f'{base}/api/status', timeout=5).json()
+        # 版本号不写死：从后端自身读，避免每次升版本都要改测试
+        from learn_helper.config import APP_VERSION as backend_version
         check('A4 status 快照字段齐全',
-              st.get('type') == 'status' and st.get('version') == '1.0.4'
+              st.get('type') == 'status' and st.get('version') == backend_version
               and 'engine' in st and st['engine']['running'] is False, str(list(st.keys())))
 
         body = http_post(f'{base}/api/control', json={'action': 'start'}, timeout=10).json()
@@ -189,10 +191,45 @@ def test_process_lifecycle():
             pass
         code = proc.wait(timeout=20)
         check('A15 后端进程在 shutdown 后自行退出', code == 0, f'exit={code}')
+
     finally:
         if proc.poll() is None:
             proc.kill()
             proc.wait(timeout=10)
+
+    # ---- A16~A18：残留运行时文件不能卡死启动（ERROR.md E32，实测踩过）----
+    lock = os.path.join(_TEST_BASE, '.runtime', 'backend.lock')
+    info = os.path.join(_TEST_BASE, '.runtime', 'backend.json')
+    os.makedirs(os.path.dirname(lock), exist_ok=True)
+    # 造一份"指向不存在 pid 的残留文件"
+    with open(lock, 'w', encoding='utf-8') as f:
+        f.write('999999')
+    with open(info, 'w', encoding='utf-8') as f:
+        json.dump({'type': 'ready', 'ok': True, 'pid': 999999, 'port': 9,
+                   'pipe': 'learn-helper-stale'}, f)
+    stale = subprocess.Popen(
+        [sys.executable, os.path.join(BACKEND_DIR, 'main.py'), '--port', '0'],
+        cwd=PROJECT_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE, env=env, text=True, encoding='utf-8', errors='replace')
+    try:
+        line = read_handshake(stale, timeout=30)
+        check('A16 残留运行时文件被自动清理并正常启动',
+              'learn-helper-backend-ready' in line, line[:160] or '(无握手行)')
+        if 'learn-helper-backend-ready' in line:
+            st = json.loads(line)
+            base2 = f'http://127.0.0.1:{st["port"]}'
+            check('A17 清理后服务可用', wait_http(f'{base2}/api/health') == 200)
+            try:
+                http_post(f'{base2}/api/shutdown', timeout=8)
+            except Exception:
+                pass
+        else:
+            check('A17 清理后服务可用', False, '未启动成功')
+        stale.wait(timeout=20)
+    finally:
+        if stale.poll() is None:
+            stale.kill()
+            stale.wait(timeout=10)
 
 
 def read_pipe_events(pipe_name, want=3, timeout=8):

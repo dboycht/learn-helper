@@ -56,17 +56,66 @@ def _pid_alive(pid):
         return False
 
 
-def acquire_single_instance_lock(force=False):
-    """返回 (ok, existing_info)。已有活着的后端时返回 False（避免抢浏览器/端口）。"""
-    os.makedirs(RUNTIME_DIR, exist_ok=True)
-    existing = read_runtime_info()
-    if existing and _pid_alive(existing.get('pid')):
-        if not force:
-            return False, existing
+def _backend_responding(port, timeout=1.5):
+    """该端口上是否真有我们自己的后端在服务（用于排除残留文件）。
+
+    ⚠️ 只查 pid 存活是不够的：进程被杀后 pid 会被系统回收，
+    ``_pid_alive`` 可能命中**另一个毫不相干的进程**，于是新实例误判"已有实例在运行"
+    而拒绝启动（实测踩到，见 ERROR.md E32）。所以最终判据是"端口上能问到 /api/health"。
+    """
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False
+    if port <= 0:
+        return False
+    import json
+    import socket
+    import urllib.request
+
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=timeout):
+            pass
+    except Exception:
+        return False
+    try:
+        # 本机请求绕开代理（有系统代理时会拦 127.0.0.1）
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(f'http://127.0.0.1:{port}/api/health', timeout=timeout) as resp:
+            data = json.loads(resp.read().decode('utf-8'))
+        return bool(data.get('ok'))
+    except Exception:
+        return False
+
+
+def _clear_stale_runtime_files():
+    for path in (LOCK_PATH, INFO_PATH):
         try:
-            os.remove(LOCK_PATH)
+            if os.path.exists(path):
+                os.remove(path)
         except Exception:
             pass
+
+
+def acquire_single_instance_lock(force=False):
+    """返回 (ok, existing_info)。
+
+    已有**真正在服务**的后端时返回 False（避免抢浏览器/端口）。
+    ⚠️ 残留文件（上次崩溃/强杀留下）必须自动清掉，否则会永久卡死启动——
+    这是实测踩到的坑（ERROR.md E32）。
+    """
+    os.makedirs(RUNTIME_DIR, exist_ok=True)
+    existing = read_runtime_info()
+    if existing and not force:
+        if _backend_responding(existing.get('port')):
+            return False, existing
+        # pid 活着但端口无响应 ⇒ 要么不是我们的进程（pid 被回收），
+        # 要么是半死状态；两种情况都该清掉残留继续启动。
+        LOGGER.warning(f'[启动] 发现残留运行时文件（{existing}），已清理后继续启动。')
+        _clear_stale_runtime_files()
+    elif existing and force:
+        _clear_stale_runtime_files()
+
     with open(LOCK_PATH, 'w', encoding='utf-8') as f:
         f.write(str(os.getpid()))
     return True, existing
@@ -119,9 +168,20 @@ class Backend:
         ok, existing = acquire_single_instance_lock(self.force)
         if not ok:
             LOGGER.warning(f'[启动] 已有后端在运行: {existing}')
-            sys.stderr.write(dumps_ascii({
-                'type': 'already-running', 'pid': (existing or {}).get('pid'),
-                'port': (existing or {}).get('port')}) + '\n')
+            # 既写 stderr（人看）也写 stdout（前端可解析并直接复用已运行的实例，
+            # 而不是只报一句"没收到握手行"——实测踩过，见 ERROR.md E32）。
+            msg = dumps_ascii({
+                'type': 'already-running',
+                'token': 'learn-helper-backend-already-running',
+                'ok': False,
+                'pid': (existing or {}).get('pid'),
+                'port': (existing or {}).get('port'),
+                'pipe': (existing or {}).get('pipe'),
+            }) + '\n'
+            sys.stderr.write(msg)
+            sys.stderr.flush()
+            sys.stdout.write(msg)
+            sys.stdout.flush()
             return None
 
         self.engine = SolverEngine(self.hub)
