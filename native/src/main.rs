@@ -66,7 +66,16 @@ fn main() {
 
         // 窗口创建期间（WM_NCCREATE）就会把 app_ptr 存进 GWLP_USERDATA 并回填 hwnd，
         // 因此窗口一存在，后台线程就能安全拿到 hwnd 发消息。
-        let hwnd = ui::create_main_window(app_ptr);
+        // DPI 用主显示器 DPI 估算（窗口尺寸/最小尺寸都按它算）。
+        let probe_dpi = {
+            let dc = unsafe { GetDC(std::ptr::null_mut()) };
+            let d = if dc.is_null() { 96 } else { unsafe { GetDeviceCaps(dc, 88) }.max(96) as u32 };
+            if !dc.is_null() {
+                unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
+            }
+            d
+        };
+        let hwnd = ui::create_main_window(app_ptr, probe_dpi);
         if hwnd.is_null() {
             trace::trace("native: CreateWindowExW 失败，退出");
             std::process::exit(2);

@@ -697,15 +697,41 @@ impl App {
         );
     }
 
+    /// **客户区最小高度**：各固定行之和 + 日志区最小高度。
+    /// 同样用于 `ptMinTrackSize` 与拖拽夹取，保证"缩到最小"时布局仍然成立。
+    pub fn min_content_height(&self) -> i32 {
+        let m = self.px(18).max(12); // 与 m() 一致
+        let gap = self.px(10);
+        let title = self.title_h() + self.px(2);
+        let status = self.px(60).max(48);
+        let page = self.px(60).max(48);
+        let kpi = self.px(170).max(120);
+        let buttons = self.px(46).max(36);
+        let log_min = self.px(140); // 日志区至少能看到几行
+        title + status + page + kpi + buttons + log_min + gap * 4 + m
+    }
+
     /// 网页框右边界（= 刷新按钮左边留 10px 间距）。绘制与命中共用。
     fn page_box_right(&self, card: RECT) -> i32 {
         self.refresh_rect(card).left - self.px(10)
     }
 
-    /// 「检测/刷新网页」按钮矩形（绘制与命中共用）。
+    /// 倍速胶囊矩形（**绘制与命中共用**）。它占最右侧靠内的位置。
+    fn speed_rect(&self, card: RECT) -> RECT {
+        let right = card.right - self.px(16) - self.answer_mode_width();
+        RECT {
+            left: right - self.speed_width(),
+            top: card.top + self.px(11),
+            right,
+            bottom: card.bottom - self.px(11),
+        }
+    }
+
+    /// 「检测/刷新网页」按钮矩形（**绘制与命中共用**）：排在**倍速左侧**、留 px(10) 间距。
+    /// 之前它与倍速用同一条右边界 ⇒ 两个控件完全叠在一起（实测重叠 144px，E41）。
     fn refresh_rect(&self, card: RECT) -> RECT {
-        let w = self.px(150);
-        let right = card.right - self.px(16) - self.px(300);
+        let right = self.speed_rect(card).left - self.px(10);
+        let w = self.refresh_button_width();
         RECT {
             left: right - w,
             top: card.top + self.px(11),
@@ -714,15 +740,76 @@ impl App {
         }
     }
 
-    /// 倍速控件矩形（**绘制与命中共用**，避免两者算出的位置不一致）。
-    fn speed_rect(&self, card: RECT) -> RECT {
-        let right = card.right - self.px(300);
-        RECT {
-            left: right - self.px(110),
-            top: card.top + self.px(11),
-            right,
-            bottom: card.bottom - self.px(11),
-        }
+    /// 刷新按钮宽度（按文本实测 + 内边距，带下限）。
+    /// 用 `ui_sm`（13pt）而不是 `ui_b`：中文标签在 14pt 半粗下要 ~217px，
+    /// 按钮会宽到挤掉网页框；13pt 足够清晰又省空间。
+    fn refresh_button_width(&self) -> i32 {
+        let hdc = unsafe { GetDC(self.hwnd) };
+        let measured = if hdc.is_null() {
+            0
+        } else {
+            let w = gdi::measure_text(hdc, "检测/刷新网页", &self.fonts[self.font_ui_sm]).cx;
+            unsafe { ReleaseDC(self.hwnd, hdc) };
+            w
+        };
+        // 文本 + 左右各 px(16) 内边距；下限 px(160)
+        let base = if measured > 0 { measured } else { self.px(140) };
+        (base + self.px(32)).max(self.px(160))
+    }
+
+    /// 「答题方式」占位宽度（按文本实测 + 间距）。
+    fn answer_mode_width(&self) -> i32 {
+        let hdc = unsafe { GetDC(self.hwnd) };
+        let measured = if hdc.is_null() {
+            0
+        } else {
+            let w = gdi::measure_text(hdc, "答题方式：内部答题 API", &self.fonts[self.font_ui_sm]).cx;
+            unsafe { ReleaseDC(self.hwnd, hdc) };
+            w
+        };
+        let base = if measured > 0 { measured } else { self.px(150) };
+        base + self.px(24)
+    }
+
+    /// 倍速胶囊宽度（按 "倍速 2.0x" 实测）。
+    fn speed_width(&self) -> i32 {
+        let hdc = unsafe { GetDC(self.hwnd) };
+        let measured = if hdc.is_null() {
+            0
+        } else {
+            let w = gdi::measure_text(hdc, "倍速 2.0x", &self.fonts[self.font_ui_sm]).cx;
+            unsafe { ReleaseDC(self.hwnd, hdc) };
+            w
+        };
+        let base = if measured > 0 { measured } else { self.px(80) };
+        (base + self.px(28)).max(self.px(96))
+    }
+
+    /// **网页选择行所需的客户区最小宽度**：各元素宽度 + 间距 + 两侧外边距。
+    ///
+    /// 用它同时决定 (a) 窗口的 `ptMinTrackSize` 与 (b) 拖拽缩放的夹取下限，
+    /// 这样"窗口缩到最小"和"布局需要的宽度"永远一致 —— 否则缩到最小就会错位
+    /// （用户反馈，见 ERROR.md E41）。
+    pub fn min_content_width(&self) -> i32 {
+        let m = self.px(16);
+        let label = self.px(70);
+        let label_gap = self.px(80);
+        let gap = self.px(10);
+        let page_box_min = self.px(220);
+        // ⚠️ 必须用**实测**宽度（refresh/speed/answer 三个函数本身就是按文本量的）。
+        // 之前这里写的是假定常量，比实测小 ⇒ 下限算低 ⇒ 缩到最小就压在一起（E41）。
+        let total = m
+            + label
+            + label_gap
+            + page_box_min
+            + gap
+            + self.refresh_button_width()
+            + gap
+            + self.speed_width()
+            + self.answer_mode_width()
+            + m;
+        // 再留一点余量，避免"刚好相等"时四舍五入后仍重叠
+        total.max(self.px(1100)) + self.px(24)
     }
     fn paint_kpi_progress(&self, hdc: HDC, kpi: RECT, progress: RECT, colors: Colors, st: &PaintState) {
         // KPI 卡
@@ -1042,8 +1129,9 @@ impl App {
             let dx = pt.x - self.grab_origin.x;
             let dy = pt.y - self.grab_origin.y;
             let mut rc = self.grab_window;
-            let min_w = (640 * self.dpi as i32 / 96).max(520);
-            let min_h = (520 * self.dpi as i32 / 96).max(420);
+            // 最小尺寸由布局算出（见 min_content_width/height），与 WM_GETMINMAXINFO 一致
+            let min_w = self.min_content_width();
+            let min_h = self.min_content_height();
             match self.grab {
                 Grab::Move => {
                     rc.left += dx;
@@ -1479,12 +1567,13 @@ impl App {
             WM_GETMINMAXINFO => {
                 let info = lp as *mut MINMAXINFO;
                 if !info.is_null() {
-                    let scale = self.dpi as i32 / 96;
+                    // ⚠️ 最小宽度**由布局算出**（网页行各元素宽度之和），不能拍脑袋写死。
+                    // 之前写死 640，而网页行实际需要 ~1200px ⇒ 缩到最小就互相压住/错位
+                    // （用户反馈"弄到最小的时候有错位"，见 ERROR.md E41）。
+                    let min_w = self.min_content_width();
+                    let min_h = self.min_content_height();
                     unsafe {
-                        (*info).ptMinTrackSize = POINT {
-                            x: (640 * scale).max(520),
-                            y: (520 * scale).max(420),
-                        };
+                        (*info).ptMinTrackSize = POINT { x: min_w, y: min_h };
                         // 无边框窗口默认"最大化"会盖住任务栏，必须自己夹到工作区
                         let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
                         let mut mi = MONITORINFO {
@@ -1633,8 +1722,42 @@ struct CREATESTRUCTW {
     lpCreateParams: *mut std::ffi::c_void,
 }
 
-/// 创建主窗口；``app_ptr`` 是 `*mut App`（Box::into_raw 的产物）。
-pub fn create_main_window(app_ptr: *mut App) -> HWND {
+/// 96 DPI 基准的"整数量"（与 `App::px` 同一套规则，供窗口创建前估算尺寸用）。
+fn px_at(dpi: u32, logical: i32) -> i32 {
+    (logical * (dpi.max(96) as i32) * 100 / 96 + 50) / 100
+}
+
+/// 创建窗口前估算"客户区最小宽度"（此时还没有窗口，量不了文本，用保守常量）。
+/// 与 `App::min_content_width()` 保持同一量级，避免"开出来就小于下限"（E41）。
+fn min_window_width(dpi: u32) -> i32 {
+    let m = px_at(dpi, 16);
+    let label = px_at(dpi, 70);
+    let label_gap = px_at(dpi, 80);
+    let gap = px_at(dpi, 10);
+    let page_min = px_at(dpi, 300);
+    let refresh = px_at(dpi, 152);
+    let speed = px_at(dpi, 104);
+    let answer = px_at(dpi, 220);
+    (px_at(dpi, 1100)).max(
+        m + label + label_gap + page_min + gap + refresh + gap + speed + answer + m,
+    )
+}
+
+/// 创建窗口前估算"客户区最小高度"。
+fn min_window_height(dpi: u32) -> i32 {
+    let m = px_at(dpi, 18);
+    let gap = px_at(dpi, 10);
+    let title = px_at(dpi, 52) + px_at(dpi, 2);
+    let status = px_at(dpi, 60);
+    let page = px_at(dpi, 60);
+    let kpi = px_at(dpi, 170);
+    let buttons = px_at(dpi, 46);
+    let log_min = px_at(dpi, 140);
+    (px_at(dpi, 640)).max(title + status + page + kpi + buttons + log_min + gap * 4 + m)
+}
+
+/// 创建主窗口；``app_ptr`` 是 `*mut App`（Box::into_raw 的产物），``dpi`` 是目标屏 DPI。
+pub fn create_main_window(app_ptr: *mut App, dpi: u32) -> HWND {
     unsafe {
         let class_w = wide(CLASS_NAME);
         let wc = WNDCLASSEXW {
@@ -1662,12 +1785,14 @@ pub fn create_main_window(app_ptr: *mut App) -> HWND {
         // WS_EX_APPWINDOW 保证它仍然出现在任务栏与 Alt+Tab 里。
         let style = WS_POPUP | WS_VISIBLE | WS_CLIPCHILDREN;
 
-        // 按屏幕 DPI 缩放并居中：固定 880x720 在 150% 缩放下会超出屏幕被裁掉（实测 E30）
+        // 按屏幕 DPI 缩放并居中。宽度**不能小于布局算出的最小宽度**，
+        // 否则窗口一打开就已经低于自己的下限（改小尺寸下限后这里必须同步，见 E41）。
         let screen_w = GetSystemMetrics(0);
         let screen_h = GetSystemMetrics(1);
         let scale = ((screen_w as f32 / 1920.0).clamp(1.0, 2.0)).min(1.5);
-        let win_w = (880.0 * scale) as i32;
-        let win_h = (720.0 * scale) as i32;
+        let min_w = min_window_width(dpi);
+        let win_w = ((1100.0 * scale) as i32).max(min_w);
+        let win_h = ((720.0 * scale) as i32).max(min_window_height(dpi));
         let x = ((screen_w - win_w) / 2).max(0);
         let y = ((screen_h - win_h) / 2).max(0);
         crate::trace::trace(&format!(

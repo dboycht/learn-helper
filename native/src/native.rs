@@ -403,6 +403,7 @@ extern "system" {
     pub fn DeleteDC(hdc: HDC) -> BOOL;
     pub fn LineTo(hdc: HDC, x: i32, y: i32) -> BOOL;
     pub fn MoveToEx(hdc: HDC, x: i32, y: i32, prev: *mut POINT) -> BOOL;
+    pub fn GetDeviceCaps(hdc: HDC, index: i32) -> i32;
     pub fn GetDIBits(
         hdc: HDC,
         hbm: HBITMAP,
