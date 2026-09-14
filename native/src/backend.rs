@@ -67,6 +67,10 @@ pub struct CoreState {
     pub log_seq: i64,
     pub answer_mode: String,
     pub server_url: String,
+    /// 视频倍速（来自后端 settings.run.video_speed）
+    pub video_speed: f64,
+    /// 提交模式：true=自动提交 / false=仅暂存
+    pub auto_submit: bool,
     /// 需要 UI 处理的提示（弹窗/追加日志），由 UI 线程消费后清空。
     pub flash: Option<String>,
     pub backend_exe: String,
@@ -488,6 +492,9 @@ pub fn refresh_settings(shared: Arc<Shared>) {
                     .unwrap_or_default();
                 let server_url = data.str_at("server_url");
                 let device = data.str_at("device_id");
+                let run = data.get("run");
+                let speed = run.map(|r| r.num_at("video_speed")).unwrap_or(0.0);
+                let auto_submit = run.map(|r| r.bool_at("auto_submit")).unwrap_or(true);
                 let mut st = shared.lock();
                 if !mode_label.is_empty() {
                     st.answer_mode = mode_label;
@@ -498,6 +505,10 @@ pub fn refresh_settings(shared: Arc<Shared>) {
                 if !device.is_empty() {
                     st.device_id = device;
                 }
+                if speed > 0.0 {
+                    st.video_speed = speed;
+                }
+                st.auto_submit = auto_submit;
                 drop(st);
                 shared.notify_ui();
             }
@@ -555,6 +566,34 @@ pub fn control(shared: &Arc<Shared>, action: &str, params: Option<Value>) -> Res
 /// 单独取网页列表（refresh_pages 也走 control，这里给「刷新网页」按钮用）。
 pub fn refresh_pages(shared: &Arc<Shared>) -> Result<String, String> {
     control(shared, "refresh_pages", None)
+}
+
+/// 更新设置（PUT /api/settings）。`json_body` 是**部分字段**的 JSON 对象，
+/// 后端只覆盖给出的键（合并式写入，不会抹掉其它设置）。
+pub fn update_settings(shared: &Arc<Shared>, json_body: &str) -> Result<String, String> {
+    let base = {
+        let st = shared.lock();
+        if !st.connected {
+            return Err("后端尚未连接".into());
+        }
+        st.base_url.clone()
+    };
+    let resp = winhttp::request(
+        "PUT",
+        &format!("{}/api/settings", base),
+        Some(json_body),
+        &[],
+        10_000,
+    )?;
+    let text = resp.text();
+    let value = json::parse(&text).ok_or_else(|| "响应不是合法 JSON".to_string())?;
+    // 成功时同步刷新本地设置快照
+    if value.get("ok").map(|v| matches!(v, Value::Bool(true))).unwrap_or(false) {
+        refresh_settings(shared.clone());
+        Ok(value.str_at("message"))
+    } else {
+        Err(value.str_at("message"))
+    }
 }
 
 pub fn shutdown(shared: Arc<Shared>) {

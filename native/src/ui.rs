@@ -24,6 +24,8 @@ enum Ctl {
     Diagnose,
     Stop,
     Theme,
+    /// 视频倍速切换（点击在 1.0 / 1.5 / 2.0 / 3.0 之间循环）
+    Speed,
     Min,
     Max,
     Close,
@@ -260,7 +262,7 @@ impl App {
         crate::trace::trace("ui: timers armed, starting backend");
 
         // 可脚本驱动的动作钩子（代理点不了界面，验证按钮链路只能靠它）：
-        //   LH_UI_ACTION=refresh_pages|diagnose|pause|resume|start|stop
+        //   LH_UI_ACTION=refresh_pages|diagnose|pause|resume|start|stop|speed
         // 启动 2.5s 后（等后端握手完）自动触发一次，并把结果写进 trace。
         if let Ok(action) = std::env::var("LH_UI_ACTION") {
             let action = action.trim().to_string();
@@ -270,19 +272,27 @@ impl App {
                 crate::trace::trace(&format!("ui: scripted action queued: {}", action));
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(2500));
-                    let shared_for_action = shared.clone();
-                    let result = backend::control(&shared_for_action, &action, None);
-                    {
-                        let mut st = shared.lock();
-                        match &result {
-                            Ok(msg) => st.push_log(&format!("[verify] {} → {}", action, msg)),
-                            Err(err) => st.push_log(&format!("[verify] {} 失败：{}", action, err)),
+                    // speed 不走 /api/control（它是本地设置），单独分派
+                    if action == "speed" {
+                        cycle_video_speed(shared.clone());
+                        std::thread::sleep(std::time::Duration::from_millis(1500));
+                        let speed = shared.lock().video_speed;
+                        crate::trace::trace(&format!("ui: scripted 'speed' -> video_speed={}", speed));
+                    } else {
+                        let shared_for_action = shared.clone();
+                        let result = backend::control(&shared_for_action, &action, None);
+                        {
+                            let mut st = shared.lock();
+                            match &result {
+                                Ok(msg) => st.push_log(&format!("[verify] {} → {}", action, msg)),
+                                Err(err) => st.push_log(&format!("[verify] {} 失败：{}", action, err)),
+                            }
                         }
+                        crate::trace::trace(&format!(
+                            "ui: scripted action '{}' -> {:?}",
+                            action, result
+                        ));
                     }
-                    crate::trace::trace(&format!(
-                        "ui: scripted action '{}' -> {:?}",
-                        action, result
-                    ));
                     // 让 UI 重绘，便于随后抓图核对
                     if hwnd_raw != 0 {
                         unsafe {
@@ -438,6 +448,7 @@ impl App {
             logs: state.logs.clone(),
             last_error: state.engine.last_error.clone(),
             maximized: unsafe { IsZoomed(self.hwnd) } != 0,
+            video_speed: if state.video_speed > 0.0 { state.video_speed } else { 2.0 },
         };        drop(state);
 
         // 背景
@@ -563,26 +574,61 @@ impl App {
         );
         x += 80;
 
-        // 页面列表（简单画成一条可点区域：点击 = 刷新后弹出选择？本轮先显示当前页）
-        let box_rc = RECT { left: x, top: rc.top + self.px(11), right: rc.right - self.px(190), bottom: rc.bottom - self.px(11) };
+        // 页面列表（当前页 + 全部标签页摘要）
+        let box_rc = RECT { left: x, top: rc.top + self.px(11), right: rc.right - self.px(300), bottom: rc.bottom - self.px(11) };
         gdi::fill_round_rect(hdc, box_rc, self.btn_radius(), colors.card_hi);
         let text_color = if st.pages_text.is_empty() || st.pages_text.starts_with('[') {
             colors.text_muted
         } else {
             colors.text_sub
         };
-        gdi::text_in(hdc, &st.pages_text, box_rc.inset(10, 0), TextAlign::Left, text_color, &self.fonts[self.font_ui]);
+        gdi::text_in(hdc, &st.pages_text, box_rc.inset(self.px(10), 0), TextAlign::Left, text_color, &self.fonts[self.font_ui]);
 
-        // 答题方式摘要（右侧）
+        // 倍速（可点：循环 1.0 / 1.5 / 2.0 / 3.0）；运行中不响应
+        let speed_rc = self.speed_rect(rc);
+        let speed_hover = self.hover == Some(Ctl::Speed);
+        let speed_fill = if speed_hover && !st.running {
+            colors.btn_hover
+        } else {
+            colors.card_hi
+        };
+        gdi::fill_round_rect(hdc, speed_rc, self.btn_radius(), speed_fill);
+        let speed_fg = if st.running { colors.text_muted } else { colors.accent };
+        gdi::text_in(
+            hdc,
+            &format!("倍速 {:.1}x", st.video_speed),
+            speed_rc,
+            TextAlign::Center,
+            speed_fg,
+            &self.fonts[self.font_ui_sm],
+        );
+
+        // 答题方式摘要（最右）
         let mode = if st.answer_mode.is_empty() { "内部答题 API" } else { &st.answer_mode };
         gdi::text_in(
             hdc,
             &format!("答题方式：{}", mode),
-            RECT { left: rc.right - self.px(190), top: rc.top, right: rc.right - m, bottom: rc.bottom },
+            RECT {
+                left: speed_rc.right + self.px(10),
+                top: rc.top,
+                right: rc.right - m,
+                bottom: rc.bottom,
+            },
             TextAlign::Right,
             colors.text_muted,
             &self.fonts[self.font_ui_sm],
         );
+    }
+
+    /// 倍速控件矩形（**绘制与命中共用**，避免两者算出的位置不一致）。
+    fn speed_rect(&self, card: RECT) -> RECT {
+        let right = card.right - self.px(300);
+        RECT {
+            left: right - self.px(110),
+            top: card.top + self.px(11),
+            right,
+            bottom: card.bottom - self.px(11),
+        }
     }
 
     fn paint_kpi_progress(&self, hdc: HDC, kpi: RECT, progress: RECT, colors: Colors, st: &PaintState) {
@@ -835,6 +881,7 @@ impl App {
                 logs: Vec::new(),
                 last_error: String::new(),
                 maximized: false,
+                video_speed: s.video_speed,
             }
         };
         let gap = self.px(10);
@@ -847,8 +894,11 @@ impl App {
             }
             bx += width + gap;
         }
-        // 网页选择行 = 点一下刷新（占位：本轮直接触发刷新）
+        // 网页选择行：先看倍速控件，其余区域 = 刷新
         if y >= layout.page.top && y < layout.page.bottom {
+            if self.speed_rect(layout.page).contains(x, y) {
+                return Some(Ctl::Speed);
+            }
             return Some(Ctl::Refresh);
         }
         None
@@ -1079,6 +1129,9 @@ impl App {
             Ctl::Refresh => {
                 spawn_action(shared, "refresh_pages", None);
             }
+            Ctl::Speed => {
+                cycle_video_speed(self.shared.clone());
+            }
             Ctl::Diagnose => {
                 spawn_action(shared, "diagnose", None);
             }
@@ -1245,10 +1298,48 @@ struct PaintState {
     logs: Vec<String>,
     last_error: String,
     maximized: bool,
+    /// 视频倍速（来自后端设置）
+    video_speed: f64,
 }
 
-fn spawn_action(shared: Arc<Shared>, action: &'static str, params: Option<Value>) {
+/// 倍速循环：1.0 → 1.5 → 2.0 → 3.0 → 1.0。
+///
+/// 拆成独立函数（而不是写在 `invoke` 里）是为了让 `LH_UI_ACTION=speed` 这条
+/// **脚本化验证路径**能复用同一份逻辑 —— 代理点不了界面，验证只能靠它。
+fn cycle_video_speed(shared: Arc<Shared>) {
+    if shared.lock().engine.running {
+        let mut st = shared.lock();
+        st.push_log("[native] 刷课运行中，暂不改倍速（停止后再调）");
+        drop(st);
+        shared.notify_ui();
+        return;
+    }
+    let current = shared.lock().video_speed;
+    const OPTIONS: [f64; 4] = [1.0, 1.5, 2.0, 3.0];
+    let next = OPTIONS
+        .iter()
+        .find(|v| **v > current + 1e-6)
+        .copied()
+        .unwrap_or(OPTIONS[0]);
     std::thread::spawn(move || {
+        // 后端是**合并式写入**：只覆盖 video_speed，不会动其它设置
+        let body = format!("{{\"video_speed\":{}}}", next);
+        match backend::update_settings(&shared, &body) {
+            Ok(msg) => {
+                let mut st = shared.lock();
+                st.video_speed = next;
+                st.push_log(&format!("[native] 倍速已设为 {:.1}x {}", next, msg));
+            }
+            Err(err) => {
+                let mut st = shared.lock();
+                st.push_log(&format!("[native] 倍速设置失败：{}", err));
+            }
+        }
+        shared.notify_ui();
+    });
+}
+
+fn spawn_action(shared: Arc<Shared>, action: &'static str, params: Option<Value>) {    std::thread::spawn(move || {
         let result = backend::control(&shared, action, params);
         let mut st = shared.lock();
         match result {

@@ -390,6 +390,14 @@ def test_logic():
 
 def main():
     seed_config()
+    # 输出固定 UTF-8：用例文案里有 ✓/⚠ 这类字符，本机默认控制台是 GBK，
+    # 直接 print 会 UnicodeEncodeError 让自测中途崩掉（实测踩过）。
+    # 这里自己兜住，避免依赖调用方是否设了 PYTHONIOENCODING。
+    try:
+        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+        sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+    except Exception:
+        pass
     try:
         test_process_lifecycle()
         test_engine_unit()
