@@ -12,6 +12,7 @@ winui/obj/
 # native Rust UI (default since 2.1.1) build outputs
 native/target/
 native/native-capture.png
+native/about-capture.png
 native/render-probe.bmp
 native/render-probe.png
 native/native-render.bmp

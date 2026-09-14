@@ -11,6 +11,7 @@
 //! 与后端的契约**完全复用 1.0.4 已验证的接口**（backend/learn_helper/ipc.py）：
 //! stdout 握手行 → `GET /api/status` → `POST /api/control` → 命名管道事件流。
 
+mod about;
 mod backend;
 mod dwm;
 mod gdi;

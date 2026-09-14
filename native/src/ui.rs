@@ -12,6 +12,32 @@ use crate::gdi::{self, Font, TextAlign};
 use crate::json::Value;
 use crate::native::*;
 
+/// 供弹窗（about.rs 等）复用的字体类型与索引。
+pub type FontOwned = Font;
+pub const DFONT_UI: usize = 0;
+pub const DFONT_UI_SM: usize = 1;
+pub const DFONT_UI_B: usize = 2;
+pub const DFONT_MONO: usize = 3;
+
+/// 弹窗用的一套字体（主窗口之外的第二套）。
+pub fn make_dialog_fonts() -> Vec<FontOwned> {
+    let specs = [
+        (13, FW_NORMAL, "Microsoft YaHei UI"),   // 0 ui
+        (12, FW_NORMAL, "Microsoft YaHei UI"),   // 1 ui sm
+        (13, FW_SEMIBOLD, "Microsoft YaHei UI"), // 2 ui b
+        (12, FW_NORMAL, "Consolas"),             // 3 mono
+    ];
+    let mut fonts = Vec::new();
+    for (pt, weight, face) in specs {
+        let mut f = Font::new(pt, weight, face);
+        if !f.is_valid() {
+            f = Font::new(pt, weight, "Segoe UI");
+        }
+        fonts.push(f);
+    }
+    fonts
+}
+
 const CLASS_NAME: &str = "LearnHelperNativeWnd";
 const TIMER_UI: usize = 1;
 const TIMER_POLL: usize = 2;
@@ -26,13 +52,15 @@ enum Ctl {
     Theme,
     /// 视频倍速切换（点击在 1.0 / 1.5 / 2.0 / 3.0 之间循环）
     Speed,
+    /// 「关于」弹窗
+    About,
     Min,
     Max,
     Close,
 }
 
 #[derive(Clone, Copy, PartialEq)]
-enum Theme {
+pub enum Theme {
     Dark,
     Light,
 }
@@ -52,29 +80,30 @@ enum Grab {
     BottomRight,
 }
 
+/// 配色令牌（弹窗 about.rs 复用同一套）。
 #[derive(Clone, Copy)]
-struct Colors {
-    bg: u32,
-    card: u32,
-    card_hi: u32,
-    divider: u32,
-    text_main: u32,
-    text_sub: u32,
-    text_muted: u32,
-    accent: u32,
-    accent_soft: u32,
-    success: u32,
-    warn: u32,
-    danger: u32,
-    danger_bg: u32,
-    btn_idle: u32,
-    btn_hover: u32,
-    caption_hover: u32,
-    caption_glyph: u32,
+pub struct Colors {
+    pub bg: u32,
+    pub card: u32,
+    pub card_hi: u32,
+    pub divider: u32,
+    pub text_main: u32,
+    pub text_sub: u32,
+    pub text_muted: u32,
+    pub accent: u32,
+    pub accent_soft: u32,
+    pub success: u32,
+    pub warn: u32,
+    pub danger: u32,
+    pub danger_bg: u32,
+    pub btn_idle: u32,
+    pub btn_hover: u32,
+    pub caption_hover: u32,
+    pub caption_glyph: u32,
 }
 
 impl Colors {
-    fn for_theme(theme: Theme) -> Colors {
+    pub fn for_theme(theme: Theme) -> Colors {
         match theme {
             Theme::Dark => Colors {
                 bg: rgb(0x10, 0x14, 0x18),
@@ -497,14 +526,14 @@ impl App {
         };
         gdi::text_in(hdc, &format!("学习助理 v{}", backend::APP_VERSION), title_rc, TextAlign::Left, colors.text_main, &self.fonts[self.font_ui_b]);
 
-        // 主题切换 + 窗口三键（右侧，系统键位习惯：最小化 - □ ×）
+        // 标题栏右侧：【关于】【主题切换】+ 窗口三键（系统键位习惯：最小化 - □ ×）
         let btn_w = self.px(48).max(40);
         let btn_h = th;
         let x_start = w - btn_w * 3;
         let glyph_theme = if self.theme == Theme::Dark { 0xE706 } else { 0xE708 };
-        let _ = glyph_theme;
 
         let controls = [
+            (Ctl::About, x_start - btn_w * 2, 0, btn_w, btn_h, 0xE946), // E946 = Info
             (Ctl::Theme, x_start - btn_w, 0, btn_w, btn_h, glyph_theme),
             (Ctl::Min, x_start, 0, btn_w, btn_h, 0xE921),
             (Ctl::Max, x_start + btn_w, 0, btn_w, btn_h, if maximized { 0xE923 } else { 0xE922 }),
@@ -870,9 +899,10 @@ impl App {
         let th = self.title_h();
         let btn_w = self.px(48).max(40);
         let x_start = self.w - btn_w * 3;
-        // 标题栏三键（含主题）
+        // 标题栏：关于 / 主题 / 三键（与绘制共用同一套位置）
         if y < th {
             let controls = [
+                (Ctl::About, x_start - btn_w * 2),
                 (Ctl::Theme, x_start - btn_w),
                 (Ctl::Min, x_start),
                 (Ctl::Max, x_start + btn_w),
@@ -1101,7 +1131,8 @@ impl App {
         if y < self.title_h() {
             let hit = self.hit_test(x, y);
             match hit {
-                Some(Ctl::Min) | Some(Ctl::Max) | Some(Ctl::Close) | Some(Ctl::Theme) => {
+                Some(Ctl::Min) | Some(Ctl::Max) | Some(Ctl::Close) | Some(Ctl::Theme)
+                | Some(Ctl::About) => {
                     self.pressed = hit;
                     unsafe { SetCapture(self.hwnd) };
                 }
@@ -1255,6 +1286,13 @@ impl App {
                     ));
                 }
                 self.shared.notify_ui();
+            }
+            Ctl::About => {
+                let mut st = self.shared.lock();
+                st.push_log("[native] 打开「关于」");
+                drop(st);
+                self.shared.notify_ui();
+                crate::about::show(hwnd, self.shared.clone(), self.theme);
             }
             Ctl::Start => {
                 spawn_action(shared, "start", None);

@@ -41,6 +41,7 @@ pub const WS_MAXIMIZEBOX: u32 = 0x0001_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 pub const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+pub const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
 
 pub const CW_USEDEFAULT: i32 = 0x8000_0000u32 as i32;
 
@@ -123,6 +124,7 @@ pub const SWP_NOACTIVATE: u32 = 0x0010;
 pub const GWL_STYLE: i32 = -16;
 pub const GWL_EXSTYLE: i32 = -20;
 pub const GWLP_USERDATA: i32 = -21;
+pub const GWLP_HWNDPARENT: i32 = -8;
 pub const GCLP_HBRBACKGROUND: i32 = -10;
 pub const MONITOR_DEFAULTTONEAREST: u32 = 2;
 
