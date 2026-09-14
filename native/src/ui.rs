@@ -236,22 +236,19 @@ impl App {
         self.init_fonts();
     }
 
-    /// 窗口建好之后：DWM 外观 + 定时器 + 拉起后端。
+    /// 窗口建好之后：套用最基础的窗口外观 + 定时器 + 拉起后端。
     pub fn bootstrap(hwnd: HWND, app: &mut App) {
-        let backdrop = crate::dwm::apply_glass(hwnd, app.theme == Theme::Dark);
+        // 纯色正常窗口：不做玻璃/背板（用户要求，见 dwm.rs 顶部说明）
+        crate::dwm::apply_plain(hwnd, app.theme == Theme::Dark);
         crate::trace::trace(&format!(
-            "ui: bootstrap backdrop={} composition={} dpi={}",
-            backdrop.label(),
-            crate::dwm::composition_enabled(),
+            "ui: bootstrap plain solid ui, dpi={}",
             app.dpi
         ));
         {
             let mut st = app.shared.lock();
             st.push_log(&format!(
-                "[native] 界面已启动（v{}）· 玻璃材质：{} · DWM 合成：{}",
-                backend::APP_VERSION,
-                backdrop.label(),
-                if crate::dwm::composition_enabled() { "开" } else { "关" }
+                "[native] 界面已启动（v{}）· 纯色界面",
+                backend::APP_VERSION
             ));
         }
         app.shared.notify_ui();
@@ -1058,13 +1055,13 @@ impl App {
             Ctl::Theme => {
                 self.theme = if self.theme == Theme::Dark { Theme::Light } else { Theme::Dark };
                 self.colors = Colors::for_theme(self.theme);
-                let backdrop = crate::dwm::apply_glass(hwnd, self.theme == Theme::Dark);
+                // 纯色界面：只同步系统标题栏的深浅，不涉及任何背板
+                crate::dwm::apply_plain(hwnd, self.theme == Theme::Dark);
                 {
                     let mut st = self.shared.lock();
                     st.push_log(&format!(
-                        "[外观] 已切换{}主题 · 玻璃材质 {}",
-                        if self.theme == Theme::Dark { "深色" } else { "浅色" },
-                        backdrop.label()
+                        "[外观] 已切换{}主题",
+                        if self.theme == Theme::Dark { "深色" } else { "浅色" }
                     ));
                 }
                 self.shared.notify_ui();
