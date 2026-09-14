@@ -83,23 +83,16 @@ pub fn apply_chrome(hwnd: HWND, dark: bool) {
         ) == 0
     };
 
-    // 让 DWM 画出与主题一致的 1px 边框（否则玻璃窗口边缘会有一条亮线）
-    let border = if dark { 0x0022_1C17u32 } else { 0x00EC_E6E1u32 };
-    let r_border = unsafe {
-        DwmSetWindowAttribute(
-            hwnd,
-            DWMWA_BORDER_COLOR,
-            &border as *const u32 as *const _,
-            4,
-        ) == 0
-    };
+    // ⚠️ 不再设 DWMWA_BORDER_COLOR：我们设的那条 1px 边框是**用户看得见的"多出来一层边框"**
+    // （用户实测反馈"为什么窗口上还有一个窗口边框"）。去掉后交给 DWM 默认处理。
+    let border_removed = true;
 
     crate::trace::trace(&format!(
-        "dwm: dark={} corner={} caption_color={} border={} build={}",
+        "dwm: dark={} corner={} caption_color={} border_removed={} build={}",
         r_dark,
         r_corner,
         r_caption,
-        r_border,
+        border_removed,
         crate::native::windows_build()
     ));
 
@@ -139,6 +132,20 @@ pub fn apply_glass(hwnd: HWND, dark: bool) -> Backdrop {
 
 pub fn apply_glass_with_backdrop(hwnd: HWND, dark: bool, allow_backdrop: bool) -> Backdrop {
     apply_chrome(hwnd, dark);
+
+    // ⚠️ 无边框窗口默认**没有投影**（少了那一圈系统阴影，边缘看着很"硬"，
+    // 用户会觉得"窗口外面还套着一个框"）。把整个客户区声明为"框架"即可让 DWM
+    // 重新为它合成圆角 + 投影；我们自己在客户区画满不透明内容，不会被看穿。
+    unsafe {
+        let margins = MARGINS {
+            cxLeftWidth: -1,
+            cxRightWidth: -1,
+            cyTopHeight: -1,
+            cyBottomHeight: -1,
+        };
+        let hr = DwmExtendFrameIntoClientArea(hwnd, &margins);
+        crate::trace::trace(&format!("dwm: extend frame into client (shadow) hr={}", hr));
+    }
 
     let build = native::windows_build();
     if !allow_backdrop || build < 22621 {

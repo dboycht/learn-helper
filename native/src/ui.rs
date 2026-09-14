@@ -193,18 +193,12 @@ impl App {
 
     fn init_fonts(&mut self) {
         self.fonts.clear();
-        // ⚠️ 字号要按 DPI 缩放：本机 144 DPI（150%），用固定 pt 会让 24pt 数字占满瓦片
-        // 并压住下面的标签（实测见 ERROR.md E30）。
-        let scale = if self.dpi >= 192 {
-            2
-        } else if self.dpi >= 144 {
-            3
-        } else if self.dpi >= 120 {
-            5
-        } else {
-            4
-        };
-        let scale = |pt: i32| (pt * scale) / 4;
+        // ⚠️ 字号必须**按 DPI 线性放大**：96 DPI = 1.0x 基准。
+        // 曾经的写法是 `pt * k / 4`，而 96 DPI 时 k=4 ⇒ 1.0x 看似对，
+        // 但 144 DPI 时 k=3 ⇒ **0.75x —— 字反而变小了**（用户实测反馈"文字太小"，
+        // 见 ERROR.md E34）。直径/高度类尺寸（瓦片、按钮）同样必须乘这个数。
+        let font_scale = (self.dpi as i32) * 100 / 96; // 96→100, 120→125, 144→150, 192→200
+        let scale = |pt: i32| (pt * font_scale + 50) / 100;
         let faces = [
             "Microsoft YaHei UI", // 0 ui
             "Microsoft YaHei UI", // 1 ui sm
@@ -212,7 +206,8 @@ impl App {
             "Microsoft YaHei UI", // 3 kpi
             "Consolas",           // 4 mono
         ];
-        let sizes = [scale(12), scale(11), scale(12), scale(21), scale(12)];
+        // 基准字号整体上调：Win32 的 pt 与浏览器/Web 的 px 观感不同，12pt 在这个窗口里偏小
+        let sizes = [scale(14), scale(13), scale(14), scale(26), scale(13)];
         let weights = [FW_NORMAL, FW_NORMAL, FW_SEMIBOLD, FW_BOLD, FW_NORMAL];
         for i in 0..faces.len() {
             let mut f = Font::new(sizes[i], weights[i], faces[i]);
@@ -311,34 +306,39 @@ impl App {
     }
 
     // ================================================================ 布局
+    /// 统一的 DPI 缩放：96 DPI = 1.0x。**所有长度（字号、圆角、行高、瓦片）都走它**，
+    /// 避免再出现"字号与高度用了不同缩放系数"的错位（ERROR.md E34）。
+    fn px(&self, logical: i32) -> i32 {
+        (logical * (self.dpi as i32) * 100 / 96 + 50) / 100
+    }
     fn m(&self) -> i32 {
-        (14 * self.dpi as i32 / 96).max(10)
+        self.px(18).max(12)
     }
     fn title_h(&self) -> i32 {
-        (46 * self.dpi as i32 / 96).max(52)
+        self.px(52).max(44)
     }
     fn card_radius(&self) -> i32 {
-        14
+        self.px(14).max(10)
     }
     fn btn_radius(&self) -> i32 {
-        8
+        self.px(8).max(6)
     }
     fn font_scale(&self) -> i32 {
-        (self.dpi as i32 / 96).max(1)
+        ((self.dpi as i32) * 100 / 96).max(100)
     }
 
     fn layout(&self) -> Layout {
         let m = self.m();
         let inner = RECT {
             left: m,
-            top: self.title_h(),
+            top: self.title_h() + self.px(2),
             right: self.w - m,
             bottom: self.h - m,
         };
-        let gap = m / 2;
+        let gap = self.px(10);
 
         // 状态卡
-        let status_h = (54 * self.font_scale()).max(44);
+        let status_h = self.px(60).max(48);
         let status = RECT {
             left: inner.left,
             top: inner.top,
@@ -347,7 +347,7 @@ impl App {
         };
 
         // 网页选择卡
-        let page_h = (54 * self.font_scale()).max(44);
+        let page_h = self.px(60).max(48);
         let page = RECT {
             left: inner.left,
             top: status.bottom + gap,
@@ -355,10 +355,8 @@ impl App {
             bottom: status.bottom + gap + page_h,
         };
 
-        // KPI + 进度：高度必须容得下【大数字 24pt + 标签 11pt】两行，
-        // 否则标签会压在数字上（144 DPI 实测踩到，见 ERROR.md E30）。
-        let scale = self.font_scale();
-        let kpi_h = (46 + 34 + 30) * scale;
+        // KPI + 进度：高度必须容得下【大数字 + 标签】两行，且随 DPI 一起放大
+        let kpi_h = self.px(170).max(120);
         let kpi = RECT {
             left: inner.left,
             top: page.bottom + gap,
@@ -373,7 +371,7 @@ impl App {
         };
 
         // 按钮行
-        let btn_h = (40 * self.font_scale()).max(34);
+        let btn_h = self.px(46).max(36);
         let buttons = RECT {
             left: inner.left,
             top: kpi.bottom + gap,
@@ -468,7 +466,7 @@ impl App {
         gdi::text_in(hdc, &format!("学习助理 v{}", backend::APP_VERSION), title_rc, TextAlign::Left, colors.text_main, &self.fonts[self.font_ui_b]);
 
         // 主题切换 + 窗口三键（右侧，系统键位习惯：最小化 - □ ×）
-        let btn_w = (46 * self.dpi as i32 / 96).max(40);
+        let btn_w = self.px(48).max(40);
         let btn_h = th;
         let x_start = w - btn_w * 3;
         let glyph_theme = if self.theme == Theme::Dark { 0xE706 } else { 0xE708 };
@@ -507,7 +505,7 @@ impl App {
     /// 画 Segoe MDL2 字形（标题栏三键/主题用）。
     fn draw_segmdl(&mut self, hdc: HDC, glyph: u32, rc: RECT, color: u32) {
         // 标题栏按钮高度约 46，glyph 用 10pt 左右
-        let size = (10 * self.dpi as i32 / 96).max(9);
+        let size = self.px(11).max(9);
         let face = "Segoe MDL2 Assets";
         let mut font = Font::new(size, FW_NORMAL, face);
         if !font.is_valid() {
@@ -525,7 +523,7 @@ impl App {
         let mut x = rc.left + m;
 
         // 胶囊：「后端」
-        let pill_rc = RECT { left: x, top: rc.top + 12, right: x + 46, bottom: rc.bottom - 12 };
+        let pill_rc = RECT { left: x, top: rc.top + self.px(13), right: x + self.px(56), bottom: rc.bottom - self.px(13) };
         gdi::pill(hdc, pill_rc, colors.accent_soft, "后端", colors.accent, &self.fonts[self.font_ui_b]);
         x = pill_rc.right + 12;
 
@@ -534,7 +532,7 @@ impl App {
         gdi::text_in(
             hdc,
             &status_text,
-            RECT { left: x, top: rc.top, right: rc.right - 240, bottom: rc.bottom },
+            RECT { left: x, top: rc.top, right: rc.right - self.px(300), bottom: rc.bottom },
             TextAlign::Left,
             colors.accent,
             &self.fonts[self.font_mono],
@@ -545,7 +543,7 @@ impl App {
             gdi::text_in(
                 hdc,
                 &format!("设备 {}", st.device),
-                RECT { left: rc.right - 240, top: rc.top, right: rc.right - m, bottom: rc.bottom },
+                RECT { left: rc.right - self.px(300), top: rc.top, right: rc.right - m, bottom: rc.bottom },
                 TextAlign::Right,
                 colors.text_muted,
                 &self.fonts[self.font_mono],
@@ -569,7 +567,7 @@ impl App {
         x += 80;
 
         // 页面列表（简单画成一条可点区域：点击 = 刷新后弹出选择？本轮先显示当前页）
-        let box_rc = RECT { left: x, top: rc.top + 10, right: rc.right - 150, bottom: rc.bottom - 10 };
+        let box_rc = RECT { left: x, top: rc.top + self.px(11), right: rc.right - self.px(190), bottom: rc.bottom - self.px(11) };
         gdi::fill_round_rect(hdc, box_rc, self.btn_radius(), colors.card_hi);
         let text_color = if st.pages_text.is_empty() || st.pages_text.starts_with('[') {
             colors.text_muted
@@ -583,7 +581,7 @@ impl App {
         gdi::text_in(
             hdc,
             &format!("答题方式：{}", mode),
-            RECT { left: rc.right - 150, top: rc.top, right: rc.right - m, bottom: rc.bottom },
+            RECT { left: rc.right - self.px(190), top: rc.top, right: rc.right - m, bottom: rc.bottom },
             TextAlign::Right,
             colors.text_muted,
             &self.fonts[self.font_ui_sm],
@@ -596,7 +594,7 @@ impl App {
         gdi::text_in(
             hdc,
             "当前页面任务感知",
-            RECT { left: kpi.left + 14, top: kpi.top + 10, right: kpi.right - 14, bottom: kpi.top + 32 },
+            RECT { left: kpi.left + self.px(16), top: kpi.top + self.px(10), right: kpi.right - self.px(16), bottom: kpi.top + self.px(42) },
             TextAlign::Left,
             colors.text_main,
             &self.fonts[self.font_ui_b],
@@ -606,25 +604,30 @@ impl App {
             (st.doc_count, "文档阅读", colors.success),
             (st.page_count, "处理页数", colors.warn),
         ];
-        let tile_w = (kpi.width() - 14 * 2 - 12 * 2) / 3;
+        // 瓦片区 = 标题下方到底部内边距之间（字号放大后必须显式算，不能只给"大概的"高度）
+        let pad = self.px(16);
+        let tile_top = kpi.top + self.px(48);
+        let tile_bottom = kpi.bottom - pad;
+        let tile_gap = self.px(12);
+        let tile_w = (kpi.width() - pad * 2 - tile_gap * 2) / 3;
         for (i, (count, label, color)) in tiles.iter().enumerate() {
-            let tx = kpi.left + 14 + i as i32 * (tile_w + 12);
-            let tile = RECT { left: tx, top: kpi.top + 38, right: tx + tile_w, bottom: kpi.bottom - 14 };
-            gdi::fill_round_rect(hdc, tile, 10, colors.card_hi);
+            let tx = kpi.left + pad + i as i32 * (tile_w + tile_gap);
+            let tile = RECT { left: tx, top: tile_top, right: tx + tile_w, bottom: tile_bottom };
+            gdi::fill_round_rect(hdc, tile, self.px(10), colors.card_hi);
             // 数字在上、标签在下，各自占固定带，绝不重叠（E30 的修法）
-            let label_h = (26 * self.font_scale()).max(20);
+            let label_h = self.px(28).max(20);
             let num_rc = RECT {
                 left: tile.left,
-                top: tile.top + 4,
+                top: tile.top + self.px(4),
                 right: tile.right,
-                bottom: tile.bottom - label_h - 2,
+                bottom: tile.bottom - label_h,
             };
             gdi::text_in(hdc, &count.to_string(), num_rc, TextAlign::Center, *color, &self.fonts[self.font_kpi]);
             let label_rc = RECT {
                 left: tile.left,
-                top: tile.bottom - label_h - 4,
+                top: tile.bottom - label_h - self.px(4),
                 right: tile.right,
-                bottom: tile.bottom - 4,
+                bottom: tile.bottom - self.px(4),
             };
             gdi::text_in(hdc, label, label_rc, TextAlign::Center, colors.text_muted, &self.fonts[self.font_ui_sm]);
         }
@@ -644,9 +647,9 @@ impl App {
         let row_h = progress.height() / 3;
         for (i, (text, color, bold)) in rows.iter().enumerate() {
             let rc = RECT {
-                left: progress.left + 16,
+                left: progress.left + self.px(18),
                 top: progress.top + i as i32 * row_h,
-                right: progress.right - 16,
+                right: progress.right - self.px(18),
                 bottom: progress.top + (i + 1) as i32 * row_h,
             };
             let font_idx = if *bold { self.font_ui_b } else { self.font_ui };
@@ -654,41 +657,73 @@ impl App {
         }
     }
 
-    fn paint_buttons(&mut self, hdc: HDC, rc: RECT, colors: Colors, st: &PaintState) {
-        let gap = 10;
-        let btn_h = rc.height();
-        let defs: Vec<(Ctl, &str, usize, u32)> = vec![
-            (Ctl::Start, if st.running { "正在运行…" } else { "启动刷课" }, 150, colors.accent),
-            (Ctl::Pause, if st.paused { "继续执行" } else { "暂停进程" }, 110, colors.btn_idle),
-            (Ctl::Refresh, "检测/刷新网页", 130, colors.btn_idle),
-            (Ctl::Diagnose, "诊断页面", 96, colors.btn_idle),
-            (Ctl::Stop, "终止并退出", 110, colors.danger_bg),
+    /// 按钮定义（**绘制与命中测试共用同一份**，避免两者算出的宽度不一致）。
+    /// 宽度按**实测文本宽度**算，字号放大后不会溢出按钮行（ERROR.md E34）。
+    fn button_specs(&self, st: &PaintState) -> Vec<(Ctl, &'static str, i32)> {
+        let labels: Vec<(Ctl, &'static str)> = vec![
+            (Ctl::Start, if st.running { "正在运行…" } else { "启动刷课" }),
+            (Ctl::Pause, if st.paused { "继续执行" } else { "暂停进程" }),
+            (Ctl::Refresh, "检测/刷新网页"),
+            (Ctl::Diagnose, "诊断页面"),
+            (Ctl::Stop, "终止并退出"),
         ];
-        // 先算总宽，再居中
-        let total: i32 = defs.iter().map(|d| d.2 as i32).sum::<i32>() + gap * (defs.len() as i32 - 1);
+        let hdc = unsafe { GetDC(self.hwnd) };
+        let mut specs = Vec::new();
+        for (ctl, label) in labels {
+            let measured = if hdc.is_null() {
+                0
+            } else {
+                gdi::measure_text(hdc, label, &self.fonts[self.font_ui_b]).cx
+            };
+            if !hdc.is_null() {
+                unsafe { ReleaseDC(self.hwnd, hdc) };
+            }
+            let pad = self.px(34);
+            let min_w = match ctl {
+                Ctl::Start => self.px(120),
+                Ctl::Stop => self.px(108),
+                _ => self.px(92),
+            };
+            let extra = if ctl == Ctl::Start { self.px(14) } else { 0 };
+            specs.push((ctl, label, (measured + pad + extra).max(min_w)));
+        }
+        specs
+    }
+
+    /// 按钮行总宽（用于居中）。
+    fn buttons_total_width(&self, specs: &[(Ctl, &'static str, i32)]) -> i32 {
+        let gap = self.px(10);
+        specs.iter().map(|s| s.2).sum::<i32>() + gap * (specs.len() as i32 - 1)
+    }
+
+    fn paint_buttons(&mut self, hdc: HDC, rc: RECT, colors: Colors, st: &PaintState) {
+        let gap = self.px(10);
+        let specs = self.button_specs(st);
+        let total = self.buttons_total_width(&specs);
         let mut x = rc.left + (rc.width() - total) / 2;
-        for (ctl, label, width, base_color) in defs {
-            let btn = RECT { left: x, top: rc.top, right: x + width as i32, bottom: rc.bottom };
+        for (ctl, label, width) in specs {
+            let btn = RECT { left: x, top: rc.top, right: x + width, bottom: rc.bottom };
             let hover = self.hover == Some(ctl);
-            let pressed = self.pressed == Some(ctl);
-            let mut fill = base_color;
+            let mut fill = colors.btn_idle;
             let mut fg = colors.text_main;
             if ctl == Ctl::Start {
-                fill = if st.running { colors.card_hi } else if hover { rgb(0x2E, 0x8F, 0xC5) } else { colors.accent };
+                fill = if st.running {
+                    colors.card_hi
+                } else if hover {
+                    rgb(0x2E, 0x8F, 0xC5)
+                } else {
+                    colors.accent
+                };
                 fg = if st.running { colors.text_muted } else { rgb(0x0A, 0x16, 0x1F) };
             } else if ctl == Ctl::Stop {
                 fill = if hover { rgb(0x7A, 0x3A, 0x3A) } else { colors.danger_bg };
                 fg = colors.danger;
-            } else {
-                fill = if hover { colors.btn_hover } else { colors.btn_idle };
-            }
-            if pressed {
-                // 视觉下压
-                let _ = fill;
+            } else if hover {
+                fill = colors.btn_hover;
             }
             gdi::fill_round_rect(hdc, btn, self.btn_radius(), fill);
             gdi::text_in(hdc, label, btn, TextAlign::Center, fg, &self.fonts[self.font_ui_b]);
-            x += width as i32 + gap;
+            x += width + gap;
         }
     }
 
@@ -697,18 +732,18 @@ impl App {
         gdi::text_in(
             hdc,
             "运行日志",
-            RECT { left: rc.left + 14, top: rc.top + 10, right: rc.right - 14, bottom: rc.top + 30 },
+            RECT { left: rc.left + self.px(16), top: rc.top + self.px(10), right: rc.right - self.px(16), bottom: rc.top + self.px(38) },
             TextAlign::Left,
             colors.text_main,
             &self.fonts[self.font_ui_b],
         );
 
         // 日志区（裁剪圆角）
-        let log_rc = RECT { left: rc.left + 12, top: rc.top + 36, right: rc.right - 12, bottom: rc.bottom - 10 };
+        let log_rc = RECT { left: rc.left + self.px(14), top: rc.top + self.px(46), right: rc.right - self.px(14), bottom: rc.bottom - self.px(12) };
         gdi::fill_round_rect(hdc, log_rc, 6, colors.card_hi);
         gdi::clip_round_rect(hdc, log_rc, 6);
 
-        let line_h = (18 * self.dpi as i32 / 96).max(16);
+        let line_h = self.px(22).max(16);
         let visible = (log_rc.height() / line_h).max(1) as usize;
         let total = st.logs.len();
         self.log_rows = total;
@@ -766,7 +801,7 @@ impl App {
     fn hit_test(&self, x: i32, y: i32) -> Option<Ctl> {
         let layout = self.layout();
         let th = self.title_h();
-        let btn_w = (46 * self.dpi as i32 / 96).max(40);
+        let btn_w = self.px(48).max(40);
         let x_start = self.w - btn_w * 3;
         // 标题栏三键（含主题）
         if y < th {
@@ -783,22 +818,37 @@ impl App {
             }
             return None; // 标题栏其余区域 = 拖拽区
         }
-        // 按钮行
-        let gap = 10;
-        let defs: Vec<(Ctl, usize)> = vec![
-            (Ctl::Start, 150),
-            (Ctl::Pause, 110),
-            (Ctl::Refresh, 130),
-            (Ctl::Diagnose, 96),
-            (Ctl::Stop, 110),
-        ];
-        let total: i32 = defs.iter().map(|d| d.1 as i32).sum::<i32>() + gap * (defs.len() as i32 - 1);
+        // 按钮行（与绘制共用 button_specs，宽度必然一致）
+        let st = {
+            let s = self.shared.lock();
+            PaintState {
+                status_text: String::new(),
+                device: String::new(),
+                pages_text: String::new(),
+                running: s.engine.running,
+                paused: s.engine.paused,
+                page_count: 0,
+                video_count: 0,
+                doc_count: 0,
+                task_text: String::new(),
+                video_text: String::new(),
+                quiz_text: String::new(),
+                answer_mode: String::new(),
+                server_url: String::new(),
+                logs: Vec::new(),
+                last_error: String::new(),
+                maximized: false,
+            }
+        };
+        let gap = self.px(10);
+        let specs = self.button_specs(&st);
+        let total = self.buttons_total_width(&specs);
         let mut bx = layout.buttons.left + (layout.buttons.width() - total) / 2;
-        for (ctl, width) in defs {
-            if x >= bx && x < bx + width as i32 && y >= layout.buttons.top && y < layout.buttons.bottom {
+        for (ctl, _label, width) in specs {
+            if x >= bx && x < bx + width && y >= layout.buttons.top && y < layout.buttons.bottom {
                 return Some(ctl);
             }
-            bx += width as i32 + gap;
+            bx += width + gap;
         }
         // 网页选择行 = 点一下刷新（占位：本轮直接触发刷新）
         if y >= layout.page.top && y < layout.page.bottom {
