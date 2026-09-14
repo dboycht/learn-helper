@@ -614,21 +614,31 @@ impl App {
 
     fn paint_page_card(&self, hdc: HDC, rc: RECT, colors: Colors, st: &PaintState) {
         gdi::fill_round_rect(hdc, rc, self.card_radius(), colors.card);
-        let m = 14;
-        let mut x = rc.left + m;
+        let m = self.px(16);
 
+        // 从左到右：标签 → 网页框 → 「检测/刷新网页」按钮 → 倍速 → 答题方式
+        // ⚠️ 这里所有横坐标都**按同一套宽度常量推导**，并且绘制与命中共用
+        // `page_box_rect()` / `refresh_rect()` / `speed_rect()` 三个函数。
+        // 之前是各处手写偏移，结果倍速胶囊压在网页框上、而"检测/刷新网页"根本没有按钮
+        // （用户实测反馈被遮挡，见 ERROR.md E40）。
+        let mut x = rc.left + m;
         gdi::text_in(
             hdc,
             "当前网页",
-            RECT { left: x, top: rc.top, right: x + 70, bottom: rc.bottom },
+            RECT { left: x, top: rc.top, right: x + self.px(70), bottom: rc.bottom },
             TextAlign::Left,
             colors.text_main,
             &self.fonts[self.font_ui_b],
         );
-        x += 80;
+        x += self.px(80);
 
-        // 页面列表（当前页 + 全部标签页摘要）
-        let box_rc = RECT { left: x, top: rc.top + self.px(11), right: rc.right - self.px(300), bottom: rc.bottom - self.px(11) };
+        // 网页框（宽度 = 到"刷新按钮"为止）
+        let box_rc = RECT {
+            left: x,
+            top: rc.top + self.px(11),
+            right: self.refresh_rect(rc).left - self.px(10),
+            bottom: rc.bottom - self.px(11),
+        };
         gdi::fill_round_rect(hdc, box_rc, self.btn_radius(), colors.card_hi);
         let text_color = if st.pages_text.is_empty() || st.pages_text.starts_with('[') {
             colors.text_muted
@@ -636,6 +646,20 @@ impl App {
             colors.text_sub
         };
         gdi::text_in(hdc, &st.pages_text, box_rc.inset(self.px(10), 0), TextAlign::Left, text_color, &self.fonts[self.font_ui]);
+
+        // 「检测/刷新网页」按钮（独立控件，不再是"整行可点"）
+        let btn = self.refresh_rect(rc);
+        let btn_hover = self.hover == Some(Ctl::Refresh);
+        let btn_fill = if btn_hover { colors.accent } else { colors.card_hi };
+        gdi::fill_round_rect(hdc, btn, self.btn_radius(), btn_fill);
+        gdi::text_in(
+            hdc,
+            "检测/刷新网页",
+            btn,
+            TextAlign::Center,
+            if btn_hover { colors.bg } else { colors.accent },
+            &self.fonts[self.font_ui_sm],
+        );
 
         // 倍速（可点：循环 1.0 / 1.5 / 2.0 / 3.0）；运行中不响应
         let speed_rc = self.speed_rect(rc);
@@ -673,6 +697,23 @@ impl App {
         );
     }
 
+    /// 网页框右边界（= 刷新按钮左边留 10px 间距）。绘制与命中共用。
+    fn page_box_right(&self, card: RECT) -> i32 {
+        self.refresh_rect(card).left - self.px(10)
+    }
+
+    /// 「检测/刷新网页」按钮矩形（绘制与命中共用）。
+    fn refresh_rect(&self, card: RECT) -> RECT {
+        let w = self.px(150);
+        let right = card.right - self.px(16) - self.px(300);
+        RECT {
+            left: right - w,
+            top: card.top + self.px(11),
+            right,
+            bottom: card.bottom - self.px(11),
+        }
+    }
+
     /// 倍速控件矩形（**绘制与命中共用**，避免两者算出的位置不一致）。
     fn speed_rect(&self, card: RECT) -> RECT {
         let right = card.right - self.px(300);
@@ -683,7 +724,6 @@ impl App {
             bottom: card.bottom - self.px(11),
         }
     }
-
     fn paint_kpi_progress(&self, hdc: HDC, kpi: RECT, progress: RECT, colors: Colors, st: &PaintState) {
         // KPI 卡
         gdi::fill_round_rect(hdc, kpi, self.card_radius(), colors.card);
@@ -948,12 +988,18 @@ impl App {
             }
             bx += width + gap;
         }
-        // 网页选择行：先看倍速控件，其余区域 = 刷新
+        // 网页选择行：只有「检测/刷新网页」按钮与「倍速」各自的可点区域响应，
+        // 标签与网页框本身不做事。
+        // ⚠️ 之前是"整行都返回 Refresh"，点标签/点网页框都会触发刷新，很费解；
+        // 而且那时"检测/刷新网页"根本没有可见按钮（用户反馈被遮挡，见 ERROR.md E40）。
         if y >= layout.page.top && y < layout.page.bottom {
             if self.speed_rect(layout.page).contains(x, y) {
                 return Some(Ctl::Speed);
             }
-            return Some(Ctl::Refresh);
+            if self.refresh_rect(layout.page).contains(x, y) {
+                return Some(Ctl::Refresh);
+            }
+            return None;
         }
         None
     }
