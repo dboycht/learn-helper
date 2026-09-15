@@ -334,3 +334,7 @@ pub fn obj(pairs: &[(&str, Value)]) -> Value {
 pub fn s(text: &str) -> Value {
     Value::Str(text.to_string())
 }
+
+pub fn json_num(n: f64) -> Value {
+    Value::Num(n)
+}

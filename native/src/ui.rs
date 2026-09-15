@@ -3,9 +3,7 @@
 //! 布局：自绘标题栏（含拖拽/三键）→ 状态卡 → 网页选择 → KPI/进度 → 按钮 → 日志。
 //! 全部纯 GDI 绘制；颜色方案与 WinUI 版同一套令牌（深色为主，可切浅色）。
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
 
 use crate::backend::{self, Shared};
 use crate::gdi::{self, Font, TextAlign};
@@ -52,6 +50,8 @@ enum Ctl {
     Theme,
     /// 视频倍速切换（点击在 1.0 / 1.5 / 2.0 / 3.0 之间循环）
     Speed,
+    /// 「答题设置」对话框
+    Settings,
     /// 「关于」弹窗
     About,
     Min,
@@ -186,6 +186,8 @@ pub struct App {
     grab_window: RECT,       // 按下时的窗口矩形
     last_click_ms: u64,      // 双击最大化用
     last_click_pt: POINT,
+    /// `LH_UI_ACTION` 的值（仅验证用；settings* 类动作需要 UI 线程建对话框）
+    scripted_action: String,
 }
 
 impl App {
@@ -222,6 +224,7 @@ impl App {
             grab_window: RECT::default(),
             last_click_ms: 0,
             last_click_pt: POINT { x: 0, y: 0 },
+            scripted_action: std::env::var("LH_UI_ACTION").unwrap_or_default().trim().to_string(),
         };
         app.init_fonts();
         app
@@ -315,7 +318,8 @@ impl App {
         }
 
         // 可脚本驱动的动作钩子（代理点不了界面，验证按钮链路只能靠它）：
-        //   LH_UI_ACTION=refresh_pages|diagnose|pause|resume|start|stop|speed
+        //   LH_UI_ACTION=refresh_pages|diagnose|pause|resume|start|stop|speed|settings|
+        //                settings_save|settings_cancel
         // 启动 2.5s 后（等后端握手完）自动触发一次，并把结果写进 trace。
         if let Ok(action) = std::env::var("LH_UI_ACTION") {
             let action = action.trim().to_string();
@@ -323,42 +327,63 @@ impl App {
                 let shared = app.shared.clone();
                 let hwnd_raw = hwnd as isize;
                 crate::trace::trace(&format!("ui: scripted action queued: {}", action));
-                std::thread::spawn(move || {
-                    std::thread::sleep(std::time::Duration::from_millis(2500));
-                    // speed 不走 /api/control（它是本地设置），单独分派
-                    if action == "speed" {
-                        cycle_video_speed(shared.clone());
-                        std::thread::sleep(std::time::Duration::from_millis(1500));
-                        let speed = shared.lock().video_speed;
-                        crate::trace::trace(&format!("ui: scripted 'speed' -> video_speed={}", speed));
-                    } else {
-                        let shared_for_action = shared.clone();
-                        let result = backend::control(&shared_for_action, &action, None);
-                        {
-                            let mut st = shared.lock();
-                            match &result {
-                                Ok(msg) => st.push_log(&format!("[verify] {} → {}", action, msg)),
-                                Err(err) => st.push_log(&format!("[verify] {} 失败：{}", action, err)),
+                // 「答题设置」类动作必须由 UI 线程建窗口：把请求 PostMessage 回主窗口
+                if action.starts_with("settings") {
+                    let action_ui = action.clone();
+                    std::thread::spawn(move || {
+                        // 保存/取消要先把后端跑起来（否则 connected=false 直接拒绝保存）
+                        std::thread::sleep(std::time::Duration::from_millis(3500));
+                        crate::trace::trace(&format!("ui: scripted action '{}' -> UI thread", action_ui));
+                        if hwnd_raw != 0 {
+                            unsafe { PostMessageW(hwnd_raw as HWND, WM_APP_ACTION, 0, 0) };
+                        }
+                    });
+                } else {
+                    let action_bg = action.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_millis(2500));
+                        // speed 不走 /api/control（它是本地设置），单独分派
+                        if action_bg == "speed" {
+                            cycle_video_speed(shared.clone());
+                            std::thread::sleep(std::time::Duration::from_millis(1500));
+                            let speed = shared.lock().video_speed;
+                            crate::trace::trace(&format!(
+                                "ui: scripted 'speed' -> video_speed={}",
+                                speed
+                            ));
+                        } else {
+                            let shared_for_action = shared.clone();
+                            let result = backend::control(&shared_for_action, &action_bg, None);
+                            {
+                                let mut st = shared.lock();
+                                match &result {
+                                    Ok(msg) => st.push_log(&format!(
+                                        "[verify] {} → {}",
+                                        action_bg, msg
+                                    )),
+                                    Err(err) => st.push_log(&format!(
+                                        "[verify] {} 失败：{}",
+                                        action_bg, err
+                                    )),
+                                }
                             }
+                            crate::trace::trace(&format!(
+                                "ui: scripted action '{}' -> {:?}",
+                                action_bg, result
+                            ));
                         }
+                        // 让 UI 重绘，便于随后抓图核对
+                        if hwnd_raw != 0 {
+                            unsafe { PostMessageW(hwnd_raw as HWND, WM_APP_BACKEND, 0, 0) };
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(1200));
                         crate::trace::trace(&format!(
-                            "ui: scripted action '{}' -> {:?}",
-                            action, result
+                            "ui: state after '{}': {:?}",
+                            action_bg,
+                            crate::backend::describe_state(&shared.lock())
                         ));
-                    }
-                    // 让 UI 重绘，便于随后抓图核对
-                    if hwnd_raw != 0 {
-                        unsafe {
-                            PostMessageW(hwnd_raw as HWND, WM_APP_BACKEND, 0, 0);
-                        }
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(1200));
-                    crate::trace::trace(&format!(
-                        "ui: state after '{}': {:?}",
-                        action,
-                        crate::backend::describe_state(&shared.lock())
-                    ));
-                });
+                    });
+                }
             }
         }
 
@@ -526,14 +551,16 @@ impl App {
         };
         gdi::text_in(hdc, &format!("学习助理 v{}", backend::APP_VERSION), title_rc, TextAlign::Left, colors.text_main, &self.fonts[self.font_ui_b]);
 
-        // 标题栏右侧：【关于】【主题切换】+ 窗口三键（系统键位习惯：最小化 - □ ×）
+        // 标题栏右侧：【关于】【答题设置】【主题切换】+ 窗口三键
+        // （系统键位习惯：最小化 - □ ×；⚠️ 控件一律靠左数，右边被系统三键占着，E-33 记过）
         let btn_w = self.px(48).max(40);
         let btn_h = th;
         let x_start = w - btn_w * 3;
         let glyph_theme = if self.theme == Theme::Dark { 0xE706 } else { 0xE708 };
 
         let controls = [
-            (Ctl::About, x_start - btn_w * 2, 0, btn_w, btn_h, 0xE946), // E946 = Info
+            (Ctl::About, x_start - btn_w * 3, 0, btn_w, btn_h, 0xE946), // E946 = Info
+            (Ctl::Settings, x_start - btn_w * 2, 0, btn_w, btn_h, 0xE713), // E713 = Settings
             (Ctl::Theme, x_start - btn_w, 0, btn_w, btn_h, glyph_theme),
             (Ctl::Min, x_start, 0, btn_w, btn_h, 0xE921),
             (Ctl::Max, x_start + btn_w, 0, btn_w, btn_h, if maximized { 0xE923 } else { 0xE922 }),
@@ -1029,7 +1056,8 @@ impl App {
         // 标题栏：关于 / 主题 / 三键（与绘制共用同一套位置）
         if y < th {
             let controls = [
-                (Ctl::About, x_start - btn_w * 2),
+                (Ctl::About, x_start - btn_w * 3),
+                (Ctl::Settings, x_start - btn_w * 2),
                 (Ctl::Theme, x_start - btn_w),
                 (Ctl::Min, x_start),
                 (Ctl::Max, x_start + btn_w),
@@ -1265,7 +1293,14 @@ impl App {
         if y < self.title_h() {
             let hit = self.hit_test(x, y);
             match hit {
-                Some(Ctl::Min) | Some(Ctl::Max) | Some(Ctl::Close) | Some(Ctl::Theme)
+                // ⚠️ 这份白名单必须把**所有标题栏按钮**列全：漏一个（这里是新加的
+                // Ctl::Settings）就会落进 `_` 分支被当成"标题栏空白 ⇒ 拖窗口"——
+                // 表现正是"按钮画得出来、点下去毫无反应"（实测踩到，见 ERROR.md E42）。
+                Some(Ctl::Min)
+                | Some(Ctl::Max)
+                | Some(Ctl::Close)
+                | Some(Ctl::Theme)
+                | Some(Ctl::Settings)
                 | Some(Ctl::About) => {
                     self.pressed = hit;
                     unsafe { SetCapture(self.hwnd) };
@@ -1428,6 +1463,13 @@ impl App {
                 self.shared.notify_ui();
                 crate::about::show(hwnd, self.shared.clone(), self.theme);
             }
+            Ctl::Settings => {
+                let mut st = self.shared.lock();
+                st.push_log("[native] 打开「答题设置」");
+                drop(st);
+                self.shared.notify_ui();
+                crate::settings::show(hwnd, self.shared.clone(), self.theme);
+            }
             Ctl::Start => {
                 spawn_action(shared, "start", None);
             }
@@ -1547,6 +1589,15 @@ impl App {
             }
             WM_APP_BACKEND => {
                 unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+                0
+            }
+            WM_APP_ACTION => {
+                // 脚本化打开「答题设置」（验证通道；必须由 UI 线程建窗口）
+                let action = self.scripted_action.clone();
+                let hook = if action.is_empty() { "settings".to_string() } else { action };
+                let theme = self.theme;
+                crate::trace::trace(&format!("ui: opening settings dialog via hook '{}'", hook));
+                crate::settings::show_with_hook(self.hwnd, self.shared.clone(), theme, &hook);
                 0
             }
             WM_CLOSE => {

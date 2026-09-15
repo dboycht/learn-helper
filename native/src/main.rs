@@ -17,6 +17,7 @@ mod dwm;
 mod gdi;
 mod json;
 mod native;
+mod settings;
 mod trace;
 mod ui;
 mod winhttp;
@@ -83,10 +84,32 @@ fn main() {
         trace::trace("native: 窗口已创建");
         ui::App::bootstrap(hwnd, &mut *app_ptr);
 
+        // 对话框渲染探针：不建窗口、不碰屏幕，直接把「答题设置」画进 BMP。
+        // 用法：learn-helper-native.exe --render-probe-settings [宽 高 输出路径]
+        if std::env::args().any(|a| a == "--render-probe-settings") {
+            let args: Vec<String> = std::env::args().collect();
+            let pos = |n: usize, def: i32| {
+                args.iter()
+                    .position(|a| a == "--render-probe-settings")
+                    .and_then(|i| args.get(i + n))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(def)
+            };
+            let w = pos(1, 820);
+            let h = pos(2, 700);
+            let out = args
+                .iter()
+                .position(|a| a == "--render-probe-settings")
+                .and_then(|i| args.get(i + 3))
+                .cloned()
+                .unwrap_or_else(|| "settings-render.bmp".to_string());
+            settings::render_probe(&out, w, h);
+            std::process::exit(0);
+        }
+
         // 渲染探针：把客户区画进内存 DC 并落盘为 BMP（不依赖 PrintWindow / 不碰屏幕）。
         // 用法：learn-helper-native.exe --render-probe [宽 高 输出路径]
-        if std::env::args().any(|a| a == "--render-probe") {
-            let args: Vec<String> = std::env::args().collect();
+        if std::env::args().any(|a| a == "--render-probe") {            let args: Vec<String> = std::env::args().collect();
             let w: i32 = args
                 .iter()
                 .position(|a| a == "--render-probe")

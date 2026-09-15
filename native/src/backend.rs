@@ -7,7 +7,7 @@
 //!
 //! 所有网络与子进程操作都在**后台线程**里，UI 线程只读共享状态。
 
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader};
 use std::os::windows::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
@@ -67,6 +67,15 @@ pub struct CoreState {
     pub log_seq: i64,
     pub answer_mode: String,
     pub server_url: String,
+    /// 答题设置快照（来自 /api/settings 的 answer 段；对话框回填用）
+    pub answer_mode_key: String,
+    pub answer_workers: i64,
+    pub answer_timeout: i64,
+    pub answer_retry: i64,
+    /// LLM 设置快照（base_url / model / 是否已存 key —— 后端不回传 key 明文）
+    pub llm_base: String,
+    pub llm_model: String,
+    pub llm_has_key: bool,
     /// 视频倍速（来自后端 settings.run.video_speed）
     pub video_speed: f64,
     /// 提交模式：true=自动提交 / false=仅暂存
@@ -548,15 +557,41 @@ pub fn refresh_settings(shared: Arc<Shared>) {
                     .get("answer")
                     .map(|a| a.str_at("mode_label"))
                     .unwrap_or_default();
+                let mode_key = data.get("answer").map(|a| a.str_at("mode")).unwrap_or_default();
                 let server_url = data.str_at("server_url");
                 let device = data.str_at("device_id");
                 let run = data.get("run");
                 let speed = run.map(|r| r.num_at("video_speed")).unwrap_or(0.0);
                 let auto_submit = run.map(|r| r.bool_at("auto_submit")).unwrap_or(true);
+                let llm = data.get("llm");
+                let llm_base = llm.map(|l| l.str_at("base_url")).unwrap_or_default();
+                let llm_model = llm.map(|l| l.str_at("model")).unwrap_or_default();
+                let llm_has_key = llm.map(|l| l.bool_at("has_api_key")).unwrap_or(false);
+                let answer = data.get("answer");
+                let workers = answer.map(|a| a.int_at("workers")).unwrap_or(0);
+                let timeout = answer.map(|a| a.int_at("solver_timeout")).unwrap_or(0);
+                let retry = answer.map(|a| a.int_at("retry")).unwrap_or(0);
                 let mut st = shared.lock();
                 if !mode_label.is_empty() {
                     st.answer_mode = mode_label;
                 }
+                if !mode_key.is_empty() {
+                    st.answer_mode_key = mode_key;
+                }
+                if workers > 0 {
+                    st.answer_workers = workers;
+                }
+                if timeout > 0 {
+                    st.answer_timeout = timeout;
+                }
+                st.answer_retry = retry;
+                if !llm_base.is_empty() {
+                    st.llm_base = llm_base;
+                }
+                if !llm_model.is_empty() {
+                    st.llm_model = llm_model;
+                }
+                st.llm_has_key = llm_has_key;
                 if !server_url.is_empty() {
                     st.server_url = server_url;
                 }

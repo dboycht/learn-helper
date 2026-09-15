@@ -57,6 +57,13 @@ pub const WM_MOUSEMOVE: u32 = 0x0200;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
 pub const WM_LBUTTONUP: u32 = 0x0202;
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
+pub const WM_KEYDOWN: u32 = 0x0100;
+pub const WM_KEYUP: u32 = 0x0101;
+pub const WM_CHAR: u32 = 0x0102;
+pub const WM_SETFOCUS: u32 = 0x0007;
+pub const WM_KILLFOCUS: u32 = 0x0008;
+pub const WM_SETCURSOR: u32 = 0x0020;
+pub const WM_NCDESTROY: u32 = 0x0082;
 pub const WM_TIMER: u32 = 0x0113;
 pub const WM_NCHITTEST: u32 = 0x0084;
 pub const WM_NCCALCSIZE: u32 = 0x0083;
@@ -70,6 +77,8 @@ pub const WM_SYSCOMMAND: u32 = 0x0112;
 pub const WM_APP: u32 = 0x8000;
 /// 后端线程通知 UI 重绘的自定义消息。
 pub const WM_APP_BACKEND: u32 = WM_APP + 1;
+/// 脚本化动作钩子（`LH_UI_ACTION=settings*`）：请求由 **UI 线程**打开「答题设置」。
+pub const WM_APP_ACTION: u32 = WM_APP + 5;
 
 pub const HTCLIENT: LRESULT = 1;
 pub const HTCAPTION: LRESULT = 2;
@@ -139,6 +148,36 @@ pub struct MONITORINFO {
 pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
 pub const IDC_ARROW: usize = 32512;
 pub const IDC_SIZENS: usize = 32645;
+pub const IDC_IBEAM: usize = 32513;
+
+// 焦点 / 输入光标 / 按钮行高（自绘对话框用）
+pub const SPI_GETKEYBOARDDELAY: u32 = 0x0016;
+pub const SM_CYBORDER: i32 = 6;
+pub const EM_SETMARGINS: u32 = 0x00D3;
+pub const EC_LEFTMARGIN: u32 = 0x0001;
+pub const EC_RIGHTMARGIN: u32 = 0x0002;
+
+// ---------------------------------------------------------------- 虚拟键
+pub const VK_BACK: usize = 0x08;
+pub const VK_TAB: usize = 0x09;
+pub const VK_RETURN: usize = 0x0D;
+pub const VK_ESCAPE: usize = 0x1B;
+pub const VK_END: usize = 0x23;
+pub const VK_HOME: usize = 0x24;
+pub const VK_LEFT: usize = 0x25;
+pub const VK_UP: usize = 0x26;
+pub const VK_RIGHT: usize = 0x27;
+pub const VK_DOWN: usize = 0x28;
+pub const VK_DELETE: usize = 0x2E;
+pub const VK_SPACE: usize = 0x20;
+pub const VK_OEM_PLUS: usize = 0xBB;
+pub const VK_OEM_MINUS: usize = 0xBD;
+pub const VK_CONTROL: usize = 0x11;
+pub const VK_A: usize = 0x41;
+pub const VK_C: usize = 0x43;
+pub const VK_S: usize = 0x53;
+pub const VK_V: usize = 0x56;
+pub const VK_X: usize = 0x58;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -340,6 +379,17 @@ extern "system" {
     pub fn GetMonitorInfoW(monitor: *mut c_void, info: *mut MONITORINFO) -> BOOL;
     pub fn MonitorFromWindow(hwnd: HWND, flags: u32) -> *mut c_void;
     pub fn SetRect(rc: *mut RECT, l: i32, t: i32, r: i32, b: i32) -> BOOL;
+    // ---- 键盘 / 焦点 / 插入符（自绘对话框的输入框需要） ----
+    pub fn SetFocus(hwnd: HWND) -> HWND;
+    pub fn GetFocus() -> HWND;
+    pub fn GetKeyState(vk: i32) -> i16;
+    pub fn CreateCaret(hwnd: HWND, bitmap: HBITMAP, w: i32, h: i32) -> BOOL;
+    pub fn DestroyCaret() -> BOOL;
+    pub fn SetCaretPos(x: i32, y: i32) -> BOOL;
+    pub fn ShowCaret(hwnd: HWND) -> BOOL;
+    pub fn HideCaret(hwnd: HWND) -> BOOL;
+    pub fn IsWindowEnabled(hwnd: HWND) -> BOOL;
+    pub fn IsWindow(hwnd: HWND) -> BOOL;
 }
 
 pub const MB_OK: u32 = 0x0000_0000;
@@ -543,8 +593,7 @@ pub fn render_client_to_bmp(app: &mut crate::ui::App, w: i32, h: i32, out_path: 
     }
 }
 
-fn write_bmp24(path: &str, w: i32, h: i32, bgra: &[u8]) {
-    use std::io::Write;
+pub fn write_bmp24(path: &str, w: i32, h: i32, bgra: &[u8]) {    use std::io::Write;
     let row_in = (w as usize) * 4;
     let row_out = ((w as usize) * 3 + 3) / 4 * 4; // 4 字节对齐
     let data_size = row_out * (h as usize);

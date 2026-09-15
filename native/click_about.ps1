@@ -43,27 +43,49 @@ public class CA3 {
     RECT cr; GetClientRect(main, out cr);
     int dpi = GetDpiForWindow(main);
     if (dpi <= 0) dpi = 96;
-    int btn = (int)(48L * dpi * 100 / 96 / 100);   // px(48)：96dpi→48，144dpi→72
+    int btn = (int)(48L * dpi * 100 / 96 / 100);   // px(48): 96dpi->48, 144dpi->72
     if (btn < 40) btn = 40;
     int w = cr.Right;
 
-    // 标题栏右侧布局：x_start = w - 3*btn；关于 = x_start - 2*btn
-    int xAbout = w - btn * 3 - btn * 2 + btn / 2;
+    // Title bar right side: x_start = w - 3*btn;
+    // About = x_start - 3*btn, Settings = x_start - 2*btn.
+    // (2026-09-15: the new Settings entry shifted About left by one slot --
+    //  whenever you touch title-bar buttons, update these coordinates too.)
+    int xAbout = w - btn * 3 - btn * 3 + btn / 2;
+    int xSettings = w - btn * 3 - btn * 2 + btn / 2;
     int y = 30;
-    log.AppendLine("probe: dpi=" + dpi + " client=" + cr.Right + "x" + cr.Bottom + " btn=" + btn + " xAbout=" + xAbout);
+    log.AppendLine("probe: dpi=" + dpi + " client=" + cr.Right + "x" + cr.Bottom + " btn=" + btn + " xAbout=" + xAbout + " xSettings=" + xSettings);
 
-    int[] xs = new int[] { xAbout };
-    for (int i = 0; i < xs.Length; i++) {
-      Click(main, xs[i], y);
-      System.Threading.Thread.Sleep(500);
-      IntPtr dlg = Find("LearnHelperAboutWnd");
-      if (dlg != IntPtr.Zero) {
-        log.AppendLine("CLICK " + xs[i] + "," + y + " -> ABOUT DIALOG OPEN, size " + Size(dlg));
-        return log.ToString();
-      }
-      log.AppendLine("CLICK " + xs[i] + "," + y + " -> no dialog");
+    bool aboutOk = false;
+    Click(main, xAbout, y);
+    System.Threading.Thread.Sleep(500);
+    IntPtr dlg = Find("LearnHelperAboutWnd");
+    if (dlg != IntPtr.Zero) {
+      log.AppendLine("CLICK " + xAbout + "," + y + " -> ABOUT DIALOG OPEN, size " + Size(dlg));
+      aboutOk = true;
+      SendMessage(dlg, 0x0010, (IntPtr)0, (IntPtr)0); // WM_CLOSE: close before the next test
+      System.Threading.Thread.Sleep(400);
+    } else {
+      log.AppendLine("CLICK " + xAbout + "," + y + " -> no about dialog");
     }
-    log.AppendLine("ABOUT DIALOG NOT OPENED");
+
+    Click(main, xSettings, y);
+    // the settings dialog may need a moment (it also kicks off a settings refresh)
+    IntPtr sdlg = IntPtr.Zero;
+    for (int t = 0; t < 12; t++) {
+      System.Threading.Thread.Sleep(250);
+      sdlg = Find("LearnHelperSettingsWnd");
+      if (sdlg != IntPtr.Zero) break;
+    }
+    if (sdlg != IntPtr.Zero) {
+      log.AppendLine("CLICK " + xSettings + "," + y + " -> SETTINGS DIALOG OPEN, size " + Size(sdlg));
+      SendMessage(sdlg, 0x0010, (IntPtr)0, (IntPtr)0);
+      System.Threading.Thread.Sleep(300);
+    } else {
+      log.AppendLine("CLICK " + xSettings + "," + y + " -> no settings dialog");
+    }
+
+    log.AppendLine(aboutOk ? "ABOUT OK" : "ABOUT DIALOG NOT OPENED");
     return log.ToString();
   }
 }
