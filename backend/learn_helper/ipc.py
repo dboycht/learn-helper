@@ -421,6 +421,7 @@ class ApiServer:
         退出条件只看自己的 ``_stop_event``，行为可预测。
         """
         ticks = 0
+        LOGGER.info('[HTTP] 服务循环开始（主线程）')
         while not self._stop_event.is_set():
             try:
                 self._httpd.handle_request()
@@ -429,6 +430,7 @@ class ApiServer:
             ticks += 1
             if ticks % 600 == 0:
                 LOGGER.debug(f'[HTTP] 主循环存活 ticks={ticks}')
+        LOGGER.info(f'[HTTP] 服务循环退出（ticks={ticks}）')
 
     def request_stop(self):
         """请求主循环退出（可从任意线程调用，含 HTTP 处理器线程）。

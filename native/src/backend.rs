@@ -228,9 +228,22 @@ pub fn locate_backend() -> Option<(String, Vec<String>)> {
 }
 
 fn find_python() -> Option<String> {
+    // ⚠️ 为什么要"解析出真正的解释器路径"而不直接用 `py`（2026-09-16 实测）：
+    //   用 `py` 时进程链是 **UI → py.exe → python.exe**。UI 一旦被强杀/异常退出，
+    //   中间那层 `py.exe` **仍然活着**，于是后端的"stdin EOF ⇒ 自杀"逻辑收不到 EOF
+    //   ⇒ **界面已经没了、后端还挂在那里**（实测残留：一个 10 分钟前的后端仍在监听端口，
+    //   用户截图里发现的；见 ERROR.md E45）。
+    //   直接 spawn `python.exe` 后进程链只剩一层：UI 一死 stdin 立刻 EOF，后端干净退出；
+    //   而且 `shutdown()` 里的 `child.kill()` 也终于杀的是真后端而不是外层 shim。
+    // 注意：这里**保持与 `py <script>` 相同的解释器选择**（不改解释器版本），只去掉 shim；
+    //   "实际跑的是默认 py（本机 = 3.12）而不是文档写的 3.10" 是另一个问题，见 DEVELOPMENT.md。
+    if let Some(path) = python_exe_path("py") {
+        return Some(path);
+    }
+    // 兜底：解析不出来就直接用 launcher（有 shim，但至少能跑起来）
     for exe in ["py", "python"] {
         let mut cmd = Command::new(exe);
-        cmd.args(["-3.10", "-c", "print(1)"])
+        cmd.args(["-c", "print(1)"])
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         if let Ok(mut child) = cmd.spawn() {
@@ -242,6 +255,25 @@ fn find_python() -> Option<String> {
         }
     }
     None
+}
+
+/// 解析 `py` 背后真实解释器的可执行文件路径（拿不到就返回 `None`，由调用方兜底）。
+fn python_exe_path(launcher: &str) -> Option<String> {
+    let out = Command::new(launcher)
+        .args(["-c", "import sys;print(sys.executable)"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW：不要闪一个黑框
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let path = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    if path.is_empty() || !PathBuf::from(&path).exists() {
+        return None;
+    }
+    Some(path)
 }
 
 /// 在后台线程完成：拉起后端 → 握手 → 连管道 → 首次拉状态。

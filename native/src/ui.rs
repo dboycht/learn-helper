@@ -944,11 +944,14 @@ impl App {
 
     /// 按钮定义（**绘制与命中测试共用同一份**，避免两者算出的宽度不一致）。
     /// 宽度按**实测文本宽度**算，字号放大后不会溢出按钮行（ERROR.md E34）。
+    ///
+    /// ⚠️ 这里**不再放**「检测/刷新网页」：网页选择行里已经有一个同名按钮（`Ctl::Refresh`
+    /// 由 `refresh_rect()` 提供），两个入口重复、用户明确指出"怎么有两个"（2026-09-16）。
+    /// ⇒ 刷新只保留网页行那一个；`Ctl::Refresh` 的 `invoke` 分支**仍然保留**（网页行按钮要用它）。
     fn button_specs(&self, st: &PaintState) -> Vec<(Ctl, &'static str, i32)> {
         let labels: Vec<(Ctl, &'static str)> = vec![
             (Ctl::Start, if st.running { "正在运行…" } else { "启动刷课" }),
             (Ctl::Pause, if st.paused { "继续执行" } else { "暂停进程" }),
-            (Ctl::Refresh, "检测/刷新网页"),
             (Ctl::Diagnose, "诊断页面"),
             (Ctl::Stop, "终止并退出"),
         ];

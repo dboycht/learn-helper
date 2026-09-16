@@ -30,6 +30,10 @@ RUNTIME_DIR = os.path.join(BASE_DIR, '.runtime')
 LOCK_PATH = os.path.join(RUNTIME_DIR, 'backend.lock')
 INFO_PATH = os.path.join(RUNTIME_DIR, 'backend.json')
 
+# 退出时"停引擎 + 关浏览器"的上限（秒）。超过就放弃这一步继续收尾。
+# 取值依据：CDP 连接超时 3s + Playwright 驱动启动余量（实测正常路径 ≈1~3s）。
+ENGINE_STOP_TIMEOUT = 6.0
+
 
 # ----------------------------------------------------------------------------
 # 单实例锁
@@ -195,7 +199,13 @@ class Backend:
         if not pipe_ok:
             self.hub.emit_log(f'[启动] 命名管道不可用（{self.pipe.last_error}），'
                               f'日志推送降级为 HTTP 轮询。')
-        self.api.start()
+        # ⚠️ **不要再调 `self.api.start()`**（2026-09-16，ERROR.md E45）：
+        # 那会再起一条 `http-api` 后台线程跑 serve_forever，于是**同一个 socket 上有两条
+        # accept 循环**（后台线程 + 下面主线程各一条），退出时互相抢、
+        # 实测出现"已请求退出但循环就是不返回"⇒ 收尾不执行 ⇒ 后端残留并占着端口，
+        # 下次启动被判"已有实例在运行"。正式运行只由**主线程**的 serve_forever 服务；
+        # `ApiServer.start()` 留给自测脚本用（它们不起主线程循环）。
+        # 握手行在 serve_forever 之前就写出去了，前端本来就要轮询 /api/health，无竞态。
 
         info = {
             'type': 'ready',
@@ -227,8 +237,11 @@ class Backend:
         threading.Thread(target=self._watch_stdin, daemon=True, name='stdin-watch').start()
         # 阻塞在这里；收到退出请求后 serve_forever 返回，**由主线程**执行收尾。
         # （收尾放主线程、退出码由 main() 返回，才不会和解释器 finalize 抢 stdout/stderr。）
+        LOGGER.info('[HTTP] 主线程进入 api.serve_forever()')
         self.api.serve_forever()
+        LOGGER.info('[退出] HTTP 循环已返回，开始收尾 _cleanup')
         self._cleanup()
+        LOGGER.info('[退出] 收尾完成')
         return self._exit_code
 
     def _watch_stdin(self):
@@ -265,23 +278,44 @@ class Backend:
             LOGGER.warning(f'[退出] 唤醒 HTTP 服务失败: {e}')
 
     def _cleanup(self):
-        """主线程收尾：停引擎与浏览器 → 关管道 → 关 HTTP → 释放运行时文件。"""
+        """主线程收尾：停引擎与浏览器 → 关管道 → 关 HTTP → 释放运行时文件。
+
+        ⚠️ **每一步都必须有界**。实测（2026-09-16，ERROR.md E45）：
+        `engine.stop(close_browser=True)` 里的 Playwright `sync_playwright()` 收尾
+        **会永远不返回**（日志停在"HTTP 服务已唤醒"就没了），于是收尾卡死
+        ⇒ HTTP 端口不放、运行时文件不删 ⇒ **界面已退出、后端还挂着**，
+        下一次启动被判定"已有实例在运行"而连不上。
+        所以引擎那一步套一层**有超时的 daemon 线程**：超时就放弃关浏览器，
+        继续把端口与运行时文件收干净（反正 `os._exit` 会终止进程）。
+        """
         try:
             if self.engine is not None:
-                self.engine.stop(close_browser=True)
+                LOGGER.info('[退出] 收尾①：停引擎/关浏览器')
+                stopper = threading.Thread(target=self.engine.stop,
+                                           kwargs={'close_browser': True},
+                                           daemon=True, name='engine-stop')
+                stopper.start()
+                stopper.join(timeout=ENGINE_STOP_TIMEOUT)
+                if stopper.is_alive():
+                    LOGGER.warning('[退出] 停止引擎/关闭浏览器超时（放弃该步，继续收尾）')
+                else:
+                    LOGGER.info('[退出] 收尾①完成')
         except Exception as e:
             LOGGER.warning(f'[退出] 停止引擎异常: {e}')
         try:
             if self.pipe is not None:
+                LOGGER.info('[退出] 收尾②：关闭命名管道')
                 self.pipe.stop()
         except Exception:
             pass
         try:
             if self.api is not None:
+                LOGGER.info('[退出] 收尾③：关闭 HTTP 监听')
                 self.api.server_close()
         except Exception:
             pass
         release_runtime_info()
+        LOGGER.info('[退出] 收尾④：运行时文件已释放')
         logger = LOGGER
         for h in list(logger.handlers):
             try:
