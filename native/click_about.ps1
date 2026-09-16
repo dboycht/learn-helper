@@ -1,9 +1,11 @@
 # click_about.ps1 -- click the About button in the title bar and report whether the dialog opens.
 #
-# ⚠️ 本脚本必须先把**自己**设成 DPI 感知进程：否则 PowerShell 进程会被坐标虚拟化，
-# 它发出的鼠标坐标会被 Windows 按系统缩放换算后才交给目标进程
-# （实测：发 (849,30) → 目标收到 (1274,45)，全部打偏，见 ERROR.md E37/E39）。
-# 所有循环都在 C# 里做 —— PowerShell 5.1 的嵌套数组算术很容易把自己绕死。
+# This script MUST make ITSELF DPI aware first: otherwise Windows virtualizes the mouse
+# coordinates it sends (measured: sent (849,30) -> the app received (1274,45), every click
+# missed; see ERROR.md E37/E39).
+# All loops live in C# -- PS 5.1's nested-array arithmetic is easy to get wrong.
+# NOTE: keep this file pure ASCII (a Chinese comment inside a here-string can swallow the
+# next line under PS 5.1/GBK; see ERROR.md E43/E47).
 
 Add-Type -TypeDefinition @'
 using System; using System.Text; using System.Runtime.InteropServices;

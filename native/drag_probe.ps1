@@ -23,9 +23,11 @@ public class DP {
   [DllImport("user32.dll")] public static extern bool GetCursorPos(out POINT p);
   [DllImport("user32.dll")] public static extern IntPtr WindowFromPoint(POINT p);
   [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
-  // 探针自身也必须是 DPI 感知的：否则 PowerShell 进程会被**坐标虚拟化**，
-  // GetWindowRect 读到的是逻辑像素（1173/1.5=782），与被测进程的物理像素对不上，
-  // 看起来就像"程序夹取算错了"（实测踩过，见 ERROR.md E37）。
+  // The probe itself MUST be DPI aware: otherwise Windows virtualizes its coordinates,
+  // GetWindowRect reports logical pixels (1173/1.5=782) while the app uses physical ones,
+  // and it looks like "the app clamps the window wrongly" (measured; see ERROR.md E37).
+  // NOTE: keep this here-string pure ASCII -- PS 5.1 decodes a BOM-less UTF-8 script as
+  // GBK, and a stray byte from a Chinese comment can swallow the NEXT line (E43).
   [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr ctx);
   public static readonly IntPtr DPI_PER_MONITOR_AWARE_V2 = new IntPtr(-4);
 
@@ -76,7 +78,7 @@ public class DP {
 '@
 Add-Type -TypeDefinition $code
 
-# 先把自己变成 DPI 感知进程，再量窗口（否则量到的是虚拟化后的逻辑像素）
+# Make THIS process DPI aware before measuring (otherwise we read virtualized logical pixels)
 [void][DP]::SetProcessDpiAwarenessContext([DP]::DPI_PER_MONITOR_AWARE_V2)
 
 $hwnd = [DP]::FindByClass("LearnHelperNativeWnd")
@@ -86,8 +88,8 @@ if ($hwnd -eq [IntPtr]::Zero) { Write-Output "NO_WINDOW"; exit 1 }
 Start-Sleep -Milliseconds 600
 Write-Output ("START      : " + [DP]::Rect($hwnd))
 
-# 起始点：标题栏中部（避开右侧按钮）
-# NOTE: PowerShell 5.1 不能直接 New-Object 嵌套结构体，必须用 [Type]::new() / New-Object -TypeName
+# Grab point: middle of the title bar (avoids the title-bar buttons)
+# NOTE: PS 5.1 cannot New-Object nested structs; use [Type]::new() / New-Object -TypeName
 $r = [DP+RECT]::new()
 [void][DP]::GetWindowRect($hwnd, [ref]$r)
 $sx = [int](($r.Left + $r.Right) / 2)
