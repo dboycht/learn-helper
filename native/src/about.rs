@@ -24,6 +24,8 @@ pub struct AboutState {
     pub hwnd: HWND,
     pub hover_ok: bool,
     pub pressed_ok: bool,
+    /// 渲染探针用：显式指定 DPI（不建窗口时按它缩放，见 `--render-probe-*`）
+    pub dpi_override: Option<u32>,
 }
 
 impl AboutState {
@@ -32,16 +34,40 @@ impl AboutState {
             shared,
             theme,
             colors: Colors::for_theme(theme),
-            fonts: ui::make_dialog_fonts(),
+            fonts: ui::make_dialog_fonts(96),
             hwnd: NULL_HANDLE,
             hover_ok: false,
             pressed_ok: false,
+            dpi_override: None,
         }
     }
 
+    /// 当前生效的 DPI（探针覆盖 > 窗口真实 DPI > 96 基准）。
+    fn dpi(&self) -> u32 {
+        if let Some(d) = self.dpi_override {
+            return d.max(96);
+        }
+        if self.hwnd.is_null() {
+            96
+        } else {
+            unsafe { GetDpiForWindow(self.hwnd) }.max(96)
+        }
+    }
+
+    /// ⚠️ 拿到窗口后**必须重建字体**：窗口 DPI 只有这时才知道，
+    /// 不重建就会"行按 1.5 放大、字还是 96 DPI 的大小"（ERROR.md E47）。
+    fn refresh_fonts(&mut self) {
+        let dpi = self.dpi();
+        let sizes = ui::dialog_font_sizes(dpi);
+        self.fonts = ui::make_dialog_fonts(dpi);
+        crate::trace::trace(&format!(
+            "about: fonts rebuilt dpi={} ui={}px sm={}px b={}px mono={}px",
+            dpi, sizes[0], sizes[1], sizes[2], sizes[3]
+        ));
+    }
+
     fn px(&self, logical: i32) -> i32 {
-        let dpi = unsafe { GetDpiForWindow(self.hwnd) }.max(96) as i32;
-        (logical * dpi * 100 / 96 + 50) / 100
+        (logical * self.dpi() as i32 * 100 / 96 + 50) / 100
     }
 
     fn ok_rect(&self, client: RECT) -> RECT {
@@ -188,6 +214,8 @@ unsafe extern "system" fn about_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
         if !state_ptr.is_null() {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
             (*state_ptr).hwnd = hwnd;
+            // 窗口 DPI 只有这时才知道 ⇒ 立刻按它重建字体（否则高 DPI 下字会偏小，E47）
+            (*state_ptr).refresh_fonts();
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }

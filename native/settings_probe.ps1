@@ -45,6 +45,24 @@ function New-TempDir([string]$tag) {
     return $d
 }
 
+# Expected dialog font pixel size for a given DPI, mirroring ui::dialog_font_sizes()
+# (integer math: ((pt * dpi * 100) / 96 + 50) / 100). Guards E47: on a 150% screen the
+# dialog text used to stay at the 96-DPI size while rows grew 1.5x, so it looked tiny.
+function Expected-UiPx([int]$dpi) {
+    $inner = [math]::Floor(14 * $dpi * 100 / 96)
+    return [int][math]::Floor(($inner + 50) / 100)
+}
+
+function Check-FontScale([string]$name, $log, [string]$pattern) {
+    $line = @($log | Where-Object { $_ -match $pattern })[0]
+    if (-not $line) { Check $name $false ("trace line not found: " + $pattern); return }
+    if ($line -notmatch 'dpi=(\d+).*ui=(\d+)px') { Check $name $false ("unparsable: " + $line); return }
+    $dpi = [int]$Matches[1]
+    $ui = [int]$Matches[2]
+    $want = Expected-UiPx $dpi
+    Check $name ($ui -eq $want) ("dpi=" + $dpi + " ui=" + $ui + "px expected=" + $want + "px")
+}
+
 function Write-Seed([string]$dir, [string]$serverUrl) {
     $seed = [ordered]@{
         server_url = $serverUrl
@@ -74,8 +92,25 @@ function Diag-Snapshot([string]$dest) {
 # Runs one UI case and returns the diag log lines produced by THAT case.
 # (The exe truncates native-diag.log on every start, so a per-case copy is the
 # only reliable way to attribute lines to a run.)
+# NOTE: the app is single-instance (named mutex). If the previous case's process is still
+# shutting down, the new process exits(0) immediately and EVERY assertion in the case fails
+# -> a confusing "everything is broken" run. Always wait for it to disappear first.
+function Wait-NoInstance([int]$timeoutSeconds = 15) {
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (@(Get-Process -Name 'learn-helper-native' -ErrorAction SilentlyContinue).Count -eq 0) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return $false
+}
+
 function Invoke-Ui([string]$dir, [string]$action, [int]$waitSeconds) {
     $snap = Join-Path $env:TEMP ("lh-diag-" + [IO.Path]::GetFileNameWithoutExtension($dir) + "-" + (Get-Random) + ".log")
+    if (-not (Wait-NoInstance)) {
+        Write-Host "  WARNING: a previous learn-helper-native is still running; case may be bogus"
+    }
     $env:LH_BASE_DIR = $dir
     $env:LH_UI_ACTION = $action
     $p = Start-Process -FilePath $Exe -WorkingDirectory $dir -PassThru
@@ -120,6 +155,11 @@ $cfg1 = Read-Cfg $d1
 
 Check "dialog created" (@($log1 | Where-Object { $_ -match 'settings: window shown' }).Count -gt 0)
 Check "dialog opened + loaded settings from backend" (@($log1 | Where-Object { $_ -match 'settings-hook: opened loaded=True' }).Count -gt 0)
+# E47: the dialog font must scale with DPI (otherwise a 150% screen shows
+# "tall rows, tiny text"). NOTE: keep this script pure ASCII -- PS 5.1 decodes a
+# BOM-less UTF-8 script as GBK, and a stray byte from a Chinese comment can swallow
+# the NEXT line (it silently skipped this very check the first time).
+Check-FontScale "dialog fonts scale with DPI" $log1 'settings: fonts rebuilt dpi='
 $saved = @($log1 | Where-Object { $_ -match 'settings: save ok' }).Count -gt 0
 if ($saved) {
     Check "save round-trip ok (PUT /api/settings)" $true

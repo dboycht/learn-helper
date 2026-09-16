@@ -41,6 +41,23 @@ function Check([string]$name, [bool]$ok, [string]$detail = '') {
     }
 }
 
+# Expected dropdown font pixel size for a given DPI, mirroring ui::dialog_font_sizes()
+# (E47: the dropdown used to keep 96-DPI text while its rows grew 1.5x on a 150% screen).
+function Expected-UiPx([int]$dpi) {
+    $inner = [math]::Floor(14 * $dpi * 100 / 96)
+    return [int][math]::Floor(($inner + 50) / 100)
+}
+
+function Check-FontScale([string]$name, $log, [string]$pattern) {
+    $line = @($log | Where-Object { $_ -match $pattern })[0]
+    if (-not $line) { Check $name $false ("trace line not found: " + $pattern); return }
+    if ($line -notmatch 'dpi=(\d+).*ui=(\d+)px') { Check $name $false ("unparsable: " + $line); return }
+    $dpi = [int]$Matches[1]
+    $ui = [int]$Matches[2]
+    $want = Expected-UiPx $dpi
+    Check $name ($ui -eq $want) ("dpi=" + $dpi + " ui=" + $ui + "px expected=" + $want + "px")
+}
+
 function New-TempDir([string]$tag) {
     $d = Join-Path $env:TEMP ("lh-pages-probe-" + $tag + "-" + (Get-Random))
     New-Item -ItemType Directory -Path $d -Force | Out-Null
@@ -58,9 +75,42 @@ function Diag-Snapshot([string]$dest) {
     else { Set-Content -Path $dest -Value '' -Encoding ASCII }
 }
 
+# Wait until a trace line matching $pattern shows up, then return that run's lines.
+# Why: "popup window exists" (polled via FindWindow) can be true a few milliseconds BEFORE
+# the matching trace line is written -> snapshotting at that instant makes the check flaky.
+# Always assert on evidence that has ARRIVED, not on evidence sampled at one moment.
+function Wait-DiagMatch([string]$dest, [string]$pattern, [int]$timeoutMs = 4000) {
+    $deadline = (Get-Date).AddMilliseconds($timeoutMs)
+    while ((Get-Date) -lt $deadline) {
+        Diag-Snapshot $dest
+        $lines = @(Get-Content $dest -Encoding UTF8 -ErrorAction SilentlyContinue)
+        if (@($lines | Where-Object { $_ -match $pattern }).Count -gt 0) { return $lines }
+        Start-Sleep -Milliseconds 200
+    }
+    Diag-Snapshot $dest
+    return @(Get-Content $dest -Encoding UTF8 -ErrorAction SilentlyContinue)
+}
+
 # Runs one UI case and returns that case's diag lines (the exe truncates the log on start).
+# NOTE: the app is single-instance (named mutex). If the previous case's process is still
+# shutting down, the new process exits(0) immediately and EVERY assertion in the case fails
+# -> a confusing "everything is broken" run. So always wait for it to disappear first.
+function Wait-NoInstance([int]$timeoutSeconds = 15) {
+    $deadline = (Get-Date).AddSeconds($timeoutSeconds)
+    while ((Get-Date) -lt $deadline) {
+        if (@(Get-Process -Name 'learn-helper-native' -ErrorAction SilentlyContinue).Count -eq 0) {
+            return $true
+        }
+        Start-Sleep -Milliseconds 300
+    }
+    return $false
+}
+
 function Invoke-Ui([string]$dir, [string]$action, [int]$waitSeconds) {
     $snap = Join-Path $env:TEMP ("lh-pages-diag-" + (Get-Random) + ".log")
+    if (-not (Wait-NoInstance)) {
+        Write-Host "  WARNING: a previous learn-helper-native is still running; case may be bogus"
+    }
     $env:LH_BASE_DIR = $dir
     $env:LH_UI_ACTION = $action
     $env:LH_PROBE_PAGES = $SamplePages
@@ -108,6 +158,9 @@ $cfg1 = Read-Cfg $d1
 
 Check "UI injected sample pages" (@($log1 | Where-Object { $_ -match 'LH_PROBE_PAGES injected 3 item' }).Count -gt 0)
 Check "dropdown opened (items=3)" (@($log1 | Where-Object { $_ -match 'pagepicker: shown items=3' }).Count -gt 0)
+# E47: the dropdown font must scale with DPI. Keep this script pure ASCII (see the note
+# in settings_probe.ps1: a Chinese comment can swallow the next line under PS 5.1/GBK).
+Check-FontScale "dropdown fonts scale with DPI" $log1 'pagepicker: fonts rebuilt dpi='
 Check "hook auto-picked index #1" (@($log1 | Where-Object { $_ -match 'pagepicker: auto-pick #1' }).Count -gt 0)
 Check "item click handled" (@($log1 | Where-Object { $_ -match 'pagepicker: picked #1' }).Count -gt 0)
 Check "dropdown closed itself after picking" (@($log1 | Where-Object { $_ -match 'pagepicker: window destroyed' }).Count -gt 0)
@@ -157,6 +210,7 @@ public class PgProbe {
 '@
 
 $d3 = New-TempDir 'empty'
+if (-not (Wait-NoInstance)) { Write-Host "  WARNING: previous instance still running (case 3)" }
 $env:LH_BASE_DIR = $d3
 $env:LH_UI_ACTION = 'pages'
 $env:LH_PROBE_PAGES = ''
@@ -173,8 +227,7 @@ for ($i = 0; $i -lt 40; $i++) {
 Check "popup window exists before Esc" ($popup -ne [IntPtr]::Zero)
 
 $snap3 = Join-Path $env:TEMP ("lh-pages-diag3-" + (Get-Random) + ".log")
-Diag-Snapshot $snap3
-$log3 = @(Get-Content $snap3 -Encoding UTF8 -ErrorAction SilentlyContinue)
+$log3 = Wait-DiagMatch $snap3 'pagepicker: shown items=0'
 Check "empty list still opens (items=0)" (@($log3 | Where-Object { $_ -match 'pagepicker: shown items=0' }).Count -gt 0)
 
 [void][PgProbe]::SendEsc([PgProbe]::Find("LearnHelperPagePickerWnd"))

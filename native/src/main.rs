@@ -86,7 +86,8 @@ fn main() {
         ui::App::bootstrap(hwnd, &mut *app_ptr);
 
         // 对话框渲染探针：不建窗口、不碰屏幕，直接把「答题设置」画进 BMP。
-        // 用法：learn-helper-native.exe --render-probe-settings [宽 高 输出路径]
+        // 用法：--render-probe-settings [宽 高 输出路径 DPI]
+        // （高 DPI 时请把"宽 高"按物理尺寸给：770×630 逻辑 @144 DPI ⇒ 1155×945）
         if std::env::args().any(|a| a == "--render-probe-settings") {
             let args: Vec<String> = std::env::args().collect();
             let pos = |n: usize, def: i32| {
@@ -98,18 +99,19 @@ fn main() {
             };
             let w = pos(1, 820);
             let h = pos(2, 700);
+            let dpi = pos(4, 96) as u32;
             let out = args
                 .iter()
                 .position(|a| a == "--render-probe-settings")
                 .and_then(|i| args.get(i + 3))
                 .cloned()
                 .unwrap_or_else(|| "settings-render.bmp".to_string());
-            settings::render_probe(&out, w, h);
+            settings::render_probe(&out, w, h, dpi);
             std::process::exit(0);
         }
 
         // 下拉渲染探针：不建窗口、不碰屏幕，直接把「当前网页」下拉画进 BMP。
-        // 用法：learn-helper-native.exe --render-probe-pages [宽 高 输出路径]
+        // 用法：--render-probe-pages [宽 高 输出路径 DPI]
         if std::env::args().any(|a| a == "--render-probe-pages") {
             let args: Vec<String> = std::env::args().collect();
             let pos = |n: usize, def: i32| {
@@ -121,13 +123,14 @@ fn main() {
             };
             let w = pos(1, 560);
             let h = pos(2, 190);
+            let dpi = pos(4, 96) as u32;
             let out = args
                 .iter()
                 .position(|a| a == "--render-probe-pages")
                 .and_then(|i| args.get(i + 3))
                 .cloned()
                 .unwrap_or_else(|| "pages-render.bmp".to_string());
-            pagepicker::render_probe(&out, w, h);
+            pagepicker::render_probe(&out, w, h, dpi);
             std::process::exit(0);
         }
 

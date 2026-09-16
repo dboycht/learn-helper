@@ -45,6 +45,8 @@ struct PickerState {
     selected: String,
     hover: Option<usize>,
     scroll: usize,
+    /// 渲染探针用：显式指定 DPI
+    dpi_override: Option<u32>,
 }
 
 impl PickerState {
@@ -52,22 +54,41 @@ impl PickerState {
         PickerState {
             shared,
             colors: Colors::for_theme(theme),
-            fonts: ui::make_dialog_fonts(),
+            fonts: ui::make_dialog_fonts(96),
             hwnd: NULL_HANDLE,
             items,
             selected,
             hover: None,
             scroll: 0,
+            dpi_override: None,
         }
     }
 
-    fn px(&self, logical: i32) -> i32 {
-        let dpi = if self.hwnd.is_null() {
+    /// 当前生效的 DPI（探针覆盖 > 窗口真实 DPI > 96 基准）。
+    fn dpi(&self) -> u32 {
+        if let Some(d) = self.dpi_override {
+            return d.max(96);
+        }
+        if self.hwnd.is_null() {
             96
         } else {
-            unsafe { GetDpiForWindow(self.hwnd) }.max(96) as i32
-        };
-        (logical * dpi * 100 / 96 + 50) / 100
+            unsafe { GetDpiForWindow(self.hwnd) }.max(96)
+        }
+    }
+
+    /// ⚠️ 拿到窗口后**必须重建字体**（窗口 DPI 只有这时才知道，见 ERROR.md E47）。
+    fn refresh_fonts(&mut self) {
+        let dpi = self.dpi();
+        let sizes = ui::dialog_font_sizes(dpi);
+        self.fonts = ui::make_dialog_fonts(dpi);
+        crate::trace::trace(&format!(
+            "pagepicker: fonts rebuilt dpi={} ui={}px sm={}px b={}px mono={}px",
+            dpi, sizes[0], sizes[1], sizes[2], sizes[3]
+        ));
+    }
+
+    fn px(&self, logical: i32) -> i32 {
+        (logical * self.dpi() as i32 * 100 / 96 + 50) / 100
     }
 
     fn visible_rows(&self) -> usize {
@@ -228,6 +249,8 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
         if !state_ptr.is_null() {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
             (*state_ptr).hwnd = hwnd;
+            // 窗口 DPI 只有这时才知道 ⇒ 立刻重建字体（否则高 DPI 下字偏小，E47）
+            (*state_ptr).refresh_fonts();
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -535,7 +558,8 @@ pub fn show(
 }
 
 /// 渲染探针：把下拉按样例数据画进 BMP（不建窗口、不碰屏幕）。
-pub fn render_probe(out_path: &str, w: i32, h: i32) {
+/// `dpi` 用来复现高 DPI 排版（ERROR.md E47）。
+pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
     let shared = Shared::new();
     let items = vec![
         "超星学习通 - 数据结构与算法 - 第3章 树与二叉树 - 3.2 二叉树的遍历".to_string(),
@@ -546,6 +570,8 @@ pub fn render_probe(out_path: &str, w: i32, h: i32) {
     ];
     let selected = items[0].clone();
     let mut state = Box::new(PickerState::new(shared, Theme::Dark, items, selected));
+    state.dpi_override = Some(dpi.max(96));
+    state.refresh_fonts();
     state.hover = Some(1);
 
     unsafe {

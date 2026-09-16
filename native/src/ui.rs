@@ -17,13 +17,30 @@ pub const DFONT_UI_SM: usize = 1;
 pub const DFONT_UI_B: usize = 2;
 pub const DFONT_MONO: usize = 3;
 
+/// 弹窗字体的**字号表**（逻辑 pt → 实际像素），与 `make_dialog_fonts` 共用同一份规则。
+/// 单独暴露出来是为了能把它写进诊断日志/探针断言里（"字号有没有跟着 DPI 缩放"，见 E47）。
+pub fn dialog_font_sizes(dpi: u32) -> [i32; 4] {
+    // 与 `App::init_fonts()` 同一套缩放规则：96 DPI = 1.0x
+    let scale = |pt: i32| {
+        let d = dpi.max(96) as i32;
+        (pt * d * 100 / 96 + 50) / 100
+    };
+    [scale(14), scale(13), scale(14), scale(13)]
+}
+
 /// 弹窗用的一套字体（主窗口之外的第二套）。
-pub fn make_dialog_fonts() -> Vec<FontOwned> {
+///
+/// ⚠️ **必须按 DPI 缩放，且基准字号与主窗口对齐**（ui 14pt / sm 13pt / b 14pt 半粗 / mono 13pt）。
+/// 曾经的写法是写死 `13/12/13/12`：主窗口按 DPI 放大到了 21px（144 DPI），弹窗却还是 13px，
+/// 而行高/间距全都走 `px()` 放大了 ⇒ 高 DPI 下**弹窗"行很大、字很小"**
+/// （用户 2026-09-16 反馈：设置/关于/下拉三个弹窗字体都非常小，见 ERROR.md E47）。
+pub fn make_dialog_fonts(dpi: u32) -> Vec<FontOwned> {
+    let sizes = dialog_font_sizes(dpi);
     let specs = [
-        (13, FW_NORMAL, "Microsoft YaHei UI"),   // 0 ui
-        (12, FW_NORMAL, "Microsoft YaHei UI"),   // 1 ui sm
-        (13, FW_SEMIBOLD, "Microsoft YaHei UI"), // 2 ui b
-        (12, FW_NORMAL, "Consolas"),             // 3 mono
+        (sizes[0], FW_NORMAL, "Microsoft YaHei UI"),   // 0 ui
+        (sizes[1], FW_NORMAL, "Microsoft YaHei UI"),   // 1 ui sm
+        (sizes[2], FW_SEMIBOLD, "Microsoft YaHei UI"), // 2 ui b
+        (sizes[3], FW_NORMAL, "Consolas"),             // 3 mono
     ];
     let mut fonts = Vec::new();
     for (pt, weight, face) in specs {

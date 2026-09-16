@@ -493,6 +493,8 @@ struct SettingsState {
     test_seq: Arc<AtomicI64>,
     /// 探针模式：客户区尺寸由参数给出，不读真实窗口
     probe_client: Option<RECT>,
+    /// 渲染探针用：显式指定 DPI
+    dpi_override: Option<u32>,
 }
 
 impl SettingsState {
@@ -501,7 +503,7 @@ impl SettingsState {
             shared,
             theme,
             colors: Colors::for_theme(theme),
-            fonts: ui::make_dialog_fonts(),
+            fonts: ui::make_dialog_fonts(96),
             hwnd: NULL_HANDLE,
             form: Form::default(),
             save_slot: Arc::new(Mutex::new(None)),
@@ -509,16 +511,36 @@ impl SettingsState {
             save_seq: Arc::new(AtomicI64::new(0)),
             test_seq: Arc::new(AtomicI64::new(0)),
             probe_client: None,
+            dpi_override: None,
         }
     }
 
-    fn px(&self, logical: i32) -> i32 {
-        let dpi = if self.hwnd.is_null() {
+    /// 当前生效的 DPI（探针覆盖 > 窗口真实 DPI > 96 基准）。
+    fn dpi(&self) -> u32 {
+        if let Some(d) = self.dpi_override {
+            return d.max(96);
+        }
+        if self.hwnd.is_null() {
             96
         } else {
-            unsafe { GetDpiForWindow(self.hwnd) }.max(96) as i32
-        };
-        (logical * dpi * 100 / 96 + 50) / 100
+            unsafe { GetDpiForWindow(self.hwnd) }.max(96)
+        }
+    }
+
+    /// ⚠️ 拿到窗口后**必须重建字体**：窗口 DPI 只有这时才知道，
+    /// 不重建就会"行按 1.5 放大、字还是 96 DPI 的大小"（ERROR.md E47）。
+    fn refresh_fonts(&mut self) {
+        let dpi = self.dpi();
+        let sizes = ui::dialog_font_sizes(dpi);
+        self.fonts = ui::make_dialog_fonts(dpi);
+        crate::trace::trace(&format!(
+            "settings: fonts rebuilt dpi={} ui={}px sm={}px b={}px mono={}px",
+            dpi, sizes[0], sizes[1], sizes[2], sizes[3]
+        ));
+    }
+
+    fn px(&self, logical: i32) -> i32 {
+        (logical * self.dpi() as i32 * 100 / 96 + 50) / 100
     }
 
     fn client(&self) -> RECT {
@@ -1183,6 +1205,8 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         if !state_ptr.is_null() {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, state_ptr as isize);
             (*state_ptr).hwnd = hwnd;
+            // 窗口 DPI 只有这时才知道 ⇒ 立刻重建字体（否则高 DPI 下字偏小，E47）
+            (*state_ptr).refresh_fonts();
         }
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -1859,7 +1883,10 @@ fn settings_from_state(shared: &Shared) -> Option<json::Value> {
 
 /// 渲染探针：把对话框客户区画进 BMP（不显示窗口、不碰屏幕）。
 /// 与主窗口 `--render-probe` 同一思路（`PrintWindow` 取不到自绘内容，见 ERROR.md E33/E10）。
-pub fn render_probe(out_path: &str, w: i32, h: i32) {
+///
+/// `dpi` 用来在探针里复现高 DPI 的排版（144 DPI 时传 1155×945 这类**物理**尺寸），
+/// 这样"字号有没有跟着 DPI 缩放"肉眼一看就知道（ERROR.md E47）。
+pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
     let shared = Shared::new();
     {
         let mut st = shared.lock();
@@ -1867,6 +1894,8 @@ pub fn render_probe(out_path: &str, w: i32, h: i32) {
     }
     let mut state = Box::new(SettingsState::new(shared, Theme::Dark));
     state.probe_client = Some(RECT { left: 0, top: 0, right: w, bottom: h });
+    state.dpi_override = Some(dpi.max(96));
+    state.refresh_fonts();
     let data = json::obj(&[
         ("server_url", json::s(DEFAULT_SERVER_URL)),
         (
