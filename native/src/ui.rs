@@ -780,8 +780,11 @@ impl App {
             w
         };
         // 文本 + 左右各 px(16) 内边距；下限 px(160)
+        // 🔧 2026-09-15 用户反馈"文字不够显示" ⇒ 在测得宽度上**再 +10px**（用户指定）。
+        // 注意：不要把正文排版改回 `ui_b`（半粗 14pt）—— 那个字号下这 8 个汉字要
+        // ~217px，按钮会宽到把网页框挤没（见本函数注释与 ERROR.md E41）。
         let base = if measured > 0 { measured } else { self.px(140) };
-        (base + self.px(32)).max(self.px(160))
+        (base + self.px(32)).max(self.px(160)) + self.px(10)
     }
 
     /// 「答题方式」占位宽度（按文本实测 + 间距）。
@@ -1786,7 +1789,7 @@ fn min_window_width(dpi: u32) -> i32 {
     let label_gap = px_at(dpi, 80);
     let gap = px_at(dpi, 10);
     let page_min = px_at(dpi, 300);
-    let refresh = px_at(dpi, 152);
+    let refresh = px_at(dpi, 170); // = refresh_button_width() 的下限（px(160) 下限 + 用户指定加宽 10）
     let speed = px_at(dpi, 104);
     let answer = px_at(dpi, 220);
     (px_at(dpi, 1100)).max(
