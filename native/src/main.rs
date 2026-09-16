@@ -17,6 +17,7 @@ mod dwm;
 mod gdi;
 mod json;
 mod native;
+mod pagepicker;
 mod settings;
 mod trace;
 mod ui;
@@ -104,6 +105,29 @@ fn main() {
                 .cloned()
                 .unwrap_or_else(|| "settings-render.bmp".to_string());
             settings::render_probe(&out, w, h);
+            std::process::exit(0);
+        }
+
+        // 下拉渲染探针：不建窗口、不碰屏幕，直接把「当前网页」下拉画进 BMP。
+        // 用法：learn-helper-native.exe --render-probe-pages [宽 高 输出路径]
+        if std::env::args().any(|a| a == "--render-probe-pages") {
+            let args: Vec<String> = std::env::args().collect();
+            let pos = |n: usize, def: i32| {
+                args.iter()
+                    .position(|a| a == "--render-probe-pages")
+                    .and_then(|i| args.get(i + n))
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(def)
+            };
+            let w = pos(1, 560);
+            let h = pos(2, 190);
+            let out = args
+                .iter()
+                .position(|a| a == "--render-probe-pages")
+                .and_then(|i| args.get(i + 3))
+                .cloned()
+                .unwrap_or_else(|| "pages-render.bmp".to_string());
+            pagepicker::render_probe(&out, w, h);
             std::process::exit(0);
         }
 

@@ -50,6 +50,8 @@ enum Ctl {
     Theme,
     /// 视频倍速切换（点击在 1.0 / 1.5 / 2.0 / 3.0 之间循环）
     Speed,
+    /// 「当前网页」下拉选择（点网页框打开选择器）
+    Pages,
     /// 「答题设置」对话框
     Settings,
     /// 「关于」弹窗
@@ -292,6 +294,23 @@ impl App {
         }
         app.shared.notify_ui();
 
+        // 验证钩子：注入一串**样例网页标题**（`|` 分隔），让"网页下拉"能在没有真实浏览器的
+        // 情况下被端到端验证（见 native\pages_probe.ps1）。正常运行时不设置这个变量。
+        if let Ok(list) = std::env::var("LH_PROBE_PAGES") {
+            let items: Vec<String> = list
+                .split('|')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !items.is_empty() {
+                let mut st = app.shared.lock();
+                st.pages = items.clone();
+                st.push_log(&format!("[native] (验证) 注入样例网页 {} 个", items.len()));
+                drop(st);
+                crate::trace::trace(&format!("ui: LH_PROBE_PAGES injected {} item(s)", items.len()));
+            }
+        }
+
         unsafe {
             SetTimer(hwnd, TIMER_UI, 250, std::ptr::null_mut());
             SetTimer(hwnd, TIMER_POLL, 1500, std::ptr::null_mut());
@@ -319,7 +338,7 @@ impl App {
 
         // 可脚本驱动的动作钩子（代理点不了界面，验证按钮链路只能靠它）：
         //   LH_UI_ACTION=refresh_pages|diagnose|pause|resume|start|stop|speed|settings|
-        //                settings_save|settings_cancel
+        //                settings_save|settings_cancel|pages|pages_select
         // 启动 2.5s 后（等后端握手完）自动触发一次，并把结果写进 trace。
         if let Ok(action) = std::env::var("LH_UI_ACTION") {
             let action = action.trim().to_string();
@@ -327,8 +346,8 @@ impl App {
                 let shared = app.shared.clone();
                 let hwnd_raw = hwnd as isize;
                 crate::trace::trace(&format!("ui: scripted action queued: {}", action));
-                // 「答题设置」类动作必须由 UI 线程建窗口：把请求 PostMessage 回主窗口
-                if action.starts_with("settings") {
+                // 「答题设置」/「网页下拉」类动作必须由 UI 线程建窗口：PostMessage 回主窗口
+                if action.starts_with("settings") || action.starts_with("pages") {
                     let action_ui = action.clone();
                     std::thread::spawn(move || {
                         // 保存/取消要先把后端跑起来（否则 connected=false 直接拒绝保存）
@@ -533,14 +552,19 @@ impl App {
         let colors = self.colors;
         let layout = self.layout();
         let state = self.shared.lock();
-        let pages_text = if state.selected_page.is_empty() {
-            if state.pages.is_empty() {
-                "[待检测] 点击右侧刷新获取浏览器标签页".to_string()
-            } else {
-                state.pages.join(" / ")
-            }
-        } else {
+        // 网页框里显示什么（2026-09-16 起它**可点**，所以文案要引导用户去点）：
+        // - 已选：显示选中的那一页；
+        // - 未选但已检测到 N 个：提示"点此处选择"，而不是把 N 个标题全糊在一起
+        //   （那样一长就被省略号截掉，等于什么都没说）；
+        // - 还没检测：提示先点「检测/刷新网页」。
+        let pages_text = if !state.selected_page.is_empty() {
             state.selected_page.clone()
+        } else if state.pages.is_empty() {
+            "[待检测] 点「检测/刷新网页」获取浏览器标签页".to_string()
+        } else if state.pages.len() == 1 {
+            format!("未选择 —— 点此处选中：{}", state.pages[0])
+        } else {
+            format!("未选择（已检测到 {} 个网页）—— 点此处选择", state.pages.len())
         };
         let state_for_paint = PaintState {
             status_text: state.status_text.clone(),
@@ -624,7 +648,7 @@ impl App {
     }
 
     /// 画 Segoe MDL2 字形（标题栏三键/主题用）。
-    fn draw_segmdl(&mut self, hdc: HDC, glyph: u32, rc: RECT, color: u32) {
+    fn draw_segmdl(&self, hdc: HDC, glyph: u32, rc: RECT, color: u32) {
         // 标题栏按钮高度约 46，glyph 用 10pt 左右
         let size = self.px(11).max(9);
         let face = "Segoe MDL2 Assets";
@@ -693,29 +717,44 @@ impl App {
         );
         x += self.px(80);
 
-        // 网页框（宽度 = 到"刷新按钮"为止）
-        let box_rc = RECT {
-            left: x,
-            top: rc.top + self.px(11),
-            right: self.refresh_rect(rc).left - self.px(10),
-            bottom: rc.bottom - self.px(11),
-        };
-        gdi::fill_round_rect(hdc, box_rc, self.btn_radius(), colors.card_hi);
+        // 网页框（宽度 = 到"刷新按钮"为止）：**可点** ⇒ 打开「当前网页」下拉选择
+        let box_rc = self.page_box_rect(rc);
+        let box_hover = self.hover == Some(Ctl::Pages);
+        gdi::fill_round_rect(
+            hdc,
+            box_rc,
+            self.btn_radius(),
+            if box_hover { colors.btn_hover } else { colors.card_hi },
+        );
         let text_color = if st.pages_text.is_empty() || st.pages_text.starts_with('[') {
             colors.text_muted
         } else {
             colors.text_sub
         };
+        // 右侧留出 ▾ 指示器（点击热区/下拉的视觉线索）
+        let caret_w = self.px(22);
         // ⚠️ 页面标题长度不可控：必须用**带省略号裁剪**的版本，否则长标题会直接
         // 盖到右边「检测/刷新网页」按钮上（用户 2026-09-16 反馈"文字溢出"，见 gdi::text_ellipsis）
         gdi::text_ellipsis(
             hdc,
             &st.pages_text,
-            box_rc.inset(self.px(10), 0),
+            RECT {
+                left: box_rc.left + self.px(10),
+                top: box_rc.top,
+                right: box_rc.right - caret_w,
+                bottom: box_rc.bottom,
+            },
             TextAlign::Left,
             text_color,
             &self.fonts[self.font_ui],
         );
+        let caret_rc = RECT {
+            left: box_rc.right - caret_w,
+            top: box_rc.top,
+            right: box_rc.right - self.px(4),
+            bottom: box_rc.bottom,
+        };
+        self.draw_segmdl(hdc, 0xE70Du32, caret_rc, colors.text_muted); // E70D = ChevronDown
 
         // 「检测/刷新网页」按钮（独立控件，不再是"整行可点"）
         let btn = self.refresh_rect(rc);
@@ -798,6 +837,16 @@ impl App {
     /// 网页框右边界（= 刷新按钮左边留 10px 间距）。绘制与命中共用。
     fn page_box_right(&self, card: RECT) -> i32 {
         self.refresh_rect(card).left - self.px(10)
+    }
+
+    /// 「当前网页」输入框矩形（**绘制与命中共用**）：点它就是打开网页下拉选择。
+    fn page_box_rect(&self, card: RECT) -> RECT {
+        RECT {
+            left: card.left + self.px(16) + self.px(80),
+            top: card.top + self.px(11),
+            right: self.page_box_right(card),
+            bottom: card.bottom - self.px(11),
+        }
     }
 
     /// 倍速胶囊矩形（**绘制与命中共用**）。它占最右侧靠内的位置。
@@ -1141,16 +1190,19 @@ impl App {
             }
             bx += width + gap;
         }
-        // 网页选择行：只有「检测/刷新网页」按钮与「倍速」各自的可点区域响应，
-        // 标签与网页框本身不做事。
-        // ⚠️ 之前是"整行都返回 Refresh"，点标签/点网页框都会触发刷新，很费解；
-        // 而且那时"检测/刷新网页"根本没有可见按钮（用户反馈被遮挡，见 ERROR.md E40）。
+        // 网页选择行：网页框（打开下拉选择）、「检测/刷新网页」按钮、倍速胶囊
+        // 各自的可点区域响应；标签本身不做事。
+        // ⚠️ 之前是"整行都返回 Refresh"（点标签也触发刷新，很费解，见 ERROR.md E40）；
+        // 现在网页框有明确动作（下拉选页）并画了 ▾ 指示器。
         if y >= layout.page.top && y < layout.page.bottom {
             if self.speed_rect(layout.page).contains(x, y) {
                 return Some(Ctl::Speed);
             }
             if self.refresh_rect(layout.page).contains(x, y) {
                 return Some(Ctl::Refresh);
+            }
+            if self.page_box_rect(layout.page).contains(x, y) {
+                return Some(Ctl::Pages);
             }
             return None;
         }
@@ -1524,6 +1576,13 @@ impl App {
             Ctl::Speed => {
                 cycle_video_speed(self.shared.clone());
             }
+            Ctl::Pages => {
+                // 打开「当前网页」下拉（再点一次网页框 = 收起，见 pagepicker::show）
+                // ⚠️ 变量别叫 `box`：它是 Rust 保留字（本轮在 settings.rs 已经踩过一次）
+                let page_rc = self.layout().page;
+                let box_rc = self.page_box_rect(page_rc);
+                crate::pagepicker::show(hwnd, self.shared.clone(), self.theme, box_rc, None, false);
+            }
             Ctl::Diagnose => {
                 spawn_action(shared, "diagnose", None);
             }
@@ -1630,12 +1689,24 @@ impl App {
                 0
             }
             WM_APP_ACTION => {
-                // 脚本化打开「答题设置」（验证通道；必须由 UI 线程建窗口）
+                // 脚本化动作（验证通道；**必须由 UI 线程建窗口**）
                 let action = self.scripted_action.clone();
                 let hook = if action.is_empty() { "settings".to_string() } else { action };
                 let theme = self.theme;
-                crate::trace::trace(&format!("ui: opening settings dialog via hook '{}'", hook));
-                crate::settings::show_with_hook(self.hwnd, self.shared.clone(), theme, &hook);
+                if hook.starts_with("pages") {
+                    // 「当前网页」下拉：pages = 只打开；pages_select = 打开并自动选第 2 项
+                    let page_rc = self.layout().page;
+                    let box_rc = self.page_box_rect(page_rc);
+                    let auto = if hook == "pages_select" { Some(1) } else { None };
+                    crate::trace::trace(&format!(
+                        "ui: opening page picker via hook '{}' (auto_pick={:?})",
+                        hook, auto
+                    ));
+                    crate::pagepicker::show(self.hwnd, self.shared.clone(), theme, box_rc, auto, true);
+                } else {
+                    crate::trace::trace(&format!("ui: opening settings dialog via hook '{}'", hook));
+                    crate::settings::show_with_hook(self.hwnd, self.shared.clone(), theme, &hook);
+                }
                 0
             }
             WM_CLOSE => {

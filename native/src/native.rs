@@ -41,6 +41,9 @@ pub const WS_MAXIMIZEBOX: u32 = 0x0001_0000;
 pub const WS_VISIBLE: u32 = 0x1000_0000;
 pub const WS_CLIPCHILDREN: u32 = 0x0200_0000;
 pub const WS_EX_APPWINDOW: u32 = 0x0004_0000;
+/// 不进任务栏、不进 Alt+Tab（下拉/工具窗用；learn-helper 的网页下拉就是它）。
+pub const WS_EX_TOOLWINDOW: u32 = 0x0000_0080;
+pub const WS_EX_TOPMOST: u32 = 0x0000_0008;
 pub const WS_EX_DLGMODALFRAME: u32 = 0x0000_0001;
 
 pub const CW_USEDEFAULT: i32 = 0x8000_0000u32 as i32;
@@ -73,6 +76,8 @@ pub const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 pub const WM_GETMINMAXINFO: u32 = 0x0024;
 pub const WM_DPICHANGED: u32 = 0x02E0;
 pub const WM_ACTIVATE: u32 = 0x0006;
+/// `WM_ACTIVATE` 的 wParam 低 16 位：窗口失活（= 用户点了别处）。
+pub const WA_INACTIVE: u32 = 0;
 pub const WM_SYSCOMMAND: u32 = 0x0112;
 pub const WM_APP: u32 = 0x8000;
 /// 后端线程通知 UI 重绘的自定义消息。

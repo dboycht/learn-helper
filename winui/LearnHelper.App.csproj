@@ -12,11 +12,11 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <!-- Single source of truth for the UI version, surfaced in the title bar.
-         2.1.1 = 界面重构为原生 Rust Win32（native/）；本 WinUI 版作为**备选退路**保留
+         2.1.2 = 「当前网页」可下拉选择（原生 UI）；本 WinUI 版作为**备选退路**保留
          （memory/02 §5：被否掉的技术线不要立刻删，直到新线稳定）。
          Keep in step with backend/learn_helper/config.py's APP_VERSION at release time. -->
-    <Version>2.1.1</Version>
-    <InformationalVersion>2.1.1</InformationalVersion>
+    <Version>2.1.2</Version>
+    <InformationalVersion>2.1.2</InformationalVersion>
     <!-- memory/03 section 1: unpackaged + self-contained, no MSIX, no certificate. -->
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>

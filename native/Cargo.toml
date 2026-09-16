@@ -1,6 +1,6 @@
 [package]
 name = "learn-helper-native"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2021"
 description = "学习助理 · 原生 Win32 界面（零依赖、单 exe）"
 

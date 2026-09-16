@@ -149,6 +149,11 @@ def test_process_lifecycle():
                              json={'action': 'select_page', 'params': {'page': '测试学习页'}},
                              timeout=10).json()
         check('A6 select_page 生效', body.get('selected_page') == '测试学习页', str(body)[:150])
+        # A6b：选择的网页要**落盘记住**（下次启动 / 后端重启后仍然选中它）
+        from learn_helper.config import load_config as _load_cfg
+        check('A6b select_page 写入 config.last_page_title',
+              _load_cfg().get('last_page_title') == '测试学习页',
+              f"last_page_title={_load_cfg().get('last_page_title')!r}")
 
         r = http_post(f'{base}/api/control', json={'action': 'refresh_pages'}, timeout=30)
         body = r.json()
@@ -297,9 +302,20 @@ def read_pipe_events(pipe_name, want=3, timeout=8):
 def test_engine_unit():
     print('\n=== B. 引擎级 ===')
     from learn_helper import core_mock
+    from learn_helper.config import update_config
     from learn_helper.engine import SolverEngine
     from learn_helper.ipc import Hub
 
+    # B0：新会话要**恢复** config 里记住的网页（配合 select_page 的落盘，
+    #     否则用户每次重开界面都得重选一次）
+    update_config({'last_page_title': '记住的学习页'})
+    hub_restored = Hub()
+    check('B0 启动时恢复 config.last_page_title',
+          hub_restored.selected_title == '记住的学习页',
+          f'selected_title={hub_restored.selected_title!r}')
+
+    # 后面的 B 用例都在"没有记住任何网页"的前提下跑，避免被 B0 的写入影响
+    update_config({'last_page_title': ''})
     hub = Hub()
     eng = SolverEngine(hub)
     hub.attach(eng, None)

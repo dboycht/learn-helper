@@ -50,6 +50,15 @@ def find_free_port():
         return int(s.getsockname()[1])
 
 
+def _remembered_page_title():
+    """读 config.json 里记住的网页标题（缺失/异常一律返回空串）。"""
+    try:
+        from .config import load_config
+        return str(load_config().get('last_page_title') or '').strip()
+    except Exception:
+        return ''
+
+
 # ============================================================================
 # Hub：状态 + 事件推送总线
 # ============================================================================
@@ -70,7 +79,9 @@ class Hub:
         self.lock = threading.RLock()
         self.pages = []
         self.pages_at = 0.0
-        self.selected_title = ''
+        # 启动时恢复"上次选中的网页"（config.json: last_page_title）——
+        # `select_page` 会写它，界面重启后不必重选（2026-09-16）。
+        self.selected_title = _remembered_page_title()
         self._last_saved_url = None
         self.engine = None
         self.pipe = None
@@ -599,6 +610,14 @@ def _make_handler(hub, on_shutdown):
                 page = str(params.get('page') or '').strip()
                 with hub.lock:
                     hub.selected_title = page
+                # **选了就记住**：写进 config.json 的 last_page_title，
+                # 这样后端重启（界面关掉再开）后仍然选中同一页 —— 否则每次都要重选。
+                if page:
+                    try:
+                        from .config import update_config
+                        update_config({'last_page_title': page})
+                    except Exception as e:
+                        LOGGER.warning(f'[选择网页] 记忆失败: {e}')
                 ok, msg = True, f'已选择网页：{page}'
             elif action == 'refresh_pages':
                 res = engine.list_pages()
