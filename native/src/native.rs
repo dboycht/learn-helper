@@ -154,6 +154,8 @@ pub const COINIT_APARTMENTTHREADED: u32 = 0x2;
 pub const IDC_ARROW: usize = 32512;
 pub const IDC_SIZENS: usize = 32645;
 pub const IDC_IBEAM: usize = 32513;
+/// 手型光标（悬停在链接上）
+pub const IDC_HAND: usize = 32649;
 
 // 焦点 / 输入光标 / 按钮行高（自绘对话框用）
 pub const SPI_GETKEYBOARDDELAY: u32 = 0x0016;
@@ -502,6 +504,21 @@ extern "system" {
 extern "system" {
     pub fn SetWindowTheme(hwnd: HWND, sub: *const u16, list: *const u16) -> i32;
 }
+
+// 打开外部链接（「关于」里的仓库地址）。只用来起系统默认浏览器，不做别的。
+#[link(name = "shell32")]
+extern "system" {
+    pub fn ShellExecuteW(
+        hwnd: HWND,
+        op: *const u16,
+        file: *const u16,
+        params: *const u16,
+        dir: *const u16,
+        show: i32,
+    ) -> *mut c_void;
+}
+
+pub const SW_SHOWNORMAL: i32 = 1;
 
 // RtlGetVersion：拿真实 build 号（GetVersionEx 会被应用兼容性 shim 骗）
 #[repr(C)]

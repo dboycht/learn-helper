@@ -75,6 +75,12 @@ function Diag-Snapshot([string]$dest) {
     else { Set-Content -Path $dest -Value '' -Encoding ASCII }
 }
 
+# NOTE: delete the diag BEFORE launching a case: the exe truncates it only once it starts,
+# so an early snapshot can otherwise "find" the PREVIOUS run's lines (stale evidence).
+function Reset-Diag() {
+    Remove-Item $script:diag -Force -ErrorAction SilentlyContinue
+}
+
 # Wait until a trace line matching $pattern shows up, then return that run's lines.
 # Why: "popup window exists" (polled via FindWindow) can be true a few milliseconds BEFORE
 # the matching trace line is written -> snapshotting at that instant makes the check flaky.
@@ -114,6 +120,7 @@ function Invoke-Ui([string]$dir, [string]$action, [int]$waitSeconds) {
     $env:LH_BASE_DIR = $dir
     $env:LH_UI_ACTION = $action
     $env:LH_PROBE_PAGES = $SamplePages
+    Reset-Diag
     $p = Start-Process -FilePath $Exe -WorkingDirectory $dir -PassThru
     $deadline = (Get-Date).AddSeconds($waitSeconds)
     while ((Get-Date) -lt $deadline) {
@@ -214,6 +221,7 @@ if (-not (Wait-NoInstance)) { Write-Host "  WARNING: previous instance still run
 $env:LH_BASE_DIR = $d3
 $env:LH_UI_ACTION = 'pages'
 $env:LH_PROBE_PAGES = ''
+Reset-Diag
 $p3 = Start-Process -FilePath $Exe -WorkingDirectory $d3 -PassThru
 
 # Poll for the popup: the app opens it ~3.5s after start, and (in hook mode) closes the

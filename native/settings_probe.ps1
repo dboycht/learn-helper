@@ -89,6 +89,12 @@ function Diag-Snapshot([string]$dest) {
     }
 }
 
+# NOTE: delete the diag BEFORE launching a case: the exe truncates it only once it starts,
+# so an early snapshot can otherwise "find" the PREVIOUS run's lines (stale evidence).
+function Reset-Diag() {
+    Remove-Item $script:diag -Force -ErrorAction SilentlyContinue
+}
+
 # Runs one UI case and returns the diag log lines produced by THAT case.
 # (The exe truncates native-diag.log on every start, so a per-case copy is the
 # only reliable way to attribute lines to a run.)
@@ -113,6 +119,7 @@ function Invoke-Ui([string]$dir, [string]$action, [int]$waitSeconds) {
     }
     $env:LH_BASE_DIR = $dir
     $env:LH_UI_ACTION = $action
+    Reset-Diag
     $p = Start-Process -FilePath $Exe -WorkingDirectory $dir -PassThru
     $deadline = (Get-Date).AddSeconds($waitSeconds)
     while ((Get-Date) -lt $deadline) {

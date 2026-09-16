@@ -363,8 +363,11 @@ impl App {
                 let shared = app.shared.clone();
                 let hwnd_raw = hwnd as isize;
                 crate::trace::trace(&format!("ui: scripted action queued: {}", action));
-                // 「答题设置」/「网页下拉」类动作必须由 UI 线程建窗口：PostMessage 回主窗口
-                if action.starts_with("settings") || action.starts_with("pages") {
+                // 「答题设置」/「网页下拉」/「关于」类动作必须由 UI 线程建窗口：PostMessage 回主窗口
+                if action.starts_with("settings")
+                    || action.starts_with("pages")
+                    || action.starts_with("about")
+                {
                     let action_ui = action.clone();
                     std::thread::spawn(move || {
                         // 保存/取消要先把后端跑起来（否则 connected=false 直接拒绝保存）
@@ -1720,6 +1723,15 @@ impl App {
                         hook, auto
                     ));
                     crate::pagepicker::show(self.hwnd, self.shared.clone(), theme, box_rc, auto, true);
+                } else if hook.starts_with("about") {
+                    // 「关于」：about = 只打开；about_link = 打开并自动点一次仓库链接
+                    // （配合 LH_ABOUT_NO_OPEN=1 ⇒ 只记日志，不会弹出用户的浏览器）
+                    crate::trace::trace(&format!("ui: opening about dialog via hook '{}'", hook));
+                    if hook == "about_link" {
+                        crate::about::show_with_hook(self.hwnd, self.shared.clone(), theme);
+                    } else {
+                        crate::about::show(self.hwnd, self.shared.clone(), theme);
+                    }
                 } else {
                     crate::trace::trace(&format!("ui: opening settings dialog via hook '{}'", hook));
                     crate::settings::show_with_hook(self.hwnd, self.shared.clone(), theme, &hook);

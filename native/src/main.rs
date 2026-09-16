@@ -85,6 +85,26 @@ fn main() {
         trace::trace("native: 窗口已创建");
         ui::App::bootstrap(hwnd, &mut *app_ptr);
 
+        // 「关于」弹窗渲染探针：不建窗口、不碰屏幕（尺寸由内容行数算出）。
+        // 用法：--render-probe-about [宽 高 输出路径 DPI]（宽/高会被内容尺寸覆盖）
+        if std::env::args().any(|a| a == "--render-probe-about") {
+            let args: Vec<String> = std::env::args().collect();
+            let dpi = args
+                .iter()
+                .position(|a| a == "--render-probe-about")
+                .and_then(|i| args.get(i + 4))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(96u32);
+            let out = args
+                .iter()
+                .position(|a| a == "--render-probe-about")
+                .and_then(|i| args.get(i + 3))
+                .cloned()
+                .unwrap_or_else(|| "about-render.bmp".to_string());
+            about::render_probe(&out, 0, 0, dpi);
+            std::process::exit(0);
+        }
+
         // 对话框渲染探针：不建窗口、不碰屏幕，直接把「答题设置」画进 BMP。
         // 用法：--render-probe-settings [宽 高 输出路径 DPI]
         // （高 DPI 时请把"宽 高"按物理尺寸给：770×630 逻辑 @144 DPI ⇒ 1155×945）

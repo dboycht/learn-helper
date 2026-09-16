@@ -3,6 +3,11 @@ name = "learn-helper-native"
 version = "2.1.2"
 edition = "2021"
 description = "学习助理 · 原生 Win32 界面（零依赖、单 exe）"
+# ⭐ 元数据单一来源：作者 / 仓库 / 许可证只写在这里，
+# 「关于」弹窗直接读 `env!("CARGO_PKG_AUTHORS")` 等编译期常量（与版本号同一套路）。
+authors = ["Mizuki"]
+repository = "https://github.com/dboycht/learn-helper"
+license = "MIT"
 
 # 目标：体积最小、零运行时依赖。
 # • 不用 windows-rs：直接声明需要的 Win32/WinHTTP 函数（FFI），省掉整包元数据与
