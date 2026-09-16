@@ -146,7 +146,9 @@ impl AboutState {
                 right: client.right - self.px(24),
                 bottom: y + line_h,
             };
-            gdi::text_in(
+            // ⚠️ 右侧是状态串/路径/地址 —— 长度不可控 ⇒ 必须用省略号裁剪版，
+            // 否则长路径会画到窗口外面去（gdi::text_in 不做裁剪）
+            gdi::text_ellipsis(
                 hdc,
                 &value,
                 value_rc,

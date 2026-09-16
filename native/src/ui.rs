@@ -490,6 +490,39 @@ impl App {
     pub fn render_to(&mut self, hdc: HDC, w: i32, h: i32) {
         self.w = w;
         self.h = h;
+        // 探针可选注入：给个**超长页面标题**，用来验证"文字不会溢到按钮上"（省略号裁剪）。
+        // 默认不注入，正常渲染/正常运行都不受影响。
+        if let Ok(long) = std::env::var("LH_PROBE_LONG_TITLE") {
+            if !long.is_empty() {
+                let mut st = self.shared.lock();
+                st.pages = vec![long.clone()];
+                st.status_text = long;
+            }
+        }
+        // 🔎 布局体检（只在渲染探针里跑）：把"网页选择行"各控件的**实测矩形**和
+        // 按钮文字的**实测宽度**落盘。这样"文字有没有溢出按钮"是**用数字判断**，
+        // 不用靠肉眼看图（本项目的规矩：先取事实，再读代码，见 ERROR.md E26/E39）。
+        let l = self.layout();
+        let btn = self.refresh_rect(l.page);
+        let speed = self.speed_rect(l.page);
+        let text_w = self.measure_label("检测/刷新网页", self.font_ui_sm);
+        let page_box_w = l.page.right - self.px(16) - (self.px(16) + self.px(80));
+        crate::trace::trace(&format!(
+            "probe-layout: client={}x{} page_box_w={} (placeholder_text={}) refresh=[{},{}) w={} text={} pad_lr={} speed=[{},{}) answer_w={} min_w={}",
+            w,
+            h,
+            page_box_w,
+            self.measure_label("[待检测] 点击右侧刷新获取浏览器标签页", self.font_ui),
+            btn.left,
+            btn.right,
+            btn.width(),
+            text_w,
+            ((btn.width() - text_w) / 2).max(0),
+            speed.left,
+            speed.right,
+            self.answer_mode_width(),
+            self.min_content_width(),
+        ));
         self.paint(hdc);
     }
 
@@ -616,8 +649,9 @@ impl App {
         x = pill_rc.right + 12;
 
         // 连接状态（等宽字体，便于和地址对齐）
+        // ⚠️ 状态串里带地址与版本号、长度不可控 ⇒ 用省略号裁剪版，别盖到右边"设备指纹"上
         let status_text = st.status_text.clone();
-        gdi::text_in(
+        gdi::text_ellipsis(
             hdc,
             &status_text,
             RECT { left: x, top: rc.top, right: rc.right - self.px(300), bottom: rc.bottom },
@@ -628,7 +662,7 @@ impl App {
 
         // 右侧：设备指纹
         if !st.device.is_empty() {
-            gdi::text_in(
+            gdi::text_ellipsis(
                 hdc,
                 &format!("设备 {}", st.device),
                 RECT { left: rc.right - self.px(300), top: rc.top, right: rc.right - m, bottom: rc.bottom },
@@ -672,7 +706,16 @@ impl App {
         } else {
             colors.text_sub
         };
-        gdi::text_in(hdc, &st.pages_text, box_rc.inset(self.px(10), 0), TextAlign::Left, text_color, &self.fonts[self.font_ui]);
+        // ⚠️ 页面标题长度不可控：必须用**带省略号裁剪**的版本，否则长标题会直接
+        // 盖到右边「检测/刷新网页」按钮上（用户 2026-09-16 反馈"文字溢出"，见 gdi::text_ellipsis）
+        gdi::text_ellipsis(
+            hdc,
+            &st.pages_text,
+            box_rc.inset(self.px(10), 0),
+            TextAlign::Left,
+            text_color,
+            &self.fonts[self.font_ui],
+        );
 
         // 「检测/刷新网页」按钮（独立控件，不再是"整行可点"）
         let btn = self.refresh_rect(rc);
@@ -738,6 +781,20 @@ impl App {
         title + status + page + kpi + buttons + log_min + gap * 4 + m
     }
 
+    /// 量一段文本的像素宽度（临时取一次窗口 DC，量完立刻释放）。
+    ///
+    /// ⚠️ 这是"按钮宽度按文本实测"的**唯一入口**：测量与绘制**必须用同一个字体槽**，
+    /// 否则会出现"量出来够宽、画出来溢出"这种最难查的不一致。
+    fn measure_label(&self, text: &str, font: usize) -> i32 {
+        let hdc = unsafe { GetDC(self.hwnd) };
+        if hdc.is_null() {
+            return 0;
+        }
+        let w = gdi::measure_text(hdc, text, &self.fonts[font]).cx;
+        unsafe { ReleaseDC(self.hwnd, hdc) };
+        w
+    }
+
     /// 网页框右边界（= 刷新按钮左边留 10px 间距）。绘制与命中共用。
     fn page_box_right(&self, card: RECT) -> i32 {
         self.refresh_rect(card).left - self.px(10)
@@ -768,49 +825,35 @@ impl App {
     }
 
     /// 刷新按钮宽度（按文本实测 + 内边距，带下限）。
+    ///
     /// 用 `ui_sm`（13pt）而不是 `ui_b`：中文标签在 14pt 半粗下要 ~217px，
     /// 按钮会宽到挤掉网页框；13pt 足够清晰又省空间。
+    ///
+    /// ⚠️ 历史（别再改回去）：
+    /// - 2026-09-14：宽度是手写死值 `px(92)` ⇒ 文字被截断（E41），改成按文本实测；
+    /// - 2026-09-15：用户反馈"不够显示" ⇒ 再 +`px(10)`；
+    /// - 2026-09-16：用户反馈**仍不够宽、文字溢出** ⇒ 内边距提到左右各 `px(24)`、
+    ///   下限提到 `px(220)`，并加一条硬保证（宽度 ≥ 文字 + `px(40)`）。
+    ///   判据：`--render-probe` 会把按钮宽/文字宽/左右内边距落盘（`probe-layout:` 行），
+    ///   **内边距必须 ≥ px(24)，看数字判断，别靠肉眼**（E26）。
     fn refresh_button_width(&self) -> i32 {
-        let hdc = unsafe { GetDC(self.hwnd) };
-        let measured = if hdc.is_null() {
-            0
-        } else {
-            let w = gdi::measure_text(hdc, "检测/刷新网页", &self.fonts[self.font_ui_sm]).cx;
-            unsafe { ReleaseDC(self.hwnd, hdc) };
-            w
-        };
-        // 文本 + 左右各 px(16) 内边距；下限 px(160)
-        // 🔧 2026-09-15 用户反馈"文字不够显示" ⇒ 在测得宽度上**再 +10px**（用户指定）。
-        // 注意：不要把正文排版改回 `ui_b`（半粗 14pt）—— 那个字号下这 8 个汉字要
-        // ~217px，按钮会宽到把网页框挤没（见本函数注释与 ERROR.md E41）。
-        let base = if measured > 0 { measured } else { self.px(140) };
-        (base + self.px(32)).max(self.px(160)) + self.px(10)
+        let measured = self.measure_label("检测/刷新网页", self.font_ui_sm);
+        let text = if measured > 0 { measured } else { self.px(150) };
+        // 文字 + 左右各 px(24) 内边距；下限 px(220)。
+        // 并且**显式保证**：宽度至少 = 文字 + px(40)（防止下限/测量异常时反过来夹住文字）。
+        (text + self.px(48)).max(self.px(220)).max(text + self.px(40))
     }
 
     /// 「答题方式」占位宽度（按文本实测 + 间距）。
     fn answer_mode_width(&self) -> i32 {
-        let hdc = unsafe { GetDC(self.hwnd) };
-        let measured = if hdc.is_null() {
-            0
-        } else {
-            let w = gdi::measure_text(hdc, "答题方式：内部答题 API", &self.fonts[self.font_ui_sm]).cx;
-            unsafe { ReleaseDC(self.hwnd, hdc) };
-            w
-        };
+        let measured = self.measure_label("答题方式：内部答题 API", self.font_ui_sm);
         let base = if measured > 0 { measured } else { self.px(150) };
         base + self.px(24)
     }
 
     /// 倍速胶囊宽度（按 "倍速 2.0x" 实测）。
     fn speed_width(&self) -> i32 {
-        let hdc = unsafe { GetDC(self.hwnd) };
-        let measured = if hdc.is_null() {
-            0
-        } else {
-            let w = gdi::measure_text(hdc, "倍速 2.0x", &self.fonts[self.font_ui_sm]).cx;
-            unsafe { ReleaseDC(self.hwnd, hdc) };
-            w
-        };
+        let measured = self.measure_label("倍速 2.0x", self.font_ui_sm);
         let base = if measured > 0 { measured } else { self.px(80) };
         (base + self.px(28)).max(self.px(96))
     }
@@ -821,23 +864,12 @@ impl App {
     /// 这样"窗口缩到最小"和"布局需要的宽度"永远一致 —— 否则缩到最小就会错位
     /// （用户反馈，见 ERROR.md E41）。
     pub fn min_content_width(&self) -> i32 {
-        let m = self.px(16);
-        let label = self.px(70);
-        let label_gap = self.px(80);
-        let gap = self.px(10);
-        let page_box_min = self.px(220);
-        // ⚠️ 必须用**实测**宽度（refresh/speed/answer 三个函数本身就是按文本量的）。
-        // 之前这里写的是假定常量，比实测小 ⇒ 下限算低 ⇒ 缩到最小就压在一起（E41）。
-        let total = m
-            + label
-            + label_gap
-            + page_box_min
-            + gap
+        // ⚠️ "与文本无关的固定部分"必须与建窗前的 `min_window_width()` 共用同一份，
+        // 否则窗口可能一开出来就**小于自己的最小宽度**（E41 同类坑）。
+        let total = page_row_fixed_width(self.dpi)
             + self.refresh_button_width()
-            + gap
             + self.speed_width()
-            + self.answer_mode_width()
-            + m;
+            + self.answer_mode_width();
         // 再留一点余量，避免"刚好相等"时四舍五入后仍重叠
         total.max(self.px(1100)) + self.px(24)
     }
@@ -1781,20 +1813,21 @@ fn px_at(dpi: u32, logical: i32) -> i32 {
     (logical * (dpi.max(96) as i32) * 100 / 96 + 50) / 100
 }
 
+/// 网页选择行里"与文本无关"的固定宽度：两侧外边距 + 标签 + 标签间距 + 网页框下限 + 两个间距。
+///
+/// ⚠️ **运行时 `App::min_content_width()` 与建窗前 `min_window_width()` 必须共用这一份**，
+/// 否则两边漂移，窗口开出来就可能小于自己的最小宽度（E41 同类坑，2026-09-16 对齐）。
+fn page_row_fixed_width(dpi: u32) -> i32 {
+    let p = |v: i32| px_at(dpi, v);
+    p(16) + p(70) + p(80) + p(220) + p(10) + p(10) + p(16)
+}
+
 /// 创建窗口前估算"客户区最小宽度"（此时还没有窗口，量不了文本，用保守常量）。
-/// 与 `App::min_content_width()` 保持同一量级，避免"开出来就小于下限"（E41）。
+/// 与 `App::min_content_width()` 共用 `page_row_fixed_width()`，元素常量取各实测函数的上限。
 fn min_window_width(dpi: u32) -> i32 {
-    let m = px_at(dpi, 16);
-    let label = px_at(dpi, 70);
-    let label_gap = px_at(dpi, 80);
-    let gap = px_at(dpi, 10);
-    let page_min = px_at(dpi, 300);
-    let refresh = px_at(dpi, 170); // = refresh_button_width() 的下限（px(160) 下限 + 用户指定加宽 10）
-    let speed = px_at(dpi, 104);
-    let answer = px_at(dpi, 220);
-    (px_at(dpi, 1100)).max(
-        m + label + label_gap + page_min + gap + refresh + gap + speed + answer + m,
-    )
+    let p = |v: i32| px_at(dpi, v);
+    let total = page_row_fixed_width(dpi) + p(220) + p(108) + p(240);
+    (p(1100)).max(total) + p(24)
 }
 
 /// 创建窗口前估算"客户区最小高度"。

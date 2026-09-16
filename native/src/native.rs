@@ -432,6 +432,7 @@ extern "system" {
     pub fn SetTextColor(hdc: HDC, color: u32) -> u32;
     pub fn SetBkColor(hdc: HDC, color: u32) -> u32;
     pub fn TextOutW(hdc: HDC, x: i32, y: i32, s: *const u16, len: i32) -> BOOL;
+    pub fn DrawTextW(hdc: HDC, s: *const u16, len: i32, rc: *mut RECT, format: u32) -> i32;
     pub fn Rectangle(hdc: HDC, l: i32, t: i32, r: i32, b: i32) -> BOOL;
     pub fn RoundRect(hdc: HDC, l: i32, t: i32, r: i32, b: i32, w: i32, h: i32) -> BOOL;
     pub fn Ellipse(hdc: HDC, l: i32, t: i32, r: i32, b: i32) -> BOOL;

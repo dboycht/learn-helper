@@ -227,6 +227,41 @@ pub fn measure_text(hdc: HDC, s: &str, font: &Font) -> SIZE {
     size
 }
 
+/// 在给定矩形内画单行文本，**超宽就用省略号截断**（绝不溢出到相邻控件上）。
+///
+/// 与 `text_in` 的分工（重要）：
+/// - `text_in`：按对齐方式落笔，**不做任何裁剪** —— 只适合**长度可控**的文案
+///   （按钮标签、固定标题）；
+/// - 本函数：用 `DrawTextW` + `DT_END_ELLIPSIS`，**长度不可控**的内容一律用它
+///   （页面标题、状态串、文件路径）。
+///
+/// 实测教训（2026-09-16）：网页框里的**页面标题**是用 `text_in` 画的，标题一长
+/// 就直接盖到右边「检测/刷新网页」按钮上 —— 用户看到的是"按钮不够宽、文字溢出了"。
+/// 把按钮加宽只是缓解；**根治是让文字不会溢出去**。
+pub fn text_ellipsis(hdc: HDC, s: &str, rc: RECT, align: TextAlign, color: u32, font: &Font) {
+    if s.is_empty() || !font.is_valid() || rc.right <= rc.left {
+        return;
+    }
+    let w = wide(s);
+    let mut r = rc;
+    // ⚠️ DT_NOPREFIX 不能省：状态/网址里带 `&` 时会被当成助记符前缀吞掉一个字符
+    let format = DT_SINGLELINE
+        | DT_VCENTER
+        | DT_NOPREFIX
+        | DT_END_ELLIPSIS
+        | match align {
+            TextAlign::Left => DT_LEFT,
+            TextAlign::Center => DT_CENTER,
+            TextAlign::Right => DT_RIGHT,
+        };
+    unsafe {
+        let _f = Selection::select(hdc, font.handle as HGDIOBJ);
+        SetBkMode(hdc, TRANSPARENT);
+        SetTextColor(hdc, color);
+        DrawTextW(hdc, w.as_ptr(), (w.len() - 1) as i32, &mut r, format);
+    }
+}
+
 /// 用圆角矩形近似画一个"胶囊"标签（用于公告/状态胶囊）。
 pub fn pill(hdc: HDC, rc: RECT, fill: u32, label: &str, fg: u32, font: &Font) {
     fill_round_rect(hdc, rc, rc.height() / 2, fill);
