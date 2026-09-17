@@ -186,8 +186,29 @@ pub struct App {
     log_scroll: usize,
     /// true = 自动跟随最新日志（用户往上翻后被置为 false）。
     log_follow: bool,
-    log_rows: usize,
     max_log_chars: usize,
+    // ---- 日志面板滚动条（2.1.3）----
+    // ⚠️ 这些几何量都是 `paint_log()` 里算出来后**存下来**的：鼠标消息拿不到 hdc，
+    //    必须做到"绘制与命中共用同一份矩形"（本项目铁律，见 ERROR.md E40/E42）。
+    /// 上一次绘制时日志区（含滚动条）的矩形
+    log_rc: RECT,
+    /// 可见行数（行高决定，随 DPI / 窗口高度变）
+    log_visible: usize,
+    /// 日志总行数
+    log_total: usize,
+    /// 首行下标的最大值（= 总行数 − 可见行数），滚动条换算用
+    log_max_first: usize,
+    /// 滚动条"轨道"矩形（无溢出时为全零）
+    log_track: RECT,
+    /// 滚动条滑块是否被鼠标按住（拖动中）
+    log_bar_drag: bool,
+    /// 拖动时鼠标相对滑块顶端的偏移（避免"一按滑块就跳"）
+    log_bar_grab: i32,
+    /// 滑块按下时"鼠标 y → 滚动位置"换算所需的锚点
+    log_bar_anchor_y: i32,
+    log_bar_anchor_first: usize,
+    /// 鼠标是否停在滚动条上（高亮 + 滚轮放行）
+    hover_log_bar: bool,
     hover: Option<Ctl>,
     pressed: Option<Ctl>,
     dragging: bool,
@@ -207,6 +228,12 @@ pub struct App {
     last_click_pt: POINT,
     /// `LH_UI_ACTION` 的值（仅验证用；settings* 类动作需要 UI 线程建对话框）
     scripted_action: String,
+    /// `LH_PROBE_HOVER_BAR` 的值（仅验证用，见 `render_to`）：
+    /// `Some(true)` = 强制认为鼠标停在日志滚动条上，`Some(false)` = 强制认为不在。
+    /// **正常运行时是 `None`**，行为与之前完全一致。
+    /// 为什么要这个东西：探针靠 PostMessage 驱动，而真机光标在用户手里、OS 会持续投递
+    /// "真实位置"的 WM_MOUSEMOVE 把悬停状态覆盖掉 ⇒ 想稳定验证"指针在滚动条上"就必须能钉住它。
+    probe_hover_bar: Option<bool>,
 }
 
 impl App {
@@ -229,8 +256,17 @@ impl App {
             h: 720,
             log_scroll: 0,
             log_follow: true,
-            log_rows: 0,
             max_log_chars: 60_000,
+            log_rc: RECT::default(),
+            log_visible: 0,
+            log_total: 0,
+            log_max_first: 0,
+            log_track: RECT::default(),
+            log_bar_drag: false,
+            log_bar_grab: 0,
+            log_bar_anchor_y: 0,
+            log_bar_anchor_first: 0,
+            hover_log_bar: false,
             hover: None,
             pressed: None,
             dragging: false,
@@ -244,6 +280,11 @@ impl App {
             last_click_ms: 0,
             last_click_pt: POINT { x: 0, y: 0 },
             scripted_action: std::env::var("LH_UI_ACTION").unwrap_or_default().trim().to_string(),
+            probe_hover_bar: match std::env::var("LH_PROBE_HOVER_BAR").as_deref() {
+                Ok("1") | Ok("true") => Some(true),
+                Ok("0") | Ok("false") => Some(false),
+                _ => None,
+            },
         };
         app.init_fonts();
         app
@@ -302,6 +343,29 @@ impl App {
             "ui: bootstrap plain solid ui, dpi={}",
             app.dpi
         ));
+        // 客户区实测尺寸落盘：**排障必需**。
+        // 曾经踩到"渲染探针按 1623x960 画出来的滚动条位置，在真实窗口里根本不存在"——
+        // 原因是窗口客户区实际只有 1124x640（物理像素），而 `self.w/self.h` 记的是
+        // 建窗时按 DPI 算出来的逻辑值。凡是"探针按坐标点击"的东西，都必须先核对
+        // 这两个数字是不是同一个坐标系（Linux/Windows 的 DPI 虚拟化经典坑）。
+        unsafe {
+            let mut cr = RECT::default();
+            GetClientRect(hwnd, &mut cr);
+            let mut wr = RECT::default();
+            GetWindowRect(hwnd, &mut wr);
+            crate::trace::trace(&format!(
+                "ui: geometry self={}x{} client={}x{} window={}x{} at {},{} dpi={}",
+                app.w,
+                app.h,
+                cr.width(),
+                cr.height(),
+                wr.width(),
+                wr.height(),
+                wr.left,
+                wr.top,
+                app.dpi
+            ));
+        }
         {
             let mut st = app.shared.lock();
             st.push_log(&format!(
@@ -325,6 +389,25 @@ impl App {
                 st.push_log(&format!("[native] (验证) 注入样例网页 {} 个", items.len()));
                 drop(st);
                 crate::trace::trace(&format!("ui: LH_PROBE_PAGES injected {} item(s)", items.len()));
+            }
+        }
+
+        // 验证钩子：注入**样例日志行**（`|` 分隔），让"日志面板滚动条"能在没有真实刷课
+        // 任务的情况下被端到端验证（见 native\logscroll_probe.ps1）。
+        // 正常运行时不设置这个变量，一条也不会注入。
+        if let Ok(list) = std::env::var("LH_PROBE_LOGS") {
+            let items: Vec<String> = list
+                .split('|')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !items.is_empty() {
+                let mut st = app.shared.lock();
+                for (i, line) in items.iter().enumerate() {
+                    st.push_log(&format!("[验证行 {:04}] {}", i + 1, line));
+                }
+                drop(st);
+                crate::trace::trace(&format!("ui: LH_PROBE_LOGS injected {} line(s)", items.len()));
             }
         }
 
@@ -541,6 +624,12 @@ impl App {
         // 🔎 布局体检（只在渲染探针里跑）：把"网页选择行"各控件的**实测矩形**和
         // 按钮文字的**实测宽度**落盘。这样"文字有没有溢出按钮"是**用数字判断**，
         // 不用靠肉眼看图（本项目的规矩：先取事实，再读代码，见 ERROR.md E26/E39）。
+        //
+        // 顺便钉住日志滚动条的悬停态（`LH_PROBE_HOVER_BAR`）：悬停时滑块会用强调色，
+        // 于是"高亮到底画没画出来"可以**靠像素比对**验证，而不用去动用户的光标。
+        if let Some(on) = self.probe_hover_bar {
+            self.hover_log_bar = on;
+        }
         let l = self.layout();
         let btn = self.refresh_rect(l.page);
         let speed = self.speed_rect(l.page);
@@ -1103,16 +1192,28 @@ impl App {
         let line_h = self.px(22).max(16);
         let visible = (log_rc.height() / line_h).max(1) as usize;
         let total = st.logs.len();
-        self.log_rows = total;
+        self.log_total = total;
+        self.log_visible = visible;
+        self.log_rc = log_rc;
 
-        // 滚动模型：log_scroll = **第一条可见行**的下标；None 表示"跟随底部"。
+        // 滚动模型：log_scroll = **第一条可见行**的下标；log_follow = "跟随底部"。
         // 新日志进来时若处于跟随状态就自动滚到底，用户往上翻过则保持不动。
         let max_first = total.saturating_sub(visible);
+        self.log_max_first = max_first;
         let first = match self.log_follow {
             true => max_first,
             false => self.log_scroll.min(max_first),
         };
         self.log_scroll = first;
+
+        // 滚动条（2.1.3）：**有溢出才占位**，没溢出时把整幅宽度留给文字，
+        // 否则日志区白白窄掉 12px（绘制与命中都用 self.log_track 这一份矩形）。
+        let track = if total > visible {
+            log_bar_rect(log_rc, &|v| self.px(v))
+        } else {
+            RECT::default()
+        };
+        self.log_track = track;
 
         let mut row = 0usize;
         for idx in first..total {
@@ -1120,17 +1221,162 @@ impl App {
                 break;
             }
             let y = log_rc.top + (row as i32) * line_h + 4;
-            gdi::text(
+            // 行尾留出滚动条的位置；单行长度不可控 ⇒ 多余部分自己裁掉
+            let right = if total > visible { track.left - self.px(6) } else { log_rc.right - 8 };
+            gdi::text_ellipsis(
                 hdc,
                 &st.logs[idx],
-                log_rc.left + 8,
-                y,
+                RECT { left: log_rc.left + 8, top: y, right, bottom: y + line_h },
+                TextAlign::Left,
                 colors.text_sub,
                 &self.fonts[self.font_mono],
             );
             row += 1;
         }
         gdi::reset_clip(hdc);
+
+        // 滑块：位置由**首行下标**换算（绘制与拖动命中/换算共用同一套，见 log_thumb_rect）
+        let thumb = self.log_thumb_rect();
+        if total > visible {
+            // 轨道
+            gdi::fill_round_rect(hdc, track, track.width() / 2, colors.card);
+            // 拖动中 / 悬停时用强调色，提示"这块可以抓"
+            let active = self.log_bar_drag || self.hover_log_bar;
+            let color = if active { colors.accent } else { colors.text_muted };
+            gdi::fill_round_rect(hdc, thumb, thumb.width() / 2, color);
+        }
+
+        // 滚动条几何落盘（无头验证用：位置/大小全靠数字断言，不靠肉眼看图）。
+        // ⚠️ **每次绘制都落盘，不做去重**：去重会把"拖动 → 抬手"的中间态（first/drag 回到
+        //    跟原来一样的值）整段吞掉，探针"等某一行出现"就会一直等到超时，看起来像功能坏了。
+        //    实测踩到过：三行不同的 dump 之后，后面的绘制因为字符串相同被跳过（2.1.3 排坑）。
+        crate::trace::trace(&format!(
+            "paint-logs: total={} visible={} first={} follow={} bar={} track=[{},{},{}x{}] thumb=[{},{},{}x{}] track_left={} track_top={} track_h={} thumb_top={} thumb_h={} drag={} hover={}",
+            total,
+            visible,
+            first,
+            self.log_follow as u8,
+            (total > visible) as u8,
+            track.left,
+            track.top,
+            track.width(),
+            track.height(),
+            thumb.left,
+            thumb.top,
+            thumb.width(),
+            thumb.height(),
+            track.left,
+            track.top,
+            track.height(),
+            thumb.top,
+            thumb.height(),
+            self.log_bar_drag as u8,
+            self.hover_log_bar as u8
+        ));
+    }
+
+    // ============================================== 滚动条几何（绘制与命中共用）
+    /// 滑块矩形：位置 = 首行下标 / 最大首行下标（跟随底部时贴底）。
+    fn log_thumb_rect(&self) -> RECT {
+        let track = self.log_track;
+        if track.height() <= 0 || self.log_total == 0 {
+            return RECT::default();
+        }
+        let (thumb_h, span) = log_bar_metrics(
+            self.log_total,
+            self.log_visible,
+            track.height(),
+            &|v| self.px(v),
+        );
+        let pos = if self.log_follow { self.log_max_first } else { self.log_scroll };
+        let top = track.top + log_thumb_offset(pos, self.log_max_first, span);
+        RECT {
+            left: track.left,
+            top,
+            right: track.right,
+            bottom: top + thumb_h,
+        }
+    }
+
+    /// 按"鼠标位移"换算滚动位置。
+    ///
+    /// ⚠️ 用的是**位移**（`y − 锚点 y`）而不是"滑块顶端 = 鼠标 y"：后者在滑块比
+    /// 鼠标抓点矮/高的时候会让滑块瞬间跳到鼠标处，手感是"一按就跳"。
+    fn log_scroll_for_drag(&self, y: i32) -> usize {
+        let (_, span) = log_bar_metrics(
+            self.log_total,
+            self.log_visible,
+            self.log_track.height(),
+            &|v| self.px(v),
+        );
+        if span <= 0 || self.log_max_first == 0 {
+            return 0;
+        }
+        let dy = y - self.log_bar_anchor_y;
+        let delta = (dy as i64 * self.log_max_first as i64) / span as i64;
+        let pos = self.log_bar_anchor_first as i64 + delta;
+        pos.clamp(0, self.log_max_first as i64) as usize
+    }
+
+    /// 滚动条按下：滑块上 = 接着拖（记录抓点）；轨道上 = 翻一页过去。
+    fn on_scroll_bar_down(&mut self, y: i32) {
+        let thumb = self.log_thumb_rect();
+        let track = self.log_track;
+        let page = self.log_visible.max(1);
+        let in_thumb = y >= thumb.top && y < thumb.bottom;
+        let zone = if in_thumb {
+            "thumb"
+        } else if y < thumb.top {
+            "track-above"
+        } else {
+            "track-below"
+        };
+        let first_before = self.log_scroll;
+        // 翻页后的落点（拖动时不改，见下）
+        let mut paged_to = first_before;
+        {
+            let mut st = self.shared.lock();
+            if in_thumb {
+                st.push_log("[native] 拖动日志滚动条");
+            } else if y < thumb.top {
+                self.log_scroll = self.log_scroll.saturating_sub(page);
+                paged_to = self.log_scroll;
+                st.push_log("[native] 日志上翻一页");
+            } else {
+                self.log_scroll = (self.log_scroll + page).min(self.log_max_first);
+                paged_to = self.log_scroll;
+                st.push_log("[native] 日志下翻一页");
+            }
+        }
+        // 翻页 / 拖动都视为"用户在手动定位"，先关掉跟随；拖到底后会自动恢复
+        self.log_follow = false;
+        if self.log_scroll >= self.log_max_first {
+            self.log_follow = true;
+        }
+        self.log_bar_drag = true;
+        self.log_bar_grab = (y - thumb.top).max(0);
+        self.log_bar_anchor_y = y;
+        self.log_bar_anchor_first = self.log_scroll;
+        // 逐次动作的真值落盘（断言读这里，而不是事后采样 —— 后台日志一直在长）
+        crate::trace::trace(&format!(
+            "ui: log scroll bar down y={} zone={} first {} -> {} (max={}) follow={} page={} thumb=[{},{}] track=[{},{}]",
+            y,
+            zone,
+            first_before,
+            if in_thumb { self.log_scroll } else { paged_to },
+            self.log_max_first,
+            self.log_follow as u8,
+            page,
+            thumb.top,
+            thumb.bottom,
+            track.top,
+            track.bottom
+        ));
+        self.shared.notify_ui();
+        unsafe {
+            SetCapture(self.hwnd);
+            InvalidateRect(self.hwnd, std::ptr::null(), 0);
+        }
     }
 
     // ================================================================ 鼠标
@@ -1258,6 +1504,23 @@ impl App {
     }
 
     fn on_mouse_move(&mut self, x: i32, y: i32) {
+        // 正在拖日志滚动条：按位移换算首行下标（滑块跟手）
+        if self.log_bar_drag {
+            let prev = self.log_scroll;
+            let next = self.log_scroll_for_drag(y);
+            let follow = next >= self.log_max_first;
+            self.log_scroll = next;
+            self.log_follow = follow;
+            // 逐次动作的真值落盘（拖动期间界面会连续重绘，dump 采样容易读到中间态）
+            if next != prev {
+                crate::trace::trace(&format!(
+                    "ui: log scroll bar drag y={} first {} -> {} follow={}",
+                    y, prev, next, follow as u8
+                ));
+            }
+            unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+            return;
+        }
         // 正在拖拽/缩放：直接按位移算新矩形
         if self.grab != Grab::None {
             let mut pt = POINT { x, y };
@@ -1361,9 +1624,37 @@ impl App {
         }
 
         let hit = self.hit_test(x, y);
-        if hit != self.hover {
+        // 日志滚动条不是 Ctl（它自己管拖拽），命中时单独高亮
+        //
+        // ⚠️ 探针钉住悬停态时（`LH_PROBE_HOVER_BAR`）这里**不要覆盖它**：无头探针靠 PostMessage
+        //    驱动，而真实光标在用户手里、OS 会持续投递"真实位置"的 WM_MOUSEMOVE，会把状态踩掉。
+        //    正常运行时 probe_hover_bar 是 None，这段等价于原来的 `hover_log_bar = on_bar`。
+        let on_bar = self.probe_hover_bar.unwrap_or_else(|| self.log_track.contains(x, y));
+        // 排障开关：`LH_TRACE_MOUSE=1` 时把每次鼠标移动与命中结果落盘。
+        // 无头探针里"移动了但界面没反应"最难判断是"消息没到"还是"命中算错"，
+        // 这一行能把两种情况区分开（默认关闭，正常运行不产生噪音）。
+        if std::env::var("LH_TRACE_MOUSE").is_ok() {
+            crate::trace::trace(&format!(
+                "ui: mouse move ({},{}) hit={:?} on_bar={}",
+                x, y, hit, on_bar as u8
+            ));
+        }
+        if hit != self.hover || on_bar != self.hover_log_bar {
             self.hover = hit;
+            self.hover_log_bar = on_bar;
             unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+        }
+        // 订阅"鼠标离开客户区"（系统只通知一次，所以每次移动都要重订）。
+        // 没有这一步：悬停高亮会永远留在最后一个控件上，鼠标移出窗口后日志滚动条
+        // 还会继续吞滚轮（2.1.3 实测）。
+        unsafe {
+            let mut tme = TRACKMOUSEEVENT {
+                cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                dwFlags: TME_LEAVE,
+                hwndTrack: self.hwnd,
+                dwHoverTime: 0,
+            };
+            TrackMouseEvent(&mut tme);
         }
 
         // 边框光标（无系统边框，自己按命中区域换光标）
@@ -1384,6 +1675,11 @@ impl App {
     }
 
     fn on_lbutton_down(&mut self, x: i32, y: i32) {
+        // 日志滚动条优先：它在日志卡片内部、又在 Ctl 命中区之外，自己处理拖拽
+        if self.log_track.contains(x, y) {
+            self.on_scroll_bar_down(y);
+            return;
+        }
         // 先看边框（缩放优先）
         let border = self.border_hit(x, y);
         if border != Grab::None {
@@ -1515,6 +1811,23 @@ impl App {
     }
 
     fn on_lbutton_up(&mut self, x: i32, y: i32) {
+        // 松手结束滚动条拖动。⚠️ 这里**不复用 Ctl 那套 pressed 白名单**：
+        // 滚动条不是 Ctl，混在一起会被"拉大后不可点"地漏掉（见 ERROR.md E42 白名单坑）。
+        if self.log_bar_drag {
+            let next = self.log_scroll_for_drag(y);
+            self.log_scroll = next;
+            self.log_follow = next >= self.log_max_first;
+            self.log_bar_drag = false;
+            crate::trace::trace(&format!(
+                "ui: log scroll bar drag end at y={} -> first={}/{} follow={}",
+                y, self.log_scroll, self.log_max_first, self.log_follow as u8
+            ));
+            unsafe {
+                ReleaseCapture();
+                InvalidateRect(self.hwnd, std::ptr::null(), 0);
+            }
+            return;
+        }
         if self.grab != Grab::None {
             self.grab = Grab::None;
             unsafe { ReleaseCapture() };
@@ -1670,18 +1983,53 @@ impl App {
             }
             WM_MOUSEWHEEL => {
                 let delta = ((wp >> 16) as i16) as i32;
+                // 滚轮在日志滚动条上：**放行**，不要顺手把日志滚了
+                // （Windows 原生滚动条也是这个行为，不抢用户的滚动输入）
+                if self.hover_log_bar && self.log_track.height() > 0 {
+                    return 0;
+                }
                 // 向上滚（delta>0）= 看更早的日志 ⇒ 关掉跟随并回退一行
                 if delta > 0 {
+                    let prev = self.log_scroll;
                     self.log_follow = false;
                     self.log_scroll = self.log_scroll.saturating_sub(3);
+                    // 逐次动作的真值落盘：断言用**动作瞬间**的前后值，而不是事后采样
+                    // （后台每 1.5s 会追加日志，事后比较会被这些新行搅乱）。
+                    crate::trace::trace(&format!(
+                        "ui: log wheel up first {} -> {} (max={}) follow=0",
+                        prev, self.log_scroll, self.log_max_first
+                    ));
                 } else {
-                    self.log_scroll = self.log_scroll.saturating_add(3);
+                    let prev = self.log_scroll;
+                    self.log_scroll = (self.log_scroll.saturating_add(3)).min(self.log_max_first);
                     // 已经到最底就恢复跟随
-                    if self.log_scroll + 1 >= self.log_rows.saturating_sub(1) {
+                    // ⚠️ 判据是"首行下标触底"（== max_first）：原来的 `log_rows - 1`
+                    // 那个写法底下会被夹到 max_first，永远差一行 ⇒ 滚到底也不会恢复跟随。
+                    if self.log_scroll >= self.log_max_first {
                         self.log_follow = true;
                     }
+                    crate::trace::trace(&format!(
+                        "ui: log wheel down first {} -> {} (max={}) follow={}",
+                        prev, self.log_scroll, self.log_max_first, self.log_follow as u8
+                    ));
                 }
                 unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+                0
+            }
+            WM_MOUSELEAVE => {
+                // 鼠标离开客户区：清掉悬停（否则最后一个控件会一直亮着，
+                // 且日志滚动条会继续吞滚轮）。拖动中不清 —— 那时指针常常跑到窗外。
+                //
+                // 探针钉住悬停态时（`LH_PROBE_HOVER_BAR`）也不清：无头探针只发消息、不动真光标，
+                // 真实光标在窗口外会持续产生 WM_MOUSELEAVE，把要验证的状态直接抹掉（2.1.3 实测）。
+                if self.probe_hover_bar.is_none()
+                    && !self.log_bar_drag
+                    && (self.hover.is_some() || self.hover_log_bar)
+                {
+                    self.hover = None;
+                    self.hover_log_bar = false;
+                    unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+                }
                 0
             }
             WM_TIMER => {
@@ -1800,6 +2148,49 @@ struct Layout {
     progress: RECT,
     buttons: RECT,
     log: RECT,
+}
+
+// ============================================================ 日志滚动条几何（纯函数）
+/// 滚动条"轨道"矩形：贴日志区内右侧，上下留 px(6)。
+///
+/// ⚠️ 只有**绘制**与**命中**都从这一个函数取矩形，才不会出现"看得见点不动"
+/// （本项目的老坑，见 ERROR.md E40/E42）。
+fn log_bar_rect(log_rc: RECT, px: &dyn Fn(i32) -> i32) -> RECT {
+    let w = px(10).max(6);
+    RECT {
+        left: log_rc.right - w - px(6).max(4),
+        top: log_rc.top + px(6).max(4),
+        right: log_rc.right - px(6).max(4),
+        bottom: log_rc.bottom - px(6).max(4),
+    }
+}
+
+/// 滑块尺寸与可滑动行程：返回 `(滑块高, 行程)`。
+///
+/// - 滑块高按"可见行 / 总行"比例给，并保证 ≥ px(32)（太短按不住）；
+/// - `行程 = 轨道高 − 滑块高`（滑块贴顶 = 第一行，贴底 = 最后一行）。
+fn log_bar_metrics(
+    total: usize,
+    visible: usize,
+    track_h: i32,
+    px: &dyn Fn(i32) -> i32,
+) -> (i32, i32) {
+    let min_h = px(32).max(20);
+    let thumb_h = if total == 0 {
+        min_h
+    } else {
+        ((track_h as i64 * visible as i64) / total as i64) as i32
+    }
+    .clamp(min_h, track_h.max(min_h));
+    (thumb_h, (track_h - thumb_h).max(0))
+}
+
+/// 首行下标 → 滑块相对轨道顶端的偏移（与反算方向必须一致，否则拖动会"跳"）。
+fn log_thumb_offset(first: usize, max_first: usize, span: i32) -> i32 {
+    if max_first == 0 || span <= 0 {
+        return 0;
+    }
+    ((first as i64 * span as i64 + max_first as i64 / 2) / max_first as i64) as i32
 }
 
 struct PaintState {

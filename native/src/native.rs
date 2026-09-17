@@ -60,6 +60,10 @@ pub const WM_MOUSEMOVE: u32 = 0x0200;
 pub const WM_LBUTTONDOWN: u32 = 0x0201;
 pub const WM_LBUTTONUP: u32 = 0x0202;
 pub const WM_MOUSEWHEEL: u32 = 0x020A;
+/// 鼠标离开客户区（要先调 `TrackMouseEvent(TME_LEAVE)` 才会收到）。
+/// 没有它的话 `hover` 会一直停在"最后命中的那个控件"上 —— 鼠标离开窗口后控件仍高亮，
+/// 日志滚动条还会继续吞滚轮（2.1.3 实测踩到）。
+pub const WM_MOUSELEAVE: u32 = 0x02A3;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_CHAR: u32 = 0x0102;
@@ -397,7 +401,22 @@ extern "system" {
     pub fn HideCaret(hwnd: HWND) -> BOOL;
     pub fn IsWindowEnabled(hwnd: HWND) -> BOOL;
     pub fn IsWindow(hwnd: HWND) -> BOOL;
+    /// 订阅 `WM_MOUSELEAVE`：**每次进入窗口都要重新订阅一次**（系统只投递一次）。
+    pub fn TrackMouseEvent(tme: *mut TRACKMOUSEEVENT) -> BOOL;
 }
+
+/// `TrackMouseEvent` 的入参。
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct TRACKMOUSEEVENT {
+    pub cbSize: u32,
+    pub dwFlags: u32,
+    pub hwndTrack: HWND,
+    pub dwHoverTime: u32,
+}
+
+/// `dwFlags`：订阅"鼠标离开客户区"。
+pub const TME_LEAVE: u32 = 0x00000002;
 
 pub const MB_OK: u32 = 0x0000_0000;
 pub const MB_ICONINFORMATION: u32 = 0x0000_0040;
