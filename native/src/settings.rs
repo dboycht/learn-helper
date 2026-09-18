@@ -1632,13 +1632,18 @@ fn caret_from_x(state: &SettingsState, f: Field, x: i32) -> Option<usize> {
 }
 
 // ================================================================ 脚本化验证钩子
+/// 0 = **不是钩子**（用户点齿轮走的路径）。必须存在这个值：
+/// 原先"用户打开"复用了 `HOOK_OPEN`，于是真实用户一点设置就被钩子逻辑当成验证场景，
+/// **1.2 秒后主窗口被 `exit_after_hook()` 关掉** —— 用户看到的正是"点设置就闪退"（E56）。
+/// 另外两个弹窗（`about.rs` / `pagepicker.rs`）本来就有 `hook=false` 守卫，只有设置漏了。
+const HOOK_NONE: usize = 0;
 const HOOK_SAVE: usize = 1;
 const HOOK_CANCEL: usize = 2;
 const HOOK_OPEN: usize = 3;
 
 /// 用**真实消息**驱动对话框（走与鼠标完全相同的窗口过程路径）。
 fn hook_action(hwnd: HWND, state: *mut SettingsState, action: usize) {
-    if state.is_null() {
+    if state.is_null() || action == HOOK_NONE {
         return;
     }
     unsafe {
@@ -1793,6 +1798,9 @@ fn ensure_class() {
 }
 
 /// 打开「答题设置」（非阻塞；同一时刻只允许一个）。
+///
+/// ⚠️ **用户路径必须是 `HOOK_NONE`**：这里不给钩子，否则"点齿轮打开设置"会被钩子逻辑
+/// 当成验证场景，跑完 `exit_after_hook()` 把主窗口关掉（用户报的"点设置就闪退"，E56）。
 pub fn show(owner: HWND, shared: Arc<Shared>, theme: Theme) {
     unsafe {
         let existing = FindWindowW(wide(CLASS).as_ptr(), std::ptr::null());
@@ -1802,7 +1810,7 @@ pub fn show(owner: HWND, shared: Arc<Shared>, theme: Theme) {
         }
     }
     ensure_class();
-    create(owner, shared, theme, HOOK_OPEN);
+    create(owner, shared, theme, HOOK_NONE);
 }
 
 /// 打开并注入脚本化动作（无人值守验证用；会先关掉已在开的那个）。
@@ -1902,14 +1910,18 @@ fn create(owner: HWND, shared: Arc<Shared>, theme: Theme, hook: usize) -> HWND {
             fetch_and_fill(shared.clone(), hwnd as isize);
         }
 
-        // 脚本化钩子：延迟执行（等窗口画完 + 后端就绪）
+        // 脚本化钩子：延迟执行（等窗口画完 + 后端就绪）。
+        // ⚠️ `hook == HOOK_NONE` 时**一条线程都不起**：这是用户路径，既不该模拟动作，
+        //    更不该在跑完后关掉主窗口（E56：正是这里把"点设置"变成"闪退"）。
         let hwnd_raw = hwnd as isize;
-        std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(if hook == HOOK_OPEN { 1200 } else { 2600 }));
-            if hwnd_raw != 0 {
-                unsafe { PostMessageW(hwnd_raw as HWND, WM_APP_HOOK, hook as WPARAM, 0) };
-            }
-        });
+        if hook != HOOK_NONE {
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(if hook == HOOK_OPEN { 1200 } else { 2600 }));
+                if hwnd_raw != 0 {
+                    unsafe { PostMessageW(hwnd_raw as HWND, WM_APP_HOOK, hook as WPARAM, 0) };
+                }
+            });
+        }
 
         hwnd
     }
