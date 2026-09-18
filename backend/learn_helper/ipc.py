@@ -624,6 +624,12 @@ def _make_handler(hub, on_shutdown):
                 ok, msg = bool(res.get('ok')), res.get('message', '')
                 hub.emit_pages(res.get('pages') or [])
                 return self._ok(msg, res, **hub.snapshot())
+            elif action == 'launch_browser':
+                # 界面启动后自动拉起沙盒浏览器（老 Tk 版 auto_launch_browser_on_start 的行为）。
+                # 失败只记日志（比如本机没装 Edge/Chrome），**不该打扰用户**。
+                ok, msg = engine.auto_launch_browser()
+                if not ok:
+                    hub.emit_log(f'[浏览器] 自动打开失败：{msg}（可点「检测/刷新网页」重试）')
             elif action == 'diagnose':
                 res = engine.diagnose()
                 ok, msg = bool(res.get('ok')), res.get('message', '')
@@ -677,6 +683,13 @@ def _make_handler(hub, on_shutdown):
                 if not ok:
                     return self._err(msg)
                 messages.append(msg)
+            if 'auto_launch_browser' in body:
+                if engine is None:
+                    return self._err('引擎未就绪', 503)
+                ok, msg = engine.set_auto_launch_browser(body['auto_launch_browser'])
+                if not ok:
+                    return self._err(msg)
+                messages.append(msg)
             if patch:
                 update_config(patch)
             if engine is not None:
@@ -713,5 +726,7 @@ def settings_payload(hub):
         'run': {
             'video_speed': engine.settings.get('video_speed', 2.0) if engine else 2.0,
             'auto_submit': engine.settings.get('auto_submit', True) if engine else True,
+            'auto_launch_browser': (engine.settings.get('auto_launch_browser', True)
+                                    if engine else True),
         },
     }

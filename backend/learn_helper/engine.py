@@ -76,6 +76,39 @@ class SolverEngine:
         update_config({'run': {'auto_submit': auto_submit}})
         return True, '提交模式已切换为「自动提交」' if auto_submit else '提交模式已切换为「仅暂存」'
 
+    def set_auto_launch_browser(self, enabled):
+        enabled = bool(enabled)
+        self.settings['auto_launch_browser'] = enabled
+        update_config({'run': {'auto_launch_browser': enabled}})
+        return True, ('启动时将自动打开浏览器' if enabled
+                      else '启动时不再自动打开浏览器（可随时点「检测/刷新网页」手动打开）')
+
+    def auto_launch_browser(self):
+        """界面启动后的延时动作：配置开着就拉起沙盒浏览器。
+
+        为什么放在后端而不是界面侧：拉起浏览器属于业务（`kill_and_launch_browser`），
+        界面只该发一条控制指令。返回 `(ok, message)`；**失败只记日志、不弹错误**。
+        """
+        if not self.settings.get('auto_launch_browser', True):
+            return True, '启动自动打开浏览器已关闭（跳过）'
+        return self.ensure_browser()
+
+    def ensure_browser(self):
+        """确保沙盒浏览器可用：没有 9222 就拉起（幂等，短连接，可被 HTTP 线程调用）。"""
+        with self._io_lock:
+            try:
+                if core.is_cdp_port_open():
+                    self.browser_proc = None     # 复用用户/上次留下的浏览器，不持有进程句柄
+                    return True, '浏览器已在运行（复用 9222）'
+                ok, proc = core.kill_and_launch_browser()
+                if not ok:
+                    return False, '无法拉起浏览器（9222 不可用）'
+                self.browser_proc = proc
+                return True, '已打开沙盒浏览器，请登录并点开学习页'
+            except Exception as e:
+                LOGGER.warning(f'[浏览器] 拉起失败: {e}')
+                return False, f'拉起浏览器异常: {e}'
+
     def reload_settings(self):
         self.settings = dict(get_run_cfg())
 

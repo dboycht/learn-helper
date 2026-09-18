@@ -329,6 +329,22 @@ def test_engine_unit():
     check('B3 auto_submit 切换', ok and eng.settings['auto_submit'] is False)
     eng.set_auto_submit(True)
 
+    # B3b/B3c：启动自动开浏览器（老 Tk 版 auto_launch_browser_on_start 的行为）
+    #   默认必须是**开**（用户打开界面就能用上次的学习页）；
+    #   关掉之后 `auto_launch_browser()` 必须**不发任何浏览器指令**（直接返回"跳过"）。
+    from learn_helper.config import get_run_cfg
+    check('B3b 默认 auto_launch_browser=True', get_run_cfg()['auto_launch_browser'] is True,
+          f"got={get_run_cfg()['auto_launch_browser']!r}")
+    ok, msg = eng.set_auto_launch_browser(False)
+    check('B3c 关掉后 auto_launch_browser() 直接跳过（不拉浏览器）',
+          ok and eng.settings['auto_launch_browser'] is False
+          and (lambda r: r[0] is True and '跳过' in r[1])(eng.auto_launch_browser()),
+          f'settings={eng.settings.get("auto_launch_browser")!r}')
+    eng.set_auto_launch_browser(True)
+    check('B3d 重新打开后设置写回 config',
+          get_run_cfg()['auto_launch_browser'] is True,
+          f"got={get_run_cfg()['auto_launch_browser']!r}")
+
     ok, msg = eng.start()
     check('B4 start(未选页) 返回 False + 提示', not ok and '网页' in msg)
     hub.selected_title = '[请点击右侧刷新选择网页]'

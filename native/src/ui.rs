@@ -417,6 +417,19 @@ impl App {
         }
         crate::trace::trace("ui: timers armed, starting backend");
 
+        // 启动后**一次性**拉起沙盒浏览器（老 Tk 版 `auto_launch_browser_on_start` 的行为）。
+        //
+        // 为什么绕一圈发指令而不是界面自己 Popen：拉起浏览器属于后端业务，
+        // 界面只发一条 `launch_browser`，由后端读 `run.auto_launch_browser` 决定拉不拉（默认拉）。
+        // 失败**只在日志里说一句**，绝不弹错误 —— 机器上没装 Edge/Chrome 也不该被启动提示挡住。
+        //
+        // 时序：后端要先握手完成（约 2.5s）才收得下这条指令，所以延时给到 4s。
+        // ⚠️ 这是**一次性**动作，别挪进定时器/轮询里（那会反复去拉浏览器）。
+        // `LH_NO_AUTO_BROWSER=1` 时整段跳过（验证/排障用，正常用户不设）。
+        if std::env::var("LH_NO_AUTO_BROWSER").is_err() {
+            spawn_action_delayed(app.shared.clone(), "launch_browser", 4000);
+        }
+
         // 诊断：每 5 秒把累计重绘次数落盘一次（验证"空闲时不再周期性重画"）。
         // 修复前应当 ≈ 4 次/秒（250ms 无条件重绘）；修复后空闲期应接近 0。
         if std::env::var("LH_UI_PAINT_REPORT").is_ok() {
@@ -2251,8 +2264,34 @@ fn cycle_video_speed(shared: Arc<Shared>) {
     });
 }
 
-fn spawn_action(shared: Arc<Shared>, action: &'static str, params: Option<Value>) {    std::thread::spawn(move || {
+/// 发一条控制指令并把它记进日志（异步，成功/失败都写一行）。
+///
+/// `delay_ms`：多久之后再发。**启动时的自动开浏览器**要用到它 ——
+/// 后端那时可能还没握手完成，太早发会被拒。`quiet`：失败时**不写状态栏**，
+/// 只写日志（自动开浏览器失败不该在界面上摆一个红字），用户仍可手动点刷新。
+fn spawn_action_ex(
+    shared: Arc<Shared>,
+    action: &'static str,
+    params: Option<Value>,
+    delay_ms: u64,
+    quiet: bool,
+) {
+    std::thread::spawn(move || {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
         let result = backend::control(&shared, action, params);
+        if quiet {
+            // 只把结果写进日志，不动 status_text（该字段用户当前在看的东西不该被抢）
+            let mut st = shared.lock();
+            match result {
+                Ok(msg) => st.push_log(&format!("[native] {} → {}", action, msg)),
+                Err(err) => st.push_log(&format!("[native] {} 跳过：{}", action, err)),
+            }
+            drop(st);
+            shared.notify_ui();
+            return;
+        }
         let mut st = shared.lock();
         match result {
             Ok(msg) => {
@@ -2269,6 +2308,15 @@ fn spawn_action(shared: Arc<Shared>, action: &'static str, params: Option<Value>
         drop(st);
         shared.notify_ui();
     });
+}
+
+/// 延时发送（启动自动开浏览器用；失败只记日志）。
+fn spawn_action_delayed(shared: Arc<Shared>, action: &'static str, delay_ms: u64) {
+    spawn_action_ex(shared, action, None, delay_ms, true);
+}
+
+fn spawn_action(shared: Arc<Shared>, action: &'static str, params: Option<Value>) {
+    spawn_action_ex(shared, action, params, 0, false);
 }
 
 // ================================================================ 窗口

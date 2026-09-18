@@ -80,6 +80,8 @@ pub struct CoreState {
     pub video_speed: f64,
     /// 提交模式：true=自动提交 / false=仅暂存
     pub auto_submit: bool,
+    /// 启动界面时自动打开沙盒浏览器（后端 settings.run.auto_launch_browser）
+    pub auto_launch_browser: bool,
     /// 需要 UI 处理的提示（弹窗/追加日志），由 UI 线程消费后清空。
     pub flash: Option<String>,
     pub backend_exe: String,
@@ -152,6 +154,8 @@ impl Shared {
         st.answer_mode.hash(&mut h);
         st.video_speed.to_bits().hash(&mut h);
         st.auto_submit.hash(&mut h);
+        // ⚠️ 新加的"会显示在界面上的设置"也要进指纹：漏了它，改了设置界面不会重绘
+        st.auto_launch_browser.hash(&mut h);
         st.log_seq.hash(&mut h);
         st.logs.len().hash(&mut h);
         st.engine.running.hash(&mut h);
@@ -595,6 +599,8 @@ pub fn refresh_settings(shared: Arc<Shared>) {
                 let run = data.get("run");
                 let speed = run.map(|r| r.num_at("video_speed")).unwrap_or(0.0);
                 let auto_submit = run.map(|r| r.bool_at("auto_submit")).unwrap_or(true);
+                let auto_launch_browser =
+                    run.map(|r| r.bool_at("auto_launch_browser")).unwrap_or(true);
                 let llm = data.get("llm");
                 let llm_base = llm.map(|l| l.str_at("base_url")).unwrap_or_default();
                 let llm_model = llm.map(|l| l.str_at("model")).unwrap_or_default();
@@ -634,6 +640,7 @@ pub fn refresh_settings(shared: Arc<Shared>) {
                     st.video_speed = speed;
                 }
                 st.auto_submit = auto_submit;
+                st.auto_launch_browser = auto_launch_browser;
                 drop(st);
                 shared.notify_ui();
             }

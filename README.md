@@ -4,9 +4,16 @@
 
 ## 版本
 
-- **2.1.2**（开发中，未发版）：**「当前网页」可下拉选择** —— 点网页框弹出标签页列表
-  （当前页打 ✓、↑↓/Enter/Esc、滚轮翻页），选中即下发后端并**记住**（下次启动仍选中同一页）；
-  选中前网页框会提示"已检测到 N 个网页 —— 点此处选择"。
+- **2.1.2**（开发中，未发版）：
+  - **「当前网页」可下拉选择** —— 点网页框弹出标签页列表
+    （当前页打 ✓、↑↓/Enter/Esc、滚轮翻页），选中即下发后端并**记住**（下次启动仍选中同一页）；
+    选中前网页框会提示"已检测到 N 个网页 —— 点此处选择"。
+  - **运行日志自带可视滚动条**：可拖拽滑块、点轨道翻页（上/下各一屏），
+    拖到底自动恢复"跟随最新日志"；鼠标停在滚动条上时滚轮归滚动条（不抢），
+    日志不满一屏时不占位。
+  - **启动时自动打开沙盒浏览器**（恢复老版本行为）：界面起来几秒后自动拉起
+    独立配置的 Edge/Chrome（`browser_profile/`，并恢复上次的学习页），
+    不用再先点一次「检测/刷新网页」。可在「答题设置」里关掉（`run.auto_launch_browser`，默认开）。
 - **2.1.1**（已发布，源码包）：**界面重构为原生 Win32（Rust）+ Python 后端服务**，主打「好传播」。
   - **前端**：`native/` —— Rust 手写 Win32/GDI/DWM，**单 exe 约 0.37 MB，零运行时依赖**，
     解压即用；**纯色自绘界面**（用系统标题栏 + Win11 圆角 + 深色标题栏，
@@ -122,6 +129,10 @@ powershell -ExecutionPolicy Bypass -File native\build_release.ps1 -Zip
 ## 工作原理
 
 - 通过 `--remote-debugging-port=9222` 连接本机 Edge/Chrome，用 Playwright 操控。
+- **浏览器什么时候被打开**：界面启动后自动拉起一个**独立配置**的沙盒浏览器
+  （`browser_profile/`，不碰你日常在用的那个浏览器窗口；并 `--restore-last-session`
+  恢复上次的学习页）；随后运行中掉线会自动重连。想手工控制就打「检测/刷新网页」，
+  想关掉自动打开就去「答题设置」取消勾选 `run.auto_launch_browser`（默认勾选）。
 - 控制逻辑（点击 / 翻页 / 刷视频 / 滚文档 / 防弹窗 / 每 10 页重建）**全部本地实现**；
   注入页面的脚本（倍速、换线路、滚动）为**本地常量**，不由服务器下发。
 - 远端调用点只有两个，都指向你自己配置的后端：`/check_version`、`/solve`。
@@ -156,10 +167,19 @@ rem 主界面：直接调自身绘制代码出图（唯一可信的界面截图�
 native\target\release\learn-helper-native.exe --render-probe 1686 960 native\render-probe.bmp
 
 rem 「答题设置」对话框：不建窗口直接出图，并打印按钮/文字宽度的布局体检数据
-native\target\release\learn-helper-native.exe --render-probe-settings 770 630 native\settings-probe.bmp
+native\target\release\learn-helper-native.exe --render-probe-settings 770 664 native\settings-probe.bmp
 
-rem 「答题设置」端到端：真实点击 → PUT /api/settings → 核对 config.json（隔离在临时目录，18 项）
+rem 「答题设置」端到端：真实点击 → PUT /api/settings → 核对 config.json（隔离在临时目录）
 powershell -ExecutionPolicy Bypass -File native\settings_probe.ps1
+
+rem 日志面板滚动条：端到端（滚轮/拖拽/翻页/悬停吞滚轮，15+ 项，不碰你的鼠标）
+powershell -ExecutionPolicy Bypass -File native\logscroll_probe.ps1
+
+rem 滚动条悬停高亮：像素级验证（两次渲染探针对比滑块颜色，不建窗口）
+powershell -ExecutionPolicy Bypass -File native\logscroll_hover_check.ps1
+
+rem 启动自动开浏览器：端到端（会真的开一次沙盒浏览器，跑完自己关掉）
+powershell -ExecutionPolicy Bypass -File native\autolaunch_probe.ps1
 ```
 
 > 界面类问题请**先取事实再改代码**：`--render-probe` 的产物 + 它落盘的

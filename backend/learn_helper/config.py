@@ -53,6 +53,9 @@ DEFAULT_SERVER_URL = 'http://127.0.0.1:8000'
 DEFAULT_RUN = {
     'video_speed': 2.0,      # 倍速
     'auto_submit': True,     # True=自动提交 / False=仅暂存
+    # 启动时自动拉起沙盒浏览器（老 Tk 版 `auto_launch_browser_on_start` 的行为）。
+    # 默认开：用户打开界面就能用上次的学习页，不必先点「检测/刷新网页」。
+    'auto_launch_browser': True,
 }
 
 
@@ -172,7 +175,7 @@ ANSWER_MODE_TIPS = {m: tip for m, _, tip in ANSWER_MODES}
 
 
 def get_run_cfg():
-    """运行期设置（倍速 / 自动提交），带钳位。"""
+    """运行期设置（倍速 / 自动提交 / 启动自动开浏览器），带钳位。"""
     cfg = load_config().get('run', {}) or {}
     out = dict(DEFAULT_RUN)
     try:
@@ -181,6 +184,8 @@ def get_run_cfg():
         out['video_speed'] = DEFAULT_RUN['video_speed']
     out['video_speed'] = max(1.0, min(4.0, out['video_speed']))
     out['auto_submit'] = bool(cfg.get('auto_submit', DEFAULT_RUN['auto_submit']))
+    out['auto_launch_browser'] = bool(
+        cfg.get('auto_launch_browser', DEFAULT_RUN['auto_launch_browser']))
     return out
 
 

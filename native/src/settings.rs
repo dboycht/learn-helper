@@ -46,6 +46,8 @@ enum Ctl {
     /// (数字字段, +1 / -1)
     Step(Field, i32),
     AutoSubmit,
+    /// 启动界面时自动打开沙盒浏览器
+    AutoLaunchBrowser,
     TestServer,
     Save,
     Cancel,
@@ -100,6 +102,8 @@ struct Layout {
     modes: [(RECT, &'static str, &'static str); 3],
     rows: Vec<Row>,
     auto: RECT,
+    /// 「启动时自动打开浏览器」那一行（在 auto 下面一行）
+    auto_launch: RECT,
     test: RECT,
     save: RECT,
     cancel: RECT,
@@ -126,6 +130,8 @@ struct Form {
     timeout: i64,
     retry: i64,
     auto_submit: bool,
+    /// 启动界面时自动打开沙盒浏览器（老 Tk 版 `auto_launch_browser_on_start` 的行为）
+    auto_launch_browser: bool,
     /// 初始快照（用于"只提交改动项"与"有改动*"）
     init: Snapshot,
     /// 从后端读到过设置没有
@@ -158,6 +164,8 @@ struct Snapshot {
     timeout: i64,
     retry: i64,
     auto_submit: bool,
+    /// 启动界面时自动打开沙盒浏览器（老 Tk 版 `auto_launch_browser_on_start` 的行为）
+    auto_launch_browser: bool,
 }
 
 impl Default for Form {
@@ -173,6 +181,7 @@ impl Default for Form {
             timeout: 0,
             retry: 0,
             auto_submit: true,
+            auto_launch_browser: true,
             init: Snapshot {
                 server_url: String::new(),
                 llm_base: String::new(),
@@ -183,6 +192,7 @@ impl Default for Form {
                 timeout: -1,
                 retry: -1,
                 auto_submit: true,
+                auto_launch_browser: true,
             },
             loaded: false,
             focus: None,
@@ -227,6 +237,10 @@ impl Form {
             if r.get("auto_submit").is_some() {
                 self.auto_submit = r.bool_at("auto_submit");
             }
+            // 老后端不带这个键 ⇒ 保持默认（true），不会把用户的设置误改成关
+            if r.get("auto_launch_browser").is_some() {
+                self.auto_launch_browser = r.bool_at("auto_launch_browser");
+            }
         }
         // API Key 永远从空白开始编辑（后端不回传）
         self.llm_key.clear();
@@ -248,6 +262,7 @@ impl Form {
             timeout: self.timeout,
             retry: self.retry,
             auto_submit: self.auto_submit,
+            auto_launch_browser: self.auto_launch_browser,
         }
     }
 
@@ -454,6 +469,11 @@ impl Form {
         }
         if self.auto_submit != self.init.auto_submit {
             parts.push(format!("\"auto_submit\":{}", self.auto_submit));
+        }
+        // 启动自动开浏览器：与 auto_submit 一样是**顶层 run 键**
+        // （后端 `_settings_update` 认的就是 body 顶层的这个名字）
+        if self.auto_launch_browser != self.init.auto_launch_browser {
+            parts.push(format!("\"auto_launch_browser\":{}", self.auto_launch_browser));
         }
         format!("{{{}}}", parts.join(","))
     }
@@ -680,10 +700,23 @@ impl SettingsState {
             y = bottom + row_gap;
         }
 
-        // 底部：自动提交 + 按钮行 + 状态行
+        // 底部：两行勾选项 + 按钮行 + 状态行
+        //
+        // ⚠️ 勾选项**不放在按钮行里面**：原先只有「自动提交」时它挤在 test 按钮左边，
+        //    再加一行就没位置了。现在两行各自占一条（`auto` / `auto_launch`），
+        //    按钮行整体下移 —— 窗口高度也随之 +px(34)（见 `show()` / 渲染探针的 770×664）。
+        let check_h = px(26);
+        let check_gap = px(6);
+        let auto = RECT { left: m, top: y, right, bottom: y + check_h };
+        let auto_launch = RECT {
+            left: m,
+            top: auto.bottom + check_gap,
+            right,
+            bottom: auto.bottom + check_gap + check_h,
+        };
         let btn_h = px(40);
         let btn_w = px(124);
-        let btn_top = y + px(12);
+        let btn_top = auto_launch.bottom + px(12);
         let btn_bottom = btn_top + btn_h;
         let cancel = RECT { left: right - btn_w, top: btn_top, right, bottom: btn_bottom };
         let save = RECT {
@@ -698,8 +731,6 @@ impl SettingsState {
             right: save.left - px(10),
             bottom: btn_bottom,
         };
-        let auto =
-            RECT { left: m, top: btn_top, right: test.left - px(12), bottom: btn_bottom };
         let status = RECT {
             left: m,
             top: btn_bottom + px(8),
@@ -707,7 +738,7 @@ impl SettingsState {
             bottom: btn_bottom + px(8) + px(22),
         };
 
-        Layout { title, subtitle, modes, rows, auto, test, save, cancel, status }
+        Layout { title, subtitle, modes, rows, auto, auto_launch, test, save, cancel, status }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<Ctl> {
@@ -732,6 +763,9 @@ impl SettingsState {
         }
         if l.auto.contains(x, y) {
             return Some(Ctl::AutoSubmit);
+        }
+        if l.auto_launch.contains(x, y) {
+            return Some(Ctl::AutoLaunchBrowser);
         }
         if l.test.contains(x, y) {
             return Some(Ctl::TestServer);
@@ -1027,6 +1061,45 @@ impl SettingsState {
             &self.fonts[ui::DFONT_UI],
         );
 
+        // 启动时自动打开浏览器（老 Tk 版的行为，默认勾上）
+        // 与「自动提交」共用同一段画法：**绘制与命中共用 l.auto_launch**
+        let cb2 = RECT {
+            left: l.auto_launch.left,
+            top: l.auto_launch.top + (l.auto_launch.height() - sz) / 2,
+            right: l.auto_launch.left + sz,
+            bottom: l.auto_launch.top + (l.auto_launch.height() + sz) / 2,
+        };
+        let hover_launch = f.hover == Some(Ctl::AutoLaunchBrowser);
+        fill_and_border(
+            &ctx,
+            cb2,
+            if f.auto_launch_browser { colors.accent } else { colors.card },
+            if f.auto_launch_browser {
+                colors.accent
+            } else if hover_launch {
+                colors.accent
+            } else {
+                colors.divider
+            },
+            px(5),
+        );
+        if f.auto_launch_browser {
+            draw_glyph(hdc, 0xE73Eu32, cb2, colors.bg, &px);
+        }
+        gdi::text_in(
+            hdc,
+            "启动时自动打开浏览器（沙盒，独立配置）",
+            RECT {
+                left: cb2.right + px(8),
+                top: l.auto_launch.top,
+                right: l.auto_launch.right,
+                bottom: l.auto_launch.bottom,
+            },
+            TextAlign::Left,
+            colors.text_sub,
+            &self.fonts[ui::DFONT_UI],
+        );
+
         // 按钮
         for (ctl, rc, label) in [
             (Ctl::TestServer, l.test, "测试连接"),
@@ -1311,6 +1384,11 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     state.form.focus = None;
                     state.form.auto_submit = !state.form.auto_submit;
                 }
+                Some(Ctl::AutoLaunchBrowser) => {
+                    state.form.finalize();
+                    state.form.focus = None;
+                    state.form.auto_launch_browser = !state.form.auto_launch_browser;
+                }
                 _ => {
                     state.form.finalize();
                     state.form.focus = None;
@@ -1567,14 +1645,15 @@ fn hook_action(hwnd: HWND, state: *mut SettingsState, action: usize) {
         let s = &mut *state;
         // 所有 hook 都先打一行"开窗事实"：探针据此断言对话框真的建起来并回填了设置
         crate::trace::trace(&format!(
-            "settings-hook: opened loaded={} url={} mode={} workers={} timeout={} retry={} auto={}",
+            "settings-hook: opened loaded={} url={} mode={} workers={} timeout={} retry={} auto={} auto_launch={}",
             s.form.loaded,
             s.form.server_url,
             s.form.mode,
             s.form.workers,
             s.form.timeout,
             s.form.retry,
-            s.form.auto_submit
+            s.form.auto_submit,
+            s.form.auto_launch_browser
         ));
         match action {
             HOOK_SAVE => {
@@ -1762,7 +1841,7 @@ fn create(owner: HWND, shared: Arc<Shared>, theme: Theme, hook: usize) -> HWND {
         // 变成 1230x1050 物理像素，在 1600 高的屏幕上会被工作区夹住、底部按钮贴边
         // （实测）。所以这里留足余量：内容实需约 620 逻辑高。
         let w = scale(770);
-        let h = scale(630);
+        let h = scale(664);   // +px(34)：底部多了「启动时自动打开浏览器」一行勾选（2.1.3）
 
         let mut owner_rc = RECT::default();
         GetWindowRect(owner, &mut owner_rc);
@@ -1877,7 +1956,7 @@ fn settings_from_state(shared: &Shared) -> Option<json::Value> {
                 ("has_api_key", json::Value::Bool(st.llm_has_key)),
             ]),
         ),
-        ("run", json::obj(&[("auto_submit", json::Value::Bool(st.auto_submit))])),
+        ("run", json::obj(&[("auto_submit", json::Value::Bool(st.auto_submit)), ("auto_launch_browser", json::Value::Bool(st.auto_launch_browser))])),
     ]))
 }
 
@@ -1915,7 +1994,7 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
                 ("has_api_key", json::Value::Bool(true)),
             ]),
         ),
-        ("run", json::obj(&[("auto_submit", json::Value::Bool(true))])),
+        ("run", json::obj(&[("auto_submit", json::Value::Bool(true)), ("auto_launch_browser", json::Value::Bool(true))])),
     ]);
     state.form.load_from(&data);
     state.form.focus_on(Field::ServerUrl);
