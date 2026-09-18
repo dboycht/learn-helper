@@ -403,6 +403,90 @@ extern "system" {
     pub fn IsWindow(hwnd: HWND) -> BOOL;
     /// 订阅 `WM_MOUSELEAVE`：**每次进入窗口都要重新订阅一次**（系统只投递一次）。
     pub fn TrackMouseEvent(tme: *mut TRACKMOUSEEVENT) -> BOOL;
+    // ---- 剪贴板（自绘文本框要支持 Ctrl+C/V/X；见 native::clipboard_*） ----
+    pub fn OpenClipboard(hwnd: HWND) -> BOOL;
+    pub fn CloseClipboard() -> BOOL;
+    pub fn EmptyClipboard() -> BOOL;
+    pub fn GetClipboardData(format: u32) -> HGLOBAL;
+    pub fn SetClipboardData(format: u32, mem: HGLOBAL) -> HGLOBAL;
+    pub fn GlobalAlloc(flags: u32, bytes: usize) -> HGLOBAL;
+    pub fn GlobalLock(mem: HGLOBAL) -> *mut c_void;
+    pub fn GlobalUnlock(mem: HGLOBAL) -> BOOL;
+    pub fn GlobalSize(mem: HGLOBAL) -> usize;
+    pub fn GlobalFree(mem: HGLOBAL) -> HGLOBAL;
+}
+
+/// 全局内存句柄（本文件统一把 Win32 的 `HANDLE` 写成 `*mut c_void`，
+/// 与 `HWND`/`HBITMAP` 等保持同一种写法；没有单独的 `HANDLE` 别名）。
+pub type HGLOBAL = *mut c_void;
+
+/// 剪贴板格式：Unicode 文本。
+pub const CF_UNICODETEXT: u32 = 13;
+const GMEM_MOVEABLE: u32 = 0x0002;
+
+/// 读剪贴板文本。**失败一律返回 Err**（调用方只记日志，绝不 panic）。
+///
+/// 为什么要这个：设置对话框里的「API Key / Base URL」基本都是**从别处复制来的**，
+/// 而自绘文本框原先只处理 `WM_CHAR`、**没实现 Ctrl+V** ⇒ 用户只能一个字符一个字符敲
+/// （2026-09-18 用户反馈"文本框不能粘贴"）。
+pub fn clipboard_get_text() -> Result<String, String> {
+    unsafe {
+        // ⚠️ 剪贴板是全局单例：必须成对 Open/Close；拿不到就立刻返回（别死等）
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            return Err("剪贴板被其它程序占用".into());
+        }
+        let mut out = Err("剪贴板里没有文本".into());
+        let h = GetClipboardData(CF_UNICODETEXT);
+        if !h.is_null() {
+            let p = GlobalLock(h) as *const u16;
+            if !p.is_null() {
+                let units = GlobalSize(h) / 2;
+                let mut len = 0usize;
+                while len < units && *p.add(len) != 0 {
+                    len += 1;
+                }
+                let slice = std::slice::from_raw_parts(p, len);
+                out = Ok(String::from_utf16_lossy(slice));
+                GlobalUnlock(h);
+            } else {
+                out = Err("剪贴板内容无法读取".into());
+            }
+        }
+        CloseClipboard();
+        out
+    }
+}
+
+/// 写剪贴板文本（Ctrl+C / Ctrl+X 用）。
+pub fn clipboard_set_text(text: &str) -> Result<(), String> {
+    let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let bytes = wide.len() * 2;
+    unsafe {
+        let mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if mem.is_null() {
+            return Err("分配剪贴板内存失败".into());
+        }
+        let dst = GlobalLock(mem) as *mut u16;
+        if dst.is_null() {
+            GlobalFree(mem);
+            return Err("锁定剪贴板内存失败".into());
+        }
+        std::ptr::copy_nonoverlapping(wide.as_ptr(), dst, wide.len());
+        GlobalUnlock(mem);
+        if OpenClipboard(std::ptr::null_mut()) == 0 {
+            GlobalFree(mem);
+            return Err("剪贴板被其它程序占用".into());
+        }
+        EmptyClipboard();
+        // 交给系统后内存所有权归剪贴板（不能再 GlobalFree）
+        if SetClipboardData(CF_UNICODETEXT, mem).is_null() {
+            CloseClipboard();
+            GlobalFree(mem);
+            return Err("写入剪贴板失败".into());
+        }
+        CloseClipboard();
+        Ok(())
+    }
 }
 
 /// `TrackMouseEvent` 的入参。

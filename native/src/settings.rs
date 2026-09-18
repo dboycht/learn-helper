@@ -402,6 +402,94 @@ impl Form {
         self.error = None;
     }
 
+    /// 粘贴一段文本（Ctrl+V）。返回实际插入了几个字符（0 = 没插入，用于日志）。
+    ///
+    /// 规则：
+    /// - **粘贴整段替换选中内容**（和点进字段时的"全选"配合起来，才是用户预期的手感）；
+    /// - 数字字段只收数字；文本字段按 `max_len()` 截断（先截再插，不会插一半）；
+    /// - **把换行/回车归一成空格**：从网页或终端复制 API Key / URL 常常带尾巴换行，
+    ///   直接插进去会让输入框里出现看不见的换行（后续存进 config.json 也难看）。
+    fn paste(&mut self, raw: &str) -> usize {
+        let Some(f) = self.focus else { return 0 };
+        let cleaned: String = raw
+            .chars()
+            .map(|c| if c == '\r' || c == '\n' || c == '\t' { ' ' } else { c })
+            .filter(|c| !c.is_control())
+            .collect();
+        if cleaned.is_empty() {
+            return 0;
+        }
+        let mut text = self.field_text(f);
+        if self.sel_all {
+            text.clear();
+            self.caret = 0;
+            self.sel_all = false;
+        }
+        let room = f.max_len().saturating_sub(text.chars().count());
+        if room == 0 {
+            return 0;
+        }
+        let accept = |c: char| if f.numeric() { c.is_ascii_digit() } else { true };
+        let add: String = cleaned.chars().filter(|c| accept(*c)).take(room).collect();
+        if add.is_empty() {
+            return 0;
+        }
+        let idx = self.caret.min(text.chars().count());
+        let mut out = String::with_capacity(text.len() + add.len());
+        for (i, c) in text.chars().enumerate() {
+            if i == idx {
+                out.push_str(&add);
+            }
+            out.push(c);
+        }
+        if idx >= text.chars().count() {
+            out.push_str(&add);
+        }
+        let added = add.chars().count();
+        self.set_field_text(f, out);
+        self.caret = (idx + added).min(self.field_text(f).chars().count());
+        self.touch(f);
+        self.error = None;
+        added
+    }
+
+    /// 当前"选中"的文本（供 Ctrl+C / Ctrl+X）。
+    /// 本对话框的选中模型很简单：要么**整段全选**，要么"从插入符到行尾"。
+    fn selected_text(&self) -> Option<String> {
+        let f = self.focus?;
+        let text = self.field_text(f);
+        if text.is_empty() {
+            return None;
+        }
+        if self.sel_all {
+            return Some(text);
+        }
+        let idx = self.caret.min(text.chars().count());
+        let tail: String = text.chars().skip(idx).collect();
+        if tail.is_empty() {
+            None
+        } else {
+            Some(tail)
+        }
+    }
+
+    /// 删除"选中"的部分（Ctrl+X 用；与 `selected_text` 同一套选中模型）。
+    fn cut_selected(&mut self) {
+        let Some(f) = self.focus else { return };
+        let text = self.field_text(f);
+        let keep: String = if self.sel_all {
+            self.caret = 0;
+            self.sel_all = false;
+            String::new()
+        } else {
+            let idx = self.caret.min(text.chars().count());
+            text.chars().take(idx).collect()
+        };
+        self.set_field_text(f, keep);
+        self.touch(f);
+        self.error = None;
+    }
+
     fn backspace(&mut self) {
         let Some(f) = self.focus else { return };
         if self.sel_all {
@@ -498,6 +586,20 @@ impl Form {
     }
 }
 
+/// 把字段值打成"可核对但不泄密"的形式：前 6 个字符 + 长度 + 掩码尾。
+///
+/// 为什么需要：Ctrl+C/V/X 这类操作要能在诊断日志里**被断言**（否则无从验证），
+/// 但字段里可能是 API Key —— 本项目有过把 api_key 明文打进日志/会话的事故记录，
+/// 所以诊断行只允许出现"前几位 + 总长度 + ***"。
+fn mask_secret(s: &str) -> String {
+    let n = s.chars().count();
+    if n == 0 {
+        return "(empty)".to_string();
+    }
+    let head: String = s.chars().take(6).collect();
+    format!("{}{}***  len={}", head, if n > 6 { "…" } else { "" }, n)
+}
+
 /// 最小 JSON 字符串转义（后端要求 ASCII 安全的报文）。
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
@@ -534,6 +636,13 @@ struct SettingsState {
     probe_client: Option<RECT>,
     /// 渲染探针用：显式指定 DPI
     dpi_override: Option<u32>,
+    /// Ctrl 是否按下（**从键盘消息维护**，不依赖 `GetKeyState`）。
+    ///
+    /// 为什么要它：`GetKeyState(VK_CONTROL)` 读的是调用线程消息队列里的键状态，
+    /// **只对真实键盘有效**；探针用 `SendMessage(WM_KEYDOWN, VK_CONTROL)` 注入时读不到
+    /// ⇒ 自动化就验证不了 Ctrl+V/C/X。这里额外跟踪 VK_CONTROL 的按下/抬起，
+    /// 两条路（真实键盘 / 注入消息）都能工作（2.1.3）。
+    ctrl_down: bool,
 }
 
 impl SettingsState {
@@ -551,6 +660,7 @@ impl SettingsState {
             test_seq: Arc::new(AtomicI64::new(0)),
             probe_client: None,
             dpi_override: None,
+            ctrl_down: false,
         }
     }
 
@@ -1511,8 +1621,19 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
             }
             0
         }
+        WM_KEYUP => {
+            if wp == VK_CONTROL {
+                state.ctrl_down = false;
+            }
+            0
+        }
         WM_KEYDOWN => {
-            let ctrl = (GetKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
+            // Ctrl 状态：物理键盘走 GetKeyState；探针注入的消息走 VK_CONTROL 按下/抬起跟踪
+            if wp == VK_CONTROL {
+                state.ctrl_down = true;
+            }
+            let ctrl = state.ctrl_down
+                || (GetKeyState(VK_CONTROL as i32) as u16 & 0x8000) != 0;
             match wp {
                 VK_ESCAPE => {
                     crate::trace::trace("settings: Escape → 关闭（不写盘）");
@@ -1577,6 +1698,51 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                         state.form.sel_all = true;
                         state.form.caret = state.form.field_text(f).chars().count();
                         InvalidateRect(hwnd, std::ptr::null(), 0);
+                    }
+                    0
+                }
+                VK_V if ctrl => {
+                    // 粘贴：读系统剪贴板 → 插到插入符处（有选中就先替换）
+                    if let Some(f) = state.form.focus {
+                        match crate::native::clipboard_get_text() {
+                            Ok(txt) => {
+                                let n = state.form.paste(&txt);
+                                // ⚠️ 诊断行**只落字符数与掩码**：API Key 绝不能进日志
+                                crate::trace::trace(&format!(
+                                    "settings: paste chars={} field={:?} value={}",
+                                    n, f, mask_secret(&state.form.field_text(f))
+                                ));
+                                InvalidateRect(hwnd, std::ptr::null(), 0);
+                            }
+                            Err(e) => crate::trace::trace(&format!("settings: paste failed: {}", e)),
+                        }
+                    }
+                    0
+                }
+                VK_C if ctrl => {
+                    // 复制：整段有选中就复制整段，否则复制到行尾（与常见编辑框一致）
+                    let payload = state.form.selected_text();
+                    if let Some(txt) = payload {
+                        match crate::native::clipboard_set_text(&txt) {
+                            Ok(()) => crate::trace::trace(&format!(
+                                "settings: copy chars={}", txt.chars().count()
+                            )),
+                            Err(e) => crate::trace::trace(&format!("settings: copy failed: {}", e)),
+                        }
+                    }
+                    0
+                }
+                VK_X if ctrl => {
+                    // 剪切：先复制再删掉（有选中就整段删，否则删到行尾）
+                    let payload = state.form.selected_text();
+                    if let Some(txt) = payload {
+                        if crate::native::clipboard_set_text(&txt).is_ok() {
+                            state.form.cut_selected();
+                            crate::trace::trace(&format!(
+                                "settings: cut chars={}", txt.chars().count()
+                            ));
+                            InvalidateRect(hwnd, std::ptr::null(), 0);
+                        }
                     }
                     0
                 }
@@ -1712,6 +1878,8 @@ const HOOK_NONE: usize = 0;
 const HOOK_SAVE: usize = 1;
 const HOOK_CANCEL: usize = 2;
 const HOOK_OPEN: usize = 3;
+/// 验证 Ctrl+V：把焦点放到「大模型 API Key」再注入一次 Ctrl+V，断言剪贴板内容真的进了输入框。
+const HOOK_PASTE: usize = 4;
 
 /// 用**真实消息**驱动对话框（走与鼠标完全相同的窗口过程路径）。
 fn hook_action(hwnd: HWND, state: *mut SettingsState, action: usize) {
@@ -1788,6 +1956,28 @@ fn hook_action(hwnd: HWND, state: *mut SettingsState, action: usize) {
                 crate::trace::trace(&format!(
                     "settings-hook: after escape window_alive={}",
                     IsWindow(hwnd) != 0
+                ));
+                exit_after_hook();
+            }
+            HOOK_PASTE => {
+                // Ctrl+V 验证：把焦点放到 API Key 字段（点进字段 = 全选），
+                // 再**用真实键盘消息**注入 Ctrl 按下 + V，走与用户完全相同的代码路径。
+                let rc = rect_of_field(s, Field::LlmKey);
+                click_rect(hwnd, s, rc);
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                crate::trace::trace(&format!(
+                    "settings-hook: paste target focused={:?} value_before='{}'",
+                    s.form.focus,
+                    mask_secret(&s.form.field_text(Field::LlmKey))
+                ));
+                SendMessageW(hwnd, WM_KEYDOWN, VK_CONTROL, 0);
+                SendMessageW(hwnd, WM_KEYDOWN, VK_V, 0);
+                SendMessageW(hwnd, WM_KEYUP, VK_V, 0);
+                SendMessageW(hwnd, WM_KEYUP, VK_CONTROL, 0);
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                crate::trace::trace(&format!(
+                    "settings-hook: paste done value_after='{}'",
+                    mask_secret(&s.form.field_text(Field::LlmKey))
                 ));
                 exit_after_hook();
             }
@@ -1899,6 +2089,7 @@ pub fn show_with_hook(owner: HWND, shared: Arc<Shared>, theme: Theme, action: &s
     let hook = match action {
         "settings_save" => HOOK_SAVE,
         "settings_cancel" => HOOK_CANCEL,
+        "settings_paste" => HOOK_PASTE,
         _ => HOOK_OPEN,
     };
     create(owner, shared, theme, hook);

@@ -218,8 +218,37 @@ if ($null -ne $cfg3) {
     Check "plain open did not touch config" ($cfg3.server_url -eq 'http://127.0.0.1:8000')
 }
 
+# -------------------------------------------------------------- CASE 4: Ctrl+V paste
+Write-Host ""
+Write-Host "CASE 4: paste into a text field with Ctrl+V (real clipboard + real key messages)"
+#
+# Why this case exists: the dialog is a self-drawn text box that handles WM_CHAR itself, so it only
+# supports the editing keys we implement. Ctrl+V was missing entirely -> users could not paste an
+# API key (2026-09-18 user report). This case drives the real path: put text on the system
+# clipboard, then run the dialog with LH_UI_ACTION=settings_paste, which focuses the API Key field
+# and injects Ctrl + V as genuine keyboard messages.
+#
+# The value is asserted through the MASKED diagnostic line ("sk-pas...*** len=29") -- the probe must
+# never see the raw secret, and neither should the log.
+$pasteText = 'sk-pastetest-0123456789abcdef'          # 29 chars, deliberately longer than the mask head
+$clipSaved = $null
+try { $clipSaved = Get-Clipboard -Raw -ErrorAction SilentlyContinue } catch { }
+Set-Clipboard -Value $pasteText
+$d4 = New-TempDir 'paste'
+Write-Seed $d4 'http://127.0.0.1:8000'
+$log4 = Invoke-Ui $d4 'settings_paste' 30
+Check "paste hook focused the API Key field" (@($log4 | Where-Object { $_ -match 'paste target focused=Some\(LlmKey\)' }).Count -gt 0)
+$pasteLine = @($log4 | Where-Object { $_ -match 'settings: paste chars=' })[-1]
+Check "Ctrl+V pasted from the real clipboard" (($null -ne $pasteLine) -and ($pasteLine -match ('chars=' + $pasteText.Length))) ("line=" + $pasteLine)
+Check "pasted value landed in the field (masked, len checked)" (($null -ne $pasteLine) -and ($pasteLine -match ('len=' + $pasteText.Length)) -and ($pasteLine -match 'sk-pas')) ("line=" + $pasteLine)
+Check "the log only carries the mask, never the raw secret" (($null -ne $pasteLine) -and ($pasteLine -notmatch [regex]::Escape($pasteText)))
+$afterLine = @($log4 | Where-Object { $_ -match 'paste done value_after=' })[-1]
+Check "field content confirmed after the paste" (($null -ne $afterLine) -and ($afterLine -match ('len=' + $pasteText.Length))) ("line=" + $afterLine)
+# Restore whatever the user had on the clipboard (a probe must not steal it).
+if ($null -ne $clipSaved) { Set-Clipboard -Value $clipSaved } else { Set-Clipboard -Value '' }
+
 Write-Host ""
 Write-Host ("RESULT: " + $script:pass + " passed, " + $script:fail + " failed")
-Write-Host ("temp dirs kept for inspection: " + $d1 + " ; " + $d2 + " ; " + $d3)
+Write-Host ("temp dirs kept for inspection: " + $d1 + " ; " + $d2 + " ; " + $d3 + " ; " + $d4)
 if ($script:fail -gt 0) { exit 1 }
 exit 0

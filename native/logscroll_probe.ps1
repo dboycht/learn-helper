@@ -330,6 +330,14 @@ $downTrace = @($logDown | Where-Object { $_ -match 'log scroll bar down' })[-1]
 Check "pressing the thumb is recognised as a thumb grab" ($downTrace -and $downTrace -match 'zone=thumb') ("trace=" + $downTrace)
 [LhProbe]::Move($h1, $trackX, ($trackTop + 2))
 Start-Sleep -Milliseconds 400
+# Re-send the SAME move right before releasing. Reason: a genuine WM_MOUSEMOVE (the OS reports the
+# physical cursor position, which the user owns) can land between our move and our release, and
+# during a drag that genuine message legitimately re-computes the position -- so the release would
+# record whatever the real cursor implied (observed: a stale/off-screen y=65216 -> "drag to top"
+# ended up following the tail again). Posting the intended position last pins the drag where the
+# probe wants it, without touching the user's mouse.
+[LhProbe]::Move($h1, $trackX, ($trackTop + 2))
+Start-Sleep -Milliseconds 200
 [LhProbe]::Up($h1, $trackX, ($trackTop + 2))
 Start-Sleep -Milliseconds 400
 $logTop = Diag-Lines $snap1
@@ -346,11 +354,14 @@ Check "still not following after dragging to the top" ($topFollow -eq 0) ("trace
 
 # --- drag it back to the very bottom: following must resume.
 # Asserted on the drag traces too: `first` in a dump is a snapshot, and the log keeps growing.
+# Same "post the intended position last" trick as above (a genuine mouse move can interleave).
 Reset-Diag
 [LhProbe]::Down($h1, $trackX, ($trackTop + 2))
 Start-Sleep -Milliseconds 300
 [LhProbe]::Move($h1, $trackX, ($trackTop + $trackH + 40))
-Start-Sleep -Milliseconds 400
+Start-Sleep -Milliseconds 300
+[LhProbe]::Move($h1, $trackX, ($trackTop + $trackH + 40))
+Start-Sleep -Milliseconds 200
 $logDragDown = Diag-Lines $snap1
 [LhProbe]::Up($h1, $trackX, ($trackTop + $trackH + 40))
 Start-Sleep -Milliseconds 400
