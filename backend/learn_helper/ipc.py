@@ -628,6 +628,10 @@ def _make_handler(hub, on_shutdown):
                 # 界面启动后自动拉起沙盒浏览器（老 Tk 版 auto_launch_browser_on_start 的行为）。
                 # 失败只记日志（比如本机没装 Edge/Chrome），**不该打扰用户**。
                 ok, msg = engine.auto_launch_browser()
+                # ⚠️ 把结论**写进后端日志**：`_control` 的公共尾巴只调 emit_status()，
+                # 界面内存里的日志外部读不到 ⇒ 探针无法证明"后端答了跳过还是真去拉了"
+                # （autolaunch_probe 的"关掉开关"用例实测踩到）。emit_log 同时会落 LOGGER。
+                hub.emit_log(f'[浏览器] {msg}')
                 if not ok:
                     hub.emit_log(f'[浏览器] 自动打开失败：{msg}（可点「检测/刷新网页」重试）')
             elif action == 'diagnose':

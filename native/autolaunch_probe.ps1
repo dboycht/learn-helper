@@ -184,8 +184,29 @@ $log2 = Wait-Diag $snap2 'launch_browser' 20000
 Check "UI still asked the backend (the decision lives in the backend)" (@($log2 | Where-Object { $_ -match 'launch_browser' }).Count -gt 0)
 Start-Sleep -Seconds 6
 $log2b = Diag-Lines $snap2
-$skipLine = @($log2b | Where-Object { $_ -match 'launch_browser' })[-1]
-Check "backend answered with the skip message" (($null -ne $skipLine) -and ($skipLine -match [regex]::Escape([char]0x8DF3 + [char]0x8FC7) -or $skipLine -match 'skip'))
+# Two independent pieces of evidence that the backend REFUSED (not just "nothing appeared"):
+#   a) the app records the backend's answer in its diagnostics (`ui: launch_browser -> ...`),
+#   b) the backend writes the same conclusion into its own file log (tagged with its own
+#      browser marker).
+# The interface's log panel only lives in memory, so without these an external probe could only
+# prove "no browser showed up" -- which is also true when the app is simply broken.
+$skipLine = @($log2b | Where-Object { $_ -match 'launch_browser -> ' })[-1]
+Check "the app recorded the backend's answer" ($null -ne $skipLine) ("line=" + $skipLine)
+$backendLog = Join-Path $d2 'logs\learn_helper.log'
+$backLines = @(Get-Content $backendLog -Encoding UTF8 -ErrorAction SilentlyContinue)
+# The backend writes the decision through a logger line shaped like
+#   "2026-09-18 17:39:16 [INFO] [<browser-tag>] <decision text>"
+# so the marker is "] [" + the browser tag + "]".
+#
+# IMPORTANT: the tags are built from code points (\uXXXX), NOT written as literal Chinese.
+# This script must stay pure ASCII: PS 5.1 reads BOM-less files as GBK, so a Chinese literal
+# here gets decoded into mojibake, the regex silently stops matching, and the check fails while
+# the log clearly contains the line (exactly what happened on the first run of this probe -- E55).
+$browserTag = [string]([char]0x6D4F + [char]0x89C8 + [char]0x5668)          # "browser"
+$skipTag = [string]([char]0x8DF3 + [char]0x8FC7)                            # "skipped"
+$decisionMarker = '] [' + $browserTag + ']'
+Check "the backend logged the auto-launch decision" (@($backLines | Where-Object { $_ -match [regex]::Escape($decisionMarker) }).Count -gt 0) ("log=" + $backendLog)
+Check "the logged decision says it was skipped" (@($backLines | Where-Object { ($_ -match [regex]::Escape($decisionMarker)) -and ($_ -match [regex]::Escape($skipTag)) }).Count -gt 0)
 $portNow = Port-Open
 Check "no browser was launched (9222 still closed)" ((-not $portNow) -or $portWasOpen) ("port open now = " + $portNow)
 $cfg2 = Get-Content (Join-Path $d2 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json

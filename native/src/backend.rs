@@ -282,6 +282,22 @@ fn python_exe_path(launcher: &str) -> Option<String> {
 
 /// 在后台线程完成：拉起后端 → 握手 → 连管道 → 首次拉状态。
 pub fn start_async(shared: Arc<Shared>) {
+    // 验证钩子：`LH_NO_BACKEND=1` 时**完全不拉后端**（界面自己跑，没有 HTTP/管道）。
+    //
+    // 为什么需要它：探针要验证"界面自己的行为"时，后端会持续往日志面板写行
+    // （握手/状态轮询），于是"日志条数不变"这类断言根本立不住 —— 实测踩到
+    // （`logscroll_probe.ps1` 的"日志不满一屏就没有滚动条"用例）。
+    // 早先那套"把 exe 复制到没有 backend/ 的目录"的绕法**不可靠**：
+    // `locate_backend()` 会沿目录树向上找，从 %TEMP% 子目录往上 4 层仍可能找到真后端。
+    if std::env::var("LH_NO_BACKEND").is_ok() {
+        crate::trace::trace("backend: start skipped (LH_NO_BACKEND set)");
+        let mut st = shared.lock();
+        st.status_text = "验证模式：未启动后端".into();
+        st.push_log("[native] (验证) LH_NO_BACKEND=1：未启动后端");
+        drop(st);
+        shared.notify_ui();
+        return;
+    }
     std::thread::spawn(move || {
         match spawn_and_handshake(&shared) {
             Ok((port, pipe_name)) => {

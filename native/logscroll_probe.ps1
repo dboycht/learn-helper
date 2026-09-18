@@ -185,7 +185,7 @@ if ($running.Count -gt 0) {
     exit 3
 }
 
-function Start-Case([string]$dir, [string]$logs, [string]$exePath = $Exe, [string]$hoverPin = '') {
+function Start-Case([string]$dir, [string]$logs, [string]$exePath = $Exe, [string]$hoverPin = '', [string]$noBackend = '') {
     if (-not (Wait-NoInstance)) { Write-Host "  WARNING: previous instance still running" }
     $env:LH_BASE_DIR = $dir
     $env:LH_PROBE_LOGS = $logs
@@ -196,6 +196,14 @@ function Start-Case([string]$dir, [string]$logs, [string]$exePath = $Exe, [strin
     # unpinned one because the app had never seen the variable; 2.1.3, E50).
     if ($hoverPin -ne '') { $env:LH_PROBE_HOVER_BAR = $hoverPin }
     else { Remove-Item Env:LH_PROBE_HOVER_BAR -ErrorAction SilentlyContinue }
+    # `LH_NO_BACKEND=1` = do not spawn the Python backend at all. Needed by the short-log case:
+    # with a live backend the panel keeps gaining lines (handshake / status pollers) and
+    # "everything still fits, so there is no bar" stops being true a few seconds later.
+    # The older workaround -- running a COPY of the exe from a folder without backend/ -- is
+    # unreliable: locate_backend() walks UP the directory tree and still found the real backend
+    # from a %TEMP% subfolder (that is why this case failed; 2.1.3, E54).
+    if ($noBackend -ne '') { $env:LH_NO_BACKEND = $noBackend }
+    else { Remove-Item Env:LH_NO_BACKEND -ErrorAction SilentlyContinue }
     # The diag log lives next to the exe, so each case may have its own copy (see CASE 3).
     $script:diag = Join-Path (Split-Path -Parent $exePath) 'native-diag.log'
     Reset-Diag
@@ -421,17 +429,17 @@ Write-Host ""
 Write-Host "CASE 3: fewer lines than fit -> no bar, and the bar area is inert"
 # This case needs a log that does NOT grow while we test it, so it runs a COPY of the exe from
 # a directory with no backend/ next to it: locate_backend() searches upward from the exe, so
-# without that folder no backend is spawned and nothing appends log lines. (With a live backend
-# the panel kept gaining lines, and after a few seconds it overflowed -- the "no bar" case
-# silently turned into "bar present" and the assertions measured the wrong thing.)
+# This case needs a log that does NOT grow while we test it, so the backend is turned off
+# entirely with `LH_NO_BACKEND=1` (see Start-Case). With a live backend the panel kept gaining
+# lines (handshake / status pollers), and after a few seconds it overflowed -- the "no bar" case
+# silently turned into "bar present" and the assertions measured the wrong thing.
 $d3 = New-TempDir 'short'
-$exe3 = Join-Path $d3 'learn-helper-native.exe'
-Copy-Item $Exe $exe3 -Force
 $few = @(1..3 | ForEach-Object { "short line " + $_ }) -join '|'
 $snap3 = Join-Path $env:TEMP ("lh-logscroll-3-" + (Get-Random) + ".log")
-$case3 = Start-Case $d3 $few $exe3
+$case3 = Start-Case $d3 $few $Exe '' '1'
 $h3 = $case3.Hwnd
 Check "main window found (short case, no backend)" ($h3 -ne [IntPtr]::Zero)
+Check "backend really skipped for this case" ((@(Get-Content $script:diag -Encoding UTF8 -ErrorAction SilentlyContinue | Where-Object { $_ -match 'LH_NO_BACKEND' }).Count) -gt 0)
 Start-Sleep -Seconds 4   # let any startup chatter settle; no backend means nothing more arrives
 Reset-Diag
 [LhProbe]::Move($h3, $logPadX, $logPadY)

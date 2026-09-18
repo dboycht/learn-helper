@@ -427,7 +427,10 @@ impl App {
         // ⚠️ 这是**一次性**动作，别挪进定时器/轮询里（那会反复去拉浏览器）。
         // `LH_NO_AUTO_BROWSER=1` 时整段跳过（验证/排障用，正常用户不设）。
         if std::env::var("LH_NO_AUTO_BROWSER").is_err() {
+            crate::trace::trace("ui: auto browser launch armed (4s)");
             spawn_action_delayed(app.shared.clone(), "launch_browser", 4000);
+        } else {
+            crate::trace::trace("ui: auto browser launch skipped (LH_NO_AUTO_BROWSER set)");
         }
 
         // 诊断：每 5 秒把累计重绘次数落盘一次（验证"空闲时不再周期性重画"）。
@@ -640,8 +643,13 @@ impl App {
         //
         // 顺便钉住日志滚动条的悬停态（`LH_PROBE_HOVER_BAR`）：悬停时滑块会用强调色，
         // 于是"高亮到底画没画出来"可以**靠像素比对**验证，而不用去动用户的光标。
-        if let Some(on) = self.probe_hover_bar {
-            self.hover_log_bar = on;
+        // ⚠️ 真正的钉住在 `paint()` 里（**实时窗口走 paint，不走这里**）——
+        //    最初错放在 render_to，导致真窗口上这个开关完全没生效（2.1.3, E54）。
+        if let Ok(v) = std::env::var("LH_PROBE_HOVER_BAR") {
+            crate::trace::trace(&format!(
+                "probe: hover-bar pin env='{}' parsed={:?}",
+                v, self.probe_hover_bar
+            ));
         }
         let l = self.layout();
         let btn = self.refresh_rect(l.page);
@@ -669,6 +677,14 @@ impl App {
 
     // ================================================================ 绘制
     pub fn paint(&mut self, hdc: HDC) {
+        // ⚠️ **钉住悬停态的开关必须在这里生效，不能在 `render_to()` 里**。
+        // 实时窗口的重绘路径是 `WM_PAINT → paint()`，`render_to()` 只服务渲染探针；
+        // 最初把它写在 `render_to()`（以为"绘制路径同一份代码"），结果**真窗口上
+        // `LH_PROBE_HOVER_BAR` 完全没生效**，`logscroll_probe` 的 CASE 2b 因此假失败
+        // （dump 永远 hover=0）—— 排查时先怀疑探针、最后才发现是**应用侧的钩子放错位置**（E54）。
+        if let Some(on) = self.probe_hover_bar {
+            self.hover_log_bar = on;
+        }
         let w = self.w;
         let h = self.h;
         let colors = self.colors;
@@ -1823,17 +1839,25 @@ impl App {
         }
     }
 
-    fn on_lbutton_up(&mut self, x: i32, y: i32) {
+    fn on_lbutton_up(&mut self, x: i32, y: i32, raw_lp: isize) {
         // 松手结束滚动条拖动。⚠️ 这里**不复用 Ctl 那套 pressed 白名单**：
         // 滚动条不是 Ctl，混在一起会被"拉大后不可点"地漏掉（见 ERROR.md E42 白名单坑）。
         if self.log_bar_drag {
-            let next = self.log_scroll_for_drag(y);
-            self.log_scroll = next;
-            self.log_follow = next >= self.log_max_first;
+            // ⚠️ **松手不重算**：位置已经在 `on_mouse_move` 里按位移算好了，抬手就用那个值。
+            // 曾经这里又按"抬手坐标"算了一遍 —— 而抬手消息的坐标**未必是最后一次移动的坐标**
+            // （实测见过 y=-288 的抬手：屏幕外/陈旧坐标），一重算就把正确位置覆盖掉，
+            // 表现成"拖到顶了却跳到最新一行"（E55）。
+            self.log_follow = self.log_scroll >= self.log_max_first;
             self.log_bar_drag = false;
+            // 落一行含**原始 LPARAM** 的诊断：拖动偶发"没生效"时，能区分是"消息里坐标不对"
+            // 还是"换算算错"（正是靠这一行定位到上面那个抬手坐标问题）。
             crate::trace::trace(&format!(
-                "ui: log scroll bar drag end at y={} -> first={}/{} follow={}",
-                y, self.log_scroll, self.log_max_first, self.log_follow as u8
+                "ui: log scroll bar drag end at y={} (raw lp={}) -> first={}/{} follow={}",
+                y,
+                raw_lp,
+                self.log_scroll,
+                self.log_max_first,
+                self.log_follow as u8
             ));
             unsafe {
                 ReleaseCapture();
@@ -1991,7 +2015,7 @@ impl App {
             WM_LBUTTONUP => {
                 let x = (lp & 0xFFFF) as i32;
                 let y = ((lp >> 16) & 0xFFFF) as i32;
-                self.on_lbutton_up(x, y);
+                self.on_lbutton_up(x, y, lp);
                 0
             }
             WM_MOUSEWHEEL => {
@@ -2280,15 +2304,22 @@ fn spawn_action_ex(
         if delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(delay_ms));
         }
+        crate::trace::trace(&format!("ui: scripted action '{}' -> sending", action));
         let result = backend::control(&shared, action, params);
         if quiet {
-            // 只把结果写进日志，不动 status_text（该字段用户当前在看的东西不该被抢）
-            let mut st = shared.lock();
-            match result {
-                Ok(msg) => st.push_log(&format!("[native] {} → {}", action, msg)),
-                Err(err) => st.push_log(&format!("[native] {} 跳过：{}", action, err)),
+            // 只把结果写进日志，不动 status_text（该字段用户当前在看的东西不该被抢）。
+            // ⚠️ 同时落一行**诊断日志**：界面日志只存在内存里，外部探针读不到，
+            // 于是"后端到底答了什么"就无处可查（实测：`autolaunch_probe.ps1` 关掉开关的那个
+            // case 只能证明"没拉浏览器"，证明不了"后端回了跳过"）。诊断行不影响用户体验。
+            let line = match result {
+                Ok(msg) => format!("ui: {} -> {}", action, msg),
+                Err(err) => format!("ui: {} skipped: {}", action, err),
+            };
+            crate::trace::trace(&line);
+            {
+                let mut st = shared.lock();
+                st.push_log(&format!("[native] {}", line));
             }
-            drop(st);
             shared.notify_ui();
             return;
         }
