@@ -694,6 +694,13 @@ def _make_handler(hub, on_shutdown):
                 if not ok:
                     return self._err(msg)
                 messages.append(msg)
+            if 'skip_quiz_only' in body:
+                if engine is None:
+                    return self._err('引擎未就绪', 503)
+                ok, msg = engine.set_skip_quiz_only(body['skip_quiz_only'])
+                if not ok:
+                    return self._err(msg)
+                messages.append(msg)
             if patch:
                 update_config(patch)
             if engine is not None:
@@ -732,5 +739,7 @@ def settings_payload(hub):
             'auto_submit': engine.settings.get('auto_submit', True) if engine else True,
             'auto_launch_browser': (engine.settings.get('auto_launch_browser', True)
                                     if engine else True),
+            'skip_quiz_only': (engine.settings.get('skip_quiz_only', False)
+                               if engine else False),
         },
     }

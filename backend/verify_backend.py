@@ -345,6 +345,17 @@ def test_engine_unit():
           get_run_cfg()['auto_launch_browser'] is True,
           f"got={get_run_cfg()['auto_launch_browser']!r}")
 
+    # B3e/B3f：只刷视频（开启后，只有题目、没有视频/文档的章节整节跳过）
+    check('B3e 默认 skip_quiz_only=False（不改变现有行为）',
+          get_run_cfg()['skip_quiz_only'] is False,
+          f"got={get_run_cfg()['skip_quiz_only']!r}")
+    ok, msg = eng.set_skip_quiz_only(True)
+    check('B3f skip_quiz_only 开启并写回 config',
+          ok and eng.settings['skip_quiz_only'] is True
+          and get_run_cfg()['skip_quiz_only'] is True,
+          f'settings={eng.settings.get("skip_quiz_only")!r} cfg={get_run_cfg()["skip_quiz_only"]!r}')
+    eng.set_skip_quiz_only(False)
+
     ok, msg = eng.start()
     check('B4 start(未选页) 返回 False + 提示', not ok and '网页' in msg)
     hub.selected_title = '[请点击右侧刷新选择网页]'

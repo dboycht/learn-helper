@@ -83,6 +83,15 @@ class SolverEngine:
         return True, ('启动时将自动打开浏览器' if enabled
                       else '启动时不再自动打开浏览器（可随时点「检测/刷新网页」手动打开）')
 
+    def set_skip_quiz_only(self, enabled):
+        """「只刷视频」开关：只跳"纯测验章节"，视频里弹的题不受影响。"""
+        enabled = bool(enabled)
+        self.settings['skip_quiz_only'] = enabled
+        update_config({'run': {'skip_quiz_only': enabled}})
+        return True, ('已开启「只刷视频」：只有题目、没有视频/文档的章节会整节跳过'
+                      if enabled
+                      else '已关闭「只刷视频」：测验章节恢复自动答题')
+
     def auto_launch_browser(self):
         """界面启动后的延时动作：配置开着就拉起沙盒浏览器。
 
@@ -442,19 +451,11 @@ class SolverEngine:
                                 pass
                             time.sleep(0.3)
 
-                            # ---- 答题（内部答题 API / 自配大模型 / 仅识别）----
-                            questions, target_frame = core.scan_page_recursively(target_page)
-                            if questions:
-                                if core.check_quiz_completed(questions, target_frame):
-                                    hub.emit_log('      [跳过] 该测验任务点已被平台标记完成。')
-                                    self.quiz_text = '已完成'
-                                else:
-                                    self._solve_question_batch(questions, target_page)
-                            else:
-                                self.quiz_text = '无题目'
-                            hub.emit_status()
-
-                            # 扫描音视频/文档任务（多选择器 + 多帧回退）
+                            # ---- 先扫音视频/文档任务（多选择器 + 多帧回退）----
+                            #
+                            # ⚠️ **顺序很重要**：这一段原来在"答题"之后。为了让「只刷视频」
+                            # （`run.skip_quiz_only`）能判断"本节到底有没有视频"，
+                            # 必须**先**知道本节有哪些媒体任务点，再决定要不要答题（2.1.3）。
                             containers = core.collect_job_containers(target_page, cards_frame)
                             hub.emit_log(f'      [识别] 发现候选任务容器 {len(containers)} 个')
                             valid_jobs = []
@@ -480,6 +481,34 @@ class SolverEngine:
                                     valid_jobs.append(ph)
                                 except Exception as ex:
                                     LOGGER.info(f'[识别] 容器检查异常: {ex}')
+
+                            has_media = any(
+                                any(k in ph.inner_html().lower() for k in
+                                    ('video', 'audio', 'fastforward', 'insertvideo',
+                                     'pdf', 'ppt', 'doc', 'preview'))
+                                for ph in valid_jobs)
+
+                            # ---- 答题（内部答题 API / 自配大模型 / 仅识别）----
+                            questions, target_frame = core.scan_page_recursively(target_page)
+                            if questions:
+                                done = core.check_quiz_completed(questions, target_frame)
+                                if done:
+                                    hub.emit_log('      [跳过] 该测验任务点已被平台标记完成。')
+                                    self.quiz_text = '已完成'
+                                elif self.settings.get('skip_quiz_only', False) and not has_media:
+                                    # 「只刷视频」：本节**只有题目、没有任何媒体任务点**
+                                    # ⇒ 这就是章节列表里那种"测验/作业"任务点，整节跳过。
+                                    # ⚠️ 明确**不跳**的情况：本节有视频/文档 ⇒ 题目照做
+                                    # （视频里弹出来的题也照做，用户明确要求）。
+                                    hub.emit_log(
+                                        f'      [跳过] 「只刷视频」已开启：本节是纯测验任务点'
+                                        f'（{len(questions)} 题、无视频/文档），整节跳过不答题。')
+                                    self.quiz_text = f'已跳过测验 {len(questions)} 题'
+                                else:
+                                    self._solve_question_batch(questions, target_page)
+                            else:
+                                self.quiz_text = '无题目'
+                            hub.emit_status()
 
                             if not valid_jobs:
                                 hub.emit_log('      [系统] 当前卡片无音视频/文档任务。'

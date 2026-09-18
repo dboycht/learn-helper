@@ -48,6 +48,8 @@ enum Ctl {
     AutoSubmit,
     /// 启动界面时自动打开沙盒浏览器
     AutoLaunchBrowser,
+    /// 「只刷视频」：纯测验章节整节跳过
+    SkipQuizOnly,
     TestServer,
     Save,
     Cancel,
@@ -104,6 +106,8 @@ struct Layout {
     auto: RECT,
     /// 「启动时自动打开浏览器」那一行（在 auto 下面一行）
     auto_launch: RECT,
+    /// 「只刷视频」那一行（第三行勾选）
+    skip_quiz: RECT,
     test: RECT,
     save: RECT,
     cancel: RECT,
@@ -132,6 +136,8 @@ struct Form {
     auto_submit: bool,
     /// 启动界面时自动打开沙盒浏览器（老 Tk 版 `auto_launch_browser_on_start` 的行为）
     auto_launch_browser: bool,
+    /// 「只刷视频」：只有题目、没有视频/文档的章节整节跳过
+    skip_quiz_only: bool,
     /// 初始快照（用于"只提交改动项"与"有改动*"）
     init: Snapshot,
     /// 从后端读到过设置没有
@@ -166,6 +172,8 @@ struct Snapshot {
     auto_submit: bool,
     /// 启动界面时自动打开沙盒浏览器（老 Tk 版 `auto_launch_browser_on_start` 的行为）
     auto_launch_browser: bool,
+    /// 「只刷视频」：只有题目、没有视频/文档的章节整节跳过
+    skip_quiz_only: bool,
 }
 
 impl Default for Form {
@@ -182,6 +190,7 @@ impl Default for Form {
             retry: 0,
             auto_submit: true,
             auto_launch_browser: true,
+            skip_quiz_only: false,
             init: Snapshot {
                 server_url: String::new(),
                 llm_base: String::new(),
@@ -193,6 +202,7 @@ impl Default for Form {
                 retry: -1,
                 auto_submit: true,
                 auto_launch_browser: true,
+                skip_quiz_only: false,
             },
             loaded: false,
             focus: None,
@@ -241,6 +251,10 @@ impl Form {
             if r.get("auto_launch_browser").is_some() {
                 self.auto_launch_browser = r.bool_at("auto_launch_browser");
             }
+            // 同理：老后端没有 skip_quiz_only ⇒ 保持默认关
+            if r.get("skip_quiz_only").is_some() {
+                self.skip_quiz_only = r.bool_at("skip_quiz_only");
+            }
         }
         // API Key 永远从空白开始编辑（后端不回传）
         self.llm_key.clear();
@@ -263,6 +277,7 @@ impl Form {
             retry: self.retry,
             auto_submit: self.auto_submit,
             auto_launch_browser: self.auto_launch_browser,
+            skip_quiz_only: self.skip_quiz_only,
         }
     }
 
@@ -474,6 +489,10 @@ impl Form {
         // （后端 `_settings_update` 认的就是 body 顶层的这个名字）
         if self.auto_launch_browser != self.init.auto_launch_browser {
             parts.push(format!("\"auto_launch_browser\":{}", self.auto_launch_browser));
+        }
+        // 「只刷视频」：同样是 run 下的顶层键
+        if self.skip_quiz_only != self.init.skip_quiz_only {
+            parts.push(format!("\"skip_quiz_only\":{}", self.skip_quiz_only));
         }
         format!("{{{}}}", parts.join(","))
     }
@@ -700,11 +719,11 @@ impl SettingsState {
             y = bottom + row_gap;
         }
 
-        // 底部：两行勾选项 + 按钮行 + 状态行
+        // 底部：三行勾选项 + 按钮行 + 状态行
         //
         // ⚠️ 勾选项**不放在按钮行里面**：原先只有「自动提交」时它挤在 test 按钮左边，
-        //    再加一行就没位置了。现在两行各自占一条（`auto` / `auto_launch`），
-        //    按钮行整体下移 —— 窗口高度也随之 +px(34)（见 `show()` / 渲染探针的 770×664）。
+        //    再加行就没位置了。现在三行各自占一条（`auto` / `auto_launch` / `skip_quiz`），
+        //    按钮行整体下移 —— 窗口高度也随之再 +px(32)（见 `show()` 的 664 → 696）。
         let check_h = px(26);
         let check_gap = px(6);
         let auto = RECT { left: m, top: y, right, bottom: y + check_h };
@@ -714,9 +733,15 @@ impl SettingsState {
             right,
             bottom: auto.bottom + check_gap + check_h,
         };
+        let skip_quiz = RECT {
+            left: m,
+            top: auto_launch.bottom + check_gap,
+            right,
+            bottom: auto_launch.bottom + check_gap + check_h,
+        };
         let btn_h = px(40);
         let btn_w = px(124);
-        let btn_top = auto_launch.bottom + px(12);
+        let btn_top = skip_quiz.bottom + px(12);
         let btn_bottom = btn_top + btn_h;
         let cancel = RECT { left: right - btn_w, top: btn_top, right, bottom: btn_bottom };
         let save = RECT {
@@ -738,7 +763,7 @@ impl SettingsState {
             bottom: btn_bottom + px(8) + px(22),
         };
 
-        Layout { title, subtitle, modes, rows, auto, auto_launch, test, save, cancel, status }
+        Layout { title, subtitle, modes, rows, auto, auto_launch, skip_quiz, test, save, cancel, status }
     }
 
     fn hit(&self, x: i32, y: i32) -> Option<Ctl> {
@@ -766,6 +791,9 @@ impl SettingsState {
         }
         if l.auto_launch.contains(x, y) {
             return Some(Ctl::AutoLaunchBrowser);
+        }
+        if l.skip_quiz.contains(x, y) {
+            return Some(Ctl::SkipQuizOnly);
         }
         if l.test.contains(x, y) {
             return Some(Ctl::TestServer);
@@ -1100,6 +1128,45 @@ impl SettingsState {
             &self.fonts[ui::DFONT_UI],
         );
 
+        // 「只刷视频」：章节列表里"只有题目、没有视频/文档"的任务点整节跳过
+        // （视频里弹出来的题照做 —— 这一条只针对"纯测验章节"，用户明确要求）
+        let cb3 = RECT {
+            left: l.skip_quiz.left,
+            top: l.skip_quiz.top + (l.skip_quiz.height() - sz) / 2,
+            right: l.skip_quiz.left + sz,
+            bottom: l.skip_quiz.top + (l.skip_quiz.height() + sz) / 2,
+        };
+        let hover_skip = f.hover == Some(Ctl::SkipQuizOnly);
+        fill_and_border(
+            &ctx,
+            cb3,
+            if f.skip_quiz_only { colors.accent } else { colors.card },
+            if f.skip_quiz_only {
+                colors.accent
+            } else if hover_skip {
+                colors.accent
+            } else {
+                colors.divider
+            },
+            px(5),
+        );
+        if f.skip_quiz_only {
+            draw_glyph(hdc, 0xE73Eu32, cb3, colors.bg, &px);
+        }
+        gdi::text_in(
+            hdc,
+            "只刷视频：纯测验章节整节跳过（视频里的题照做）",
+            RECT {
+                left: cb3.right + px(8),
+                top: l.skip_quiz.top,
+                right: l.skip_quiz.right,
+                bottom: l.skip_quiz.bottom,
+            },
+            TextAlign::Left,
+            colors.text_sub,
+            &self.fonts[ui::DFONT_UI],
+        );
+
         // 按钮
         for (ctl, rc, label) in [
             (Ctl::TestServer, l.test, "测试连接"),
@@ -1389,6 +1456,11 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                     state.form.focus = None;
                     state.form.auto_launch_browser = !state.form.auto_launch_browser;
                 }
+                Some(Ctl::SkipQuizOnly) => {
+                    state.form.finalize();
+                    state.form.focus = None;
+                    state.form.skip_quiz_only = !state.form.skip_quiz_only;
+                }
                 _ => {
                     state.form.finalize();
                     state.form.focus = None;
@@ -1650,7 +1722,7 @@ fn hook_action(hwnd: HWND, state: *mut SettingsState, action: usize) {
         let s = &mut *state;
         // 所有 hook 都先打一行"开窗事实"：探针据此断言对话框真的建起来并回填了设置
         crate::trace::trace(&format!(
-            "settings-hook: opened loaded={} url={} mode={} workers={} timeout={} retry={} auto={} auto_launch={}",
+            "settings-hook: opened loaded={} url={} mode={} workers={} timeout={} retry={} auto={} auto_launch={} skip_quiz={}",
             s.form.loaded,
             s.form.server_url,
             s.form.mode,
@@ -1658,7 +1730,8 @@ fn hook_action(hwnd: HWND, state: *mut SettingsState, action: usize) {
             s.form.timeout,
             s.form.retry,
             s.form.auto_submit,
-            s.form.auto_launch_browser
+            s.form.auto_launch_browser,
+            s.form.skip_quiz_only
         ));
         match action {
             HOOK_SAVE => {
@@ -1849,7 +1922,7 @@ fn create(owner: HWND, shared: Arc<Shared>, theme: Theme, hook: usize) -> HWND {
         // 变成 1230x1050 物理像素，在 1600 高的屏幕上会被工作区夹住、底部按钮贴边
         // （实测）。所以这里留足余量：内容实需约 620 逻辑高。
         let w = scale(770);
-        let h = scale(664);   // +px(34)：底部多了「启动时自动打开浏览器」一行勾选（2.1.3）
+        let h = scale(696);   // 三行勾选（自动提交 / 启动开浏览器 / 只刷视频）⇒ 664 + px(32)
 
         let mut owner_rc = RECT::default();
         GetWindowRect(owner, &mut owner_rc);
@@ -1968,7 +2041,7 @@ fn settings_from_state(shared: &Shared) -> Option<json::Value> {
                 ("has_api_key", json::Value::Bool(st.llm_has_key)),
             ]),
         ),
-        ("run", json::obj(&[("auto_submit", json::Value::Bool(st.auto_submit)), ("auto_launch_browser", json::Value::Bool(st.auto_launch_browser))])),
+        ("run", json::obj(&[("auto_submit", json::Value::Bool(st.auto_submit)), ("auto_launch_browser", json::Value::Bool(st.auto_launch_browser)), ("skip_quiz_only", json::Value::Bool(st.skip_quiz_only))])),
     ]))
 }
 
@@ -2006,7 +2079,7 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
                 ("has_api_key", json::Value::Bool(true)),
             ]),
         ),
-        ("run", json::obj(&[("auto_submit", json::Value::Bool(true)), ("auto_launch_browser", json::Value::Bool(true))])),
+        ("run", json::obj(&[("auto_submit", json::Value::Bool(true)), ("auto_launch_browser", json::Value::Bool(true)), ("skip_quiz_only", json::Value::Bool(false))])),
     ]);
     state.form.load_from(&data);
     state.form.focus_on(Field::ServerUrl);

@@ -56,6 +56,10 @@ DEFAULT_RUN = {
     # 启动时自动拉起沙盒浏览器（老 Tk 版 `auto_launch_browser_on_start` 的行为）。
     # 默认开：用户打开界面就能用上次的学习页，不必先点「检测/刷新网页」。
     'auto_launch_browser': True,
+    # 「只刷视频」：章节列表里那些**只有题目、没有任何视频/文档任务点**的章节
+    # （测验/作业类任务点）整个跳过，不答题也不提交。默认关。
+    # ⚠️ 只跳"纯测验"章节：视频/文档任务点里的题目照做，不受影响。
+    'skip_quiz_only': False,
 }
 
 
@@ -175,7 +179,7 @@ ANSWER_MODE_TIPS = {m: tip for m, _, tip in ANSWER_MODES}
 
 
 def get_run_cfg():
-    """运行期设置（倍速 / 自动提交 / 启动自动开浏览器），带钳位。"""
+    """运行期设置（倍速 / 自动提交 / 启动自动开浏览器 / 只刷视频），带钳位。"""
     cfg = load_config().get('run', {}) or {}
     out = dict(DEFAULT_RUN)
     try:
@@ -186,6 +190,7 @@ def get_run_cfg():
     out['auto_submit'] = bool(cfg.get('auto_submit', DEFAULT_RUN['auto_submit']))
     out['auto_launch_browser'] = bool(
         cfg.get('auto_launch_browser', DEFAULT_RUN['auto_launch_browser']))
+    out['skip_quiz_only'] = bool(cfg.get('skip_quiz_only', DEFAULT_RUN['skip_quiz_only']))
     return out
 
 

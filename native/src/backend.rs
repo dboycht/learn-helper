@@ -82,6 +82,8 @@ pub struct CoreState {
     pub auto_submit: bool,
     /// 启动界面时自动打开沙盒浏览器（后端 settings.run.auto_launch_browser）
     pub auto_launch_browser: bool,
+    /// 「只刷视频」：只有题目、没有视频/文档的章节整节跳过（后端 settings.run.skip_quiz_only）
+    pub skip_quiz_only: bool,
     /// 需要 UI 处理的提示（弹窗/追加日志），由 UI 线程消费后清空。
     pub flash: Option<String>,
     pub backend_exe: String,
@@ -156,6 +158,7 @@ impl Shared {
         st.auto_submit.hash(&mut h);
         // ⚠️ 新加的"会显示在界面上的设置"也要进指纹：漏了它，改了设置界面不会重绘
         st.auto_launch_browser.hash(&mut h);
+        st.skip_quiz_only.hash(&mut h);
         st.log_seq.hash(&mut h);
         st.logs.len().hash(&mut h);
         st.engine.running.hash(&mut h);
@@ -617,6 +620,7 @@ pub fn refresh_settings(shared: Arc<Shared>) {
                 let auto_submit = run.map(|r| r.bool_at("auto_submit")).unwrap_or(true);
                 let auto_launch_browser =
                     run.map(|r| r.bool_at("auto_launch_browser")).unwrap_or(true);
+                let skip_quiz_only = run.map(|r| r.bool_at("skip_quiz_only")).unwrap_or(false);
                 let llm = data.get("llm");
                 let llm_base = llm.map(|l| l.str_at("base_url")).unwrap_or_default();
                 let llm_model = llm.map(|l| l.str_at("model")).unwrap_or_default();
@@ -657,6 +661,7 @@ pub fn refresh_settings(shared: Arc<Shared>) {
                 }
                 st.auto_submit = auto_submit;
                 st.auto_launch_browser = auto_launch_browser;
+                st.skip_quiz_only = skip_quiz_only;
                 drop(st);
                 shared.notify_ui();
             }
