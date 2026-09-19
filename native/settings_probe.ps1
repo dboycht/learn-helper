@@ -245,7 +245,14 @@ Check "the log only carries the mask, never the raw secret" (($null -ne $pasteLi
 $afterLine = @($log4 | Where-Object { $_ -match 'paste done value_after=' })[-1]
 Check "field content confirmed after the paste" (($null -ne $afterLine) -and ($afterLine -match ('len=' + $pasteText.Length))) ("line=" + $afterLine)
 # Restore whatever the user had on the clipboard (a probe must not steal it).
-if ($null -ne $clipSaved) { Set-Clipboard -Value $clipSaved } else { Set-Clipboard -Value '' }
+# NOTE: `Set-Clipboard -Value ''` throws ("Value cannot be null") and, with
+# $ErrorActionPreference='Stop', that ABORTED the script after every check had already passed --
+# the run printed no RESULT line although all cases were green. Handle it without throwing.
+if (-not [string]::IsNullOrEmpty($clipSaved)) {
+    try { Set-Clipboard -Value $clipSaved } catch { Write-Host ("  (clipboard restore skipped: " + $_.Exception.Message + ")") }
+} else {
+    try { Set-Clipboard -Value ' ' } catch { }
+}
 
 Write-Host ""
 Write-Host ("RESULT: " + $script:pass + " passed, " + $script:fail + " failed")

@@ -43,6 +43,20 @@ if (-not $SkipUi) {
 $uiExe = Join-Path $PSScriptRoot 'target\release\learn-helper-native.exe'
 if (-not (Test-Path $uiExe)) { throw "native exe not found: $uiExe (run without -SkipUi)" }
 
+# ---------------------------------------------------------------- icon
+# Stamp the multi-size icon into the freshly built exe. `cargo build` always produces an exe without
+# icon resources, so this MUST run after every build (a rebuild silently drops the icon otherwise).
+# The ICO itself is generated from native\logo-src.png by _tools\make-icon.ps1 (16/24/32/48/64/128/256).
+$icon = Join-Path $PSScriptRoot 'logo.ico'
+if (Test-Path $icon) {
+    Write-Host "[icon] stamping logo.ico into the exe" -ForegroundColor Yellow
+    & powershell -ExecutionPolicy Bypass -File (Join-Path $root '_tools\make-icon.ps1') `
+        -IconFile $icon -ExeFile $uiExe
+    if ($LASTEXITCODE -ne 0) { throw "icon stamping failed" }
+} else {
+    Write-Host "[icon] SKIPPED: $icon not found" -ForegroundColor DarkYellow
+}
+
 # ---------------------------------------------------------------- backend
 $backendExe = Join-Path $root '_release\pyi\learn-helper-core.exe'
 if (-not $SkipBackend) {
@@ -91,7 +105,9 @@ $config = @"
   },
   "run": {
     "video_speed": 2.0,
-    "auto_submit": true
+    "auto_submit": true,
+    "auto_launch_browser": true,
+    "skip_quiz_only": false
   }
 }
 "@

@@ -12,11 +12,12 @@
     <Nullable>enable</Nullable>
     <LangVersion>latest</LangVersion>
     <!-- Single source of truth for the UI version, surfaced in the title bar.
-         2.1.2 = 「当前网页」可下拉选择（原生 UI）；本 WinUI 版作为**备选退路**保留
+         2.1.3 = 「只刷视频」/ Ctrl+V 粘贴 / 点设置不再闪退（原生 UI）；
+         本 WinUI 版作为**备选退路**保留
          （memory/02 §5：被否掉的技术线不要立刻删，直到新线稳定）。
          Keep in step with backend/learn_helper/config.py's APP_VERSION at release time. -->
-    <Version>2.1.2</Version>
-    <InformationalVersion>2.1.2</InformationalVersion>
+    <Version>2.1.3</Version>
+    <InformationalVersion>2.1.3</InformationalVersion>
     <!-- memory/03 section 1: unpackaged + self-contained, no MSIX, no certificate. -->
     <WindowsPackageType>None</WindowsPackageType>
     <WindowsAppSDKSelfContained>true</WindowsAppSDKSelfContained>
@@ -35,5 +36,13 @@
     <PackageReference Include="Microsoft.WindowsAppSDK" Version="2.4.0" />
     <PackageReference Include="Microsoft.Windows.SDK.BuildTools" Version="10.0.26100.4654" />
   </ItemGroup>
+
+  <PropertyGroup>
+    <!-- Shared application icon (multi-size: 16/24/32/48/64/128/256).
+         This line belongs to the FALLBACK WinUI line: the default product since 2.1.1 is the
+         native Rust UI, which gets its icon stamped into the exe by native\build_release.ps1
+         (see native\icon_probe.ps1 for the regression check). -->
+    <ApplicationIcon>..\native\logo.ico</ApplicationIcon>
+  </PropertyGroup>
 
 </Project>

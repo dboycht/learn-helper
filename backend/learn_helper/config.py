@@ -13,7 +13,7 @@ import os
 import sys
 from logging.handlers import RotatingFileHandler
 
-APP_VERSION = '2.1.2'
+APP_VERSION = '2.1.3'
 SCHOOL_ID = 'nuaa'
 
 # 本模块不依赖 requests / playwright，保证「装没装浏览器依赖」都能起服务：

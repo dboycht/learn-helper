@@ -2342,8 +2342,49 @@ fn spawn_action_ex(
 }
 
 /// 延时发送（启动自动开浏览器用；失败只记日志）。
+///
+/// ⚠️ **发送前要等对话框关掉**：拉起浏览器会让我们的窗口**失去焦点**，而「当前网页」下拉
+/// 和「答题设置」都是靠 `WM_ACTIVATE(WA_INACTIVE)` 自动收起的 ⇒ 如果用户刚点开网页下拉、
+/// 自动开浏览器正好在那一刻执行，下拉会被抢焦点关掉（表现为"列表一闪就没了"，
+/// `pages_probe` 偶发失败也是这个原因；2.1.3 修）。
 fn spawn_action_delayed(shared: Arc<Shared>, action: &'static str, delay_ms: u64) {
-    spawn_action_ex(shared, action, None, delay_ms, true);
+    std::thread::spawn(move || {
+        if delay_ms > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms));
+        }
+        // 我们的三个弹窗类名（任一存在都说明用户正在操作界面）
+        let dialogs: [&str; 3] = ["LearnHelperPagePickerWnd", "LearnHelperSettingsWnd", "LearnHelperAboutWnd"];
+        let dialog_open = || dialogs.iter().any(|cls| {
+            !unsafe { FindWindowW(wide(cls).as_ptr(), std::ptr::null()) }.is_null()
+        });
+        if dialog_open() {
+            // ⚠️ **检测到对话框开着就放弃这次自动开浏览器**，不要把用户正在用的下拉/设置抢掉焦点。
+            // 「当前网页」下拉和「答题设置」都是靠 `WM_ACTIVATE(WA_INACTIVE)` 自动收起的，
+            // 而拉起浏览器必然抢焦点 ⇒ 自动开浏览器会把用户刚打开的下拉关掉
+            // （`pages_probe` 偶发失败就是这个原因；2.1.3 修）。
+            // 放弃后**不影响使用**：用户可以随时点「检测/刷新网页」手动打开浏览器。
+            crate::trace::trace(&format!(
+                "ui: auto launch skipped (dialog open) -> user can click refresh manually: {}",
+                action
+            ));
+            return;
+        }
+        crate::trace::trace(&format!("ui: scripted action '{}' -> sending", action));
+        let result = backend::control(&shared, action, None);
+        // 自动开浏览器是"后台动作"：**只写日志，不动 status_text**（不抢用户正在看的状态栏）。
+        // ⚠️ 也要落**诊断日志**：界面日志只存在内存里，外部探针读不到，否则无法证明
+        // "后端答了跳过还是真去拉了"（`autolaunch_probe.ps1` 的关开关用例实测踩到）。
+        let line = match result {
+            Ok(msg) => format!("ui: {} -> {}", action, msg),
+            Err(err) => format!("ui: {} skipped: {}", action, err),
+        };
+        crate::trace::trace(&line);
+        {
+            let mut st = shared.lock();
+            st.push_log(&format!("[native] {}", line));
+        }
+        shared.notify_ui();
+    });
 }
 
 fn spawn_action(shared: Arc<Shared>, action: &'static str, params: Option<Value>) {

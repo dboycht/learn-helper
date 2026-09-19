@@ -35,6 +35,19 @@ fn pad(px: &dyn Fn(i32) -> i32) -> i32 {
 }
 const MAX_ROWS: usize = 8;
 
+/// 钩子模式下多久收尾（关掉主窗口）。
+///
+/// 默认 1800ms；`LH_KEEP_OPEN=1` 时给到 120 秒 —— 让探针能观察"下拉还开着时"的
+/// 窗口级行为（比如自动开浏览器是否抢焦点）。**只影响验证路径**，正常使用不进这里。
+fn hook_delay_ms() -> u64 {
+    if std::env::var("LH_KEEP_OPEN").is_ok() {
+        crate::trace::trace("pagepicker: LH_KEEP_OPEN=1 -> hook 收尾延后到 120s");
+        120_000
+    } else {
+        1800
+    }
+}
+
 struct PickerState {
     shared: Arc<Shared>,
     colors: Colors,
@@ -546,8 +559,12 @@ pub fn show(
 
         if hook_mode {
             // 验证钩子：给足时间把 select_page 发出去（含后端落盘），再优雅关掉主窗口
+            //
+            // ⚠️ `LH_KEEP_OPEN=1` 时**不主动收尾**（等很久很久）：有些探针要观察"下拉还开着的时候
+            // 窗口级行为"（例如自动开浏览器会不会抢焦点把它关掉）。默认 1800ms 的正常收尾会
+            // 把这类观测打断（autolaunch_pause_probe 实测踩到）。
             let owner_raw = owner as isize;
-            let delay = if auto_pick.is_some() { 3500 } else { 1800 };
+            let delay = if auto_pick.is_some() { 3500 } else { hook_delay_ms() };
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
                 crate::trace::trace("pagepicker: hook mode -> closing main window");
