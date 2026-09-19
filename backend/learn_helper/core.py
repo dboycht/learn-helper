@@ -274,13 +274,22 @@ DIAG_SELECTORS = [
 # ----------------------------------------------------------------------------
 # 通用助手
 # ----------------------------------------------------------------------------
-def keep_computer_awake():
-    """通过 Windows API 阻止系统自动休眠/熄屏（挂机必备）。"""
+def keep_computer_awake(release=False):
+    """阻止/恢复系统自动休眠与熄屏（挂机必备）。
+
+    老 Tk 版在启动时就调它（`learn_helper.py` 的启动序列），2.x 重构时**没搬过来**
+    ⇒ 这个函数一直没人调用，等于"挂机一晚上、中途系统睡了"（见 ERROR.md E53
+    同类问题：重构漏搬行为）。
+
+    用法：**开始刷课时调一次**（`release=False`），结束时调 `release=True` 撤销。
+    用 `ES_CONTINUOUS` 表示"这个状态一直有效，直到下次调用改掉"，所以不必轮询。
+    """
     try:
         import ctypes
         ES_CONTINUOUS = 0x80000000
-        ES_SYSTEM_REQUIRED = 1
-        ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+        ES_SYSTEM_REQUIRED = 0x00000001
+        flags = ES_CONTINUOUS | (0 if release else ES_SYSTEM_REQUIRED)
+        ctypes.windll.kernel32.SetThreadExecutionState(flags)
     except Exception:
         return None
     return None
@@ -339,6 +348,7 @@ def kill_and_launch_browser():
         except Exception:
             pass
 
+    proc = None
     try:
         cmd_args = [
             valid_path,
@@ -358,9 +368,26 @@ def kill_and_launch_browser():
             time.sleep(1)
             if is_cdp_port_open():
                 return (True, proc)
+        # ⚠️ 拉了但 9222 一直没起来 ⇒ **必须把进程收掉**再返回失败：
+        # 原来直接 `return (False, None)`，调用方拿不到句柄、也就永远杀不掉它，
+        # 桌面上留一个"半死"的沙盒 Edge（用户视角：明明报失败，却多出一个浏览器窗口）。
+        LOGGER.warning('[浏览器] 拉起后 10s 内 9222 未就绪，回收该进程。')
         return (False, None)
-    except Exception:
+    except Exception as e:
+        LOGGER.warning(f'[浏览器] 启动异常: {e}')
         return (False, None)
+    finally:
+        # 走到这里说明"没成功交给调用方"（成功路径在上面已 return）
+        if proc is not None and not is_cdp_port_open():
+            try:
+                if proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=5)
+                    except Exception:
+                        proc.kill()
+            except Exception:
+                pass
 
 
 def collect_page_labels(context, attempts=10, interval=0.6):
@@ -756,7 +783,10 @@ def solve_with_llm(image_bytes, q_type, num_blanks, text_source, timeout=180, ll
 def parse_llm_answer(content, q_type):
     """把大模型返回的文本解析成统一答案格式（尽力鲁棒）。"""
     content = (content or '').strip()
-    m = re.search(r'\{[^{}]*\}', content, re.S)
+    # ⚠️ 用贪心 `\\{.*\\}` 而不是 `\\{[^{}]*\\}`：后者匹配不了任何**嵌套**的 JSON
+    # （`{"answer_key":"AC","text_answers":["x"]}` 里的方括号没问题，但只要模型
+    # 顺手包一层 `{"result":{...}}` 就直接失配），失配后又掉进下面"抓字母"的兜底。
+    m = re.search(r'\{.*\}', content, re.S)
     if m:
         try:
             obj = json.loads(m.group(0))
@@ -766,8 +796,9 @@ def parse_llm_answer(content, q_type):
             at = obj.get('answer_key')
             ta = obj.get('text_answers')
             qt = str(obj.get('question_type') or q_type)
-            if isinstance(at, str):
-                at = re.sub(r'[^A-Fa-f]', '', at).upper()
+            # ⚠️ 后端/模型可能给 `"answer_key": null` 或数字 ⇒ 原来只判了
+            # `isinstance(at, str)` 才清洗，但下面 `len(at)` 对 None 会抛 TypeError。
+            at = normalize_choice_keys(at) if isinstance(at, str) else ''
             if not isinstance(ta, (list, tuple)):
                 ta = [ta] if ta else []
             ta = [str(x) for x in ta if x is not None]
@@ -775,17 +806,32 @@ def parse_llm_answer(content, q_type):
                 return {'question_type': qt, 'answer_key': '', 'text_answers': ta}
             return {'question_type': 'multi_choice' if len(at) > 1 else 'choice',
                     'answer_key': at, 'text_answers': []}
-    letters = re.findall(r'[A-Fa-f]', content)
+    # ⚠️ 兜底**只从"像答案的片段"里取字母**：原来是把整段文本里所有 A-F 都抓出来
+    # （"The answer is AC" 会抓成 `THANSA` 之类），然后当成答案交上去 —— 比"答不出"
+    # 更糟。这里只认这几类明确形式：
+    #   · `答案：AC` / `答案是 B` / `answer: A`
+    #   · 整段就是一个/多个选项字母（可带分隔符）
     if q_type in ('blank', 'essay'):
         return {'question_type': q_type, 'answer_key': '', 'text_answers': [content]}
-    return {'question_type': 'choice', 'answer_key': ''.join(letters[:6]).upper(), 'text_answers': []}
+    for pat in (r'(?:答案|answer)\s*[:：是]\s*([A-Fa-f][A-Fa-f\s,、，]*)',
+                r'^\s*([A-Fa-f](?:\s*[,、，]?\s*[A-Fa-f])*)\s*$'):
+        mm = re.search(pat, content, re.I | re.M)
+        if mm:
+            keys = normalize_choice_keys(mm.group(1))
+            # 抽出 "AC" 这种多选形式时，里面的分隔符已经被清掉
+            keys = re.sub(r'[^A-F]', '', keys)
+            if keys:
+                return {'question_type': 'multi_choice' if len(keys) > 1 else 'choice',
+                        'answer_key': keys, 'text_answers': []}
+    return {'question_type': q_type, 'answer_key': '', 'text_answers': []}
 
 
 def _normalize_answer(data, q_type):
     """把后端返回统一成 {'question_type','answer_key','text_answers'}（与自配大模型对齐）。"""
     data = data if isinstance(data, dict) else {}
     at = data.get('answer_key')
-    at = re.sub(r'[^A-Fa-f]', '', at).upper() if isinstance(at, str) else ''
+    # 与 `parse_llm_answer` 走同一套规范化（判断题、多选字母都不会被改错）
+    at = normalize_choice_keys(at) if isinstance(at, str) else ''
     ta = data.get('text_answers')
     if not isinstance(ta, (list, tuple)):
         ta = [ta] if ta else []
@@ -1132,11 +1178,24 @@ def run_parallel(items, worker, workers=4, on_progress=None):
     threads = [threading.Thread(target=runner, args=(it,), daemon=True) for it in items]
     for t in threads:
         t.start()
+    # ⚠️ 等待必须有**上限**：worker 里是网络调用，`requests` 的 timeout 覆盖不了
+    # "DNS 卡住 / 代理黑洞"这类情况，而主流程是在自动化线程里等这个函数的 ⇒
+    # 没有上限就等于"刷课永久卡在求解阶段"，用户只能点停止。
+    # 上限取"单题超时 + 60s 余量"：正常情况（含重试）一定在这个范围内结束，
+    # 真到了说明有请求僵死，放弃它们（daemon 线程随进程结束）比卡死好。
+    try:
+        per_item = float(get_answer_cfg().get('solver_timeout') or 240)
+    except Exception:
+        per_item = 240.0
+    deadline = time.time() + per_item + 60.0
     for t in threads:
         while t.is_alive():
             t.join(0.2)
             if SHUTDOWN.is_set():
                 return None      # 放弃在途请求：daemon 线程随进程结束
+            if time.time() > deadline:
+                LOGGER.warning('[求解] 等待并发求解超时，放弃剩余在途请求')
+                return None
     return None
 
 
@@ -1265,6 +1324,38 @@ def detect_question_type_and_inputs(question_locator):
         return ('essay', 1)
 
 
+def normalize_choice_keys(answer_key):
+    """把答案键规范成"A"~"F"的字符串（选择题用）。
+
+    ⚠️ **必须整体判定，不能逐个字母替换**（2026-09-19 修，见 ERROR.md E64）。
+    原来的写法是：
+        `answer_key.upper().replace('对','A').replace('TRUE','A').replace('T','A')...`
+    这些都是**整串替换**，于是 `'AF'` 里的 `F` 被换成了 `B`（`'AF' → 'AB'`），
+    多选答案"选 A 和 F"会被填成"选 A 和 B"——**答案被静默改错还报"填涂成功"**。
+    `'T'`/`'F'`（判断题的"对/错"）同理。
+    正确做法：先看整串是不是"真/假"这类词，是就映射成单个 A/B；否则只做
+    "保留 A-F、转大写"的清洗。
+    """
+    text = str(answer_key or '').strip().upper()
+    if not text:
+        return ''
+    # 判断题映射**只在整串就是那个词时**生效。原来的写法是整串 replace，
+    # 会把多选答案里的字母也换掉：`'AF' → 'AB'`（F 被当成"错"）、
+    # `'ABF' → 'ABB'` —— 答案被静默改错，还照样报"填涂成功"、照样提交。
+    # 注意：选项字母只有 A~F，所以清洗时 `'T'` 会被丢掉（`'TF' → 'F'`）——
+    # 这是对的：题面里根本没有 T 选项。
+    if text in ('对', '正确', 'TRUE', 'T', '√', 'YES', 'Y', '1'):
+        return 'A'
+    if text in ('错', '错误', 'FALSE', 'F', '×', 'NO', 'N', '0'):
+        return 'B'
+    # 多选/单选：只保留 A-F 并去重保序（'A,C' → 'AC'）
+    out = []
+    for ch in text:
+        if ch in 'ABCDEF' and ch not in out:
+            out.append(ch)
+    return ''.join(out)
+
+
 def fill_and_click_smart(question_locator, response_data):
     """按答题结果填涂题目。response_data 形如
        {'question_type':..., 'answer_key':'AC', 'text_answers':[...]}。"""
@@ -1275,11 +1366,7 @@ def fill_and_click_smart(question_locator, response_data):
         if q_type in ('choice', 'multi_choice') or text_answers:
             if not answer_key:
                 return False
-            clean_str = (answer_key.upper().replace('对', 'A').replace('TRUE', 'A')
-                         .replace('T', 'A').replace('正确', 'A'))
-            clean_str = (clean_str.replace('错', 'B').replace('FALSE', 'B')
-                         .replace('F', 'B').replace('错误', 'B'))
-            clean_keys = re.sub(r'[^A-F]', '', clean_str)
+            clean_keys = normalize_choice_keys(answer_key)
             target_set = set(clean_keys)
 
             def parse_option_letter(el, idx):

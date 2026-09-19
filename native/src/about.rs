@@ -38,7 +38,8 @@ struct Row {
 /// 弹窗状态：指针经 GWLP_USERDATA 传进窗口过程。
 pub struct AboutState {
     pub shared: Arc<Shared>,
-    pub theme: Theme,
+    /// 主题只用于构造时算出 `colors`；之后各绘制点都读 `colors`，所以不再单独存 theme
+    /// （原来存了却没人读，属于"看起来权威的死字段"）。
     pub colors: Colors,
     pub fonts: Vec<ui::FontOwned>,
     pub hwnd: HWND,
@@ -56,7 +57,6 @@ impl AboutState {
     pub fn new(shared: Arc<Shared>, theme: Theme) -> AboutState {
         AboutState {
             shared,
-            theme,
             colors: Colors::for_theme(theme),
             fonts: ui::make_dialog_fonts(96),
             hwnd: NULL_HANDLE,
@@ -448,7 +448,10 @@ unsafe extern "system" fn about_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARA
     }
 }
 
+// Win32 `CREATESTRUCTW` 的前缀（只用到第一个字段）：字段名保持与 SDK 一致，
+// 免得下一个改代码的人对不上文档。
 #[repr(C)]
+#[allow(non_snake_case)]
 struct CREATESTRUCT {
     lpCreateParams: *mut std::ffi::c_void,
 }
@@ -571,10 +574,11 @@ fn create(owner: HWND, shared: Arc<Shared>, theme: Theme, hook: bool) {
             let owner_raw = owner as isize;
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(1200));
-                unsafe { PostMessageW(raw as HWND, WM_APP_ABOUT_LINK, 0, 0) };
+                // 已在包含本闭包的 `unsafe` 块里，无需再套一层
+                PostMessageW(raw as HWND, WM_APP_ABOUT_LINK, 0, 0);
                 std::thread::sleep(std::time::Duration::from_millis(1200));
                 crate::trace::trace("about-hook: closing main window");
-                unsafe { PostMessageW(owner_raw as HWND, WM_CLOSE, 0, 0) };
+                PostMessageW(owner_raw as HWND, WM_CLOSE, 0, 0);
             });
         }
     }
@@ -599,6 +603,11 @@ pub fn render_probe(out_path: &str, _w: i32, _h: i32, dpi: u32) {
 
     let w = state.content_width();
     let h = state.content_height();
+    // 尺寸校验 + 溢出安全的缓冲区长度（见 native::probe_buffer_bytes）
+    let buf_bytes = match crate::native::probe_buffer_bytes(w, h) {
+        Some(n) => n,
+        None => return,
+    };
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
         if screen.is_null() {
@@ -609,6 +618,12 @@ pub fn render_probe(out_path: &str, _w: i32, _h: i32, dpi: u32) {
         let bmp = CreateCompatibleBitmap(screen, w, h);
         if mem.is_null() || bmp.is_null() {
             crate::trace::trace("about-probe: 创建内存 DC/位图失败");
+            if !bmp.is_null() {
+                DeleteObject(bmp as HGDIOBJ);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
             ReleaseDC(std::ptr::null_mut(), screen);
             return;
         }
@@ -626,7 +641,7 @@ pub fn render_probe(out_path: &str, _w: i32, _h: i32, dpi: u32) {
             },
             ..Default::default()
         };
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let mut pixels = vec![0u8; buf_bytes];
         let lines = GetDIBits(
             mem,
             bmp,

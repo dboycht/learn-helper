@@ -26,6 +26,10 @@ mod winhttp;
 use native::*;
 
 /// 持有单实例互斥体句柄，保证它在进程整个生命周期内不被释放。
+///
+/// ⚠️ 这个字段**故意不读**：它的唯一作用是让句柄活到进程退出（配合 `Box::leak`）。
+/// 换成裸 `Box::leak(mutex)` 之类会丢掉类型语义，所以保留包装结构并显式放行 warning。
+#[allow(dead_code)]
 struct MutexKeep(*mut std::ffi::c_void);
 
 fn main() {
@@ -60,6 +64,16 @@ fn main() {
             "native: dpi awareness ctx_ok={} aware_ok={}",
             dpi_ctx_ok, dpi_aware_ok
         ));
+        // ⚠️ 两条路都失败 ⇒ 进程**不是 DPI 感知**的，Windows 会做坐标虚拟化：
+        // `GetMonitorInfo` 给物理像素、`GetWindowRect`/客户区给逻辑像素，两套坐标
+        // 混用必然算错（拖拽夹取、窗口尺寸、按坐标点击的探针全都会错，见 ERROR.md E37）。
+        // 这种环境下**宁可明确报错退出**，也不要开出一个"能用但行为错乱"的界面。
+        if !dpi_aware_ok {
+            trace::trace("native: 无法设置 DPI 感知，退出（此环境下坐标会被系统虚拟化）");
+            eprintln!("learn-helper: 无法启用 DPI 感知（SetProcessDpiAwarenessContext / \
+                       SetProcessDpiAwareness 均失败），为避免坐标错乱已退出。");
+            std::process::exit(2);
+        }
 
         let _ = CoInitializeEx(std::ptr::null_mut(), COINIT_APARTMENTTHREADED);
 
@@ -70,10 +84,11 @@ fn main() {
         // 因此窗口一存在，后台线程就能安全拿到 hwnd 发消息。
         // DPI 用主显示器 DPI 估算（窗口尺寸/最小尺寸都按它算）。
         let probe_dpi = {
-            let dc = unsafe { GetDC(std::ptr::null_mut()) };
-            let d = if dc.is_null() { 96 } else { unsafe { GetDeviceCaps(dc, 88) }.max(96) as u32 };
+            // 已在包含本块的 `unsafe` 块里
+            let dc = GetDC(std::ptr::null_mut());
+            let d = if dc.is_null() { 96 } else { GetDeviceCaps(dc, 88).max(96) as u32 };
             if !dc.is_null() {
-                unsafe { ReleaseDC(std::ptr::null_mut(), dc) };
+                ReleaseDC(std::ptr::null_mut(), dc);
             }
             d
         };

@@ -393,7 +393,16 @@ fn spawn_and_handshake(shared: &Arc<Shared>) -> Result<(u16, String), String> {
         let mut seen = 0;
         for line in reader.lines().map_while(Result::ok) {
             seen += 1;
-            crate::trace::trace(&format!("backend[stdout#{}]: {}", seen, &line[..line.len().min(120)]));
+            // ⚠️ 必须按**字符**截断，不能用 `&line[..line.len().min(120)]`：
+            // 那是字节下标，而后端日志全是中文（一个汉字 3 字节）⇒ 第 120 字节
+            // 一旦落在字符中间就直接 panic；release profile 是 `panic = "abort"`，
+            // 等于**启动阶段整个界面进程被杀**（用户看到的是"双击没反应"）。
+            // 这里还会把单行长度也一并限制住，避免超长行把诊断日志刷爆。
+            crate::trace::trace(&format!(
+                "backend[stdout#{}]: {}",
+                seen,
+                json::truncate_chars(&line, 200)
+            ));
             if line.contains(READY_TOKEN) {
                 if let Some(value) = json::parse(&line) {
                     let port = value.int_at("port") as u16;
@@ -406,13 +415,14 @@ fn spawn_and_handshake(shared: &Arc<Shared>) -> Result<(u16, String), String> {
         let _ = tx.send(result);
     });
 
-    match rx.recv_timeout(Duration::from_secs(30)) {
+    let handshake = match rx.recv_timeout(Duration::from_secs(30)) {
         Ok(Some((port, pipe))) if port > 0 => {
             crate::trace::trace(&format!("backend: handshake port={} pipe={}", port, pipe));
             // 等 /api/health 真的通（握手行只说明进程起来了）
             let base = format!("http://127.0.0.1:{}", port);
             let deadline = Instant::now() + Duration::from_secs(20);
             let mut attempts = 0;
+            let mut ready = false;
             while Instant::now() < deadline {
                 attempts += 1;
                 match winhttp::request("GET", &format!("{}/api/health", base), None, &[], 3000) {
@@ -426,7 +436,8 @@ fn spawn_and_handshake(shared: &Arc<Shared>) -> Result<(u16, String), String> {
                             ));
                         }
                         if resp.status == 200 {
-                            return Ok((port, pipe));
+                            ready = true;
+                            break;
                         }
                     }
                     Err(err) => {
@@ -437,16 +448,34 @@ fn spawn_and_handshake(shared: &Arc<Shared>) -> Result<(u16, String), String> {
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
-            Err("握手成功但 /api/health 无响应".into())
+            if ready {
+                Ok((port, pipe))
+            } else {
+                Err("握手成功但 /api/health 无响应".to_string())
+            }
         }
-        Ok(_) => Err("后端未返回握手行（详见后端日志）".into()),
-        Err(_) => Err("等待后端握手超时（30s）".into()),
+        Ok(_) => Err("后端未返回握手行（详见后端日志）".to_string()),
+        Err(_) => Err("等待后端握手超时（30s）".to_string()),
+    };
+
+    // ⚠️ 握手失败必须**把刚拉起来的子进程收掉**（2026-09-19）：
+    // 原来每一条 Err 都是直接返回，子进程与它的 stdout 读线程都留着 —— 后端会
+    // 一直活着、占着端口和命名管道，界面这边看起来"启动失败"，下次启动又因为
+    // 单实例锁判"已有实例在运行"，只能去任务管理器手动杀。
+    if let Err(err) = &handshake {
+        crate::trace::trace(&format!("backend: handshake failed ({}), killing child", err));
+        kill_child(shared.clone());
     }
+    handshake
 }
 
-/// 后台线程也能安全写的 trace（避免与主线 trace 争用被拒）。
-fn trace_bg(message: &str) {
-    crate::trace::trace(message);
+/// 结束并回收后端子进程（握手失败、退出收尾都用它）。
+fn kill_child(shared: Arc<Shared>) {
+    let mut slot = shared.child.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(mut child) = slot.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 // ---------------------------------------------------------------- 管道事件
@@ -716,11 +745,6 @@ pub fn control(shared: &Arc<Shared>, action: &str, params: Option<Value>) -> Res
     Ok(value.str_at("action_message"))
 }
 
-/// 单独取网页列表（refresh_pages 也走 control，这里给「刷新网页」按钮用）。
-pub fn refresh_pages(shared: &Arc<Shared>) -> Result<String, String> {
-    control(shared, "refresh_pages", None)
-}
-
 /// 更新设置（PUT /api/settings）。`json_body` 是**部分字段**的 JSON 对象，
 /// 后端只覆盖给出的键（合并式写入，不会抹掉其它设置）。
 pub fn update_settings(shared: &Arc<Shared>, json_body: &str) -> Result<String, String> {
@@ -759,10 +783,7 @@ pub fn shutdown(shared: Arc<Shared>) {
     let owned = shared.clone();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(3));
-        let mut slot = owned.child.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(child) = slot.as_mut() {
-            let _ = child.kill();
-        }
+        kill_child(owned);
     });
 }
 

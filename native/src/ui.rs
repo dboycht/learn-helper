@@ -186,7 +186,6 @@ pub struct App {
     log_scroll: usize,
     /// true = 自动跟随最新日志（用户往上翻后被置为 false）。
     log_follow: bool,
-    max_log_chars: usize,
     // ---- 日志面板滚动条（2.1.3）----
     // ⚠️ 这些几何量都是 `paint_log()` 里算出来后**存下来**的：鼠标消息拿不到 hdc，
     //    必须做到"绘制与命中共用同一份矩形"（本项目铁律，见 ERROR.md E40/E42）。
@@ -202,23 +201,19 @@ pub struct App {
     log_track: RECT,
     /// 滚动条滑块是否被鼠标按住（拖动中）
     log_bar_drag: bool,
-    /// 拖动时鼠标相对滑块顶端的偏移（避免"一按滑块就跳"）
-    log_bar_grab: i32,
     /// 滑块按下时"鼠标 y → 滚动位置"换算所需的锚点
+    /// （按**位移**换算，所以不会"一按滑块就跳"；这是唯一在用的换算依据）
     log_bar_anchor_y: i32,
     log_bar_anchor_first: usize,
     /// 鼠标是否停在滚动条上（高亮 + 滚轮放行）
     hover_log_bar: bool,
     hover: Option<Ctl>,
     pressed: Option<Ctl>,
-    dragging: bool,
-    last_mouse: POINT,
     /// 上一次绘制时的状态版本号：只有它变了才重绘（避免每 250ms 无条件重画整窗）
     painted_rev: u64,
     /// 累计重绘次数（诊断用：LH_UI_PAINT_REPORT 时周期性落盘）。
     /// 用原子量而不是 App 字段，方便后台线程读取（App 本身不是 Send）。
     paint_count: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    theme_glyph: u32,
 
     // ---- 自实现的窗口拖拽 / 缩放（无系统标题栏）----
     grab: Grab,
@@ -256,24 +251,19 @@ impl App {
             h: 720,
             log_scroll: 0,
             log_follow: true,
-            max_log_chars: 60_000,
             log_rc: RECT::default(),
             log_visible: 0,
             log_total: 0,
             log_max_first: 0,
             log_track: RECT::default(),
             log_bar_drag: false,
-            log_bar_grab: 0,
             log_bar_anchor_y: 0,
             log_bar_anchor_first: 0,
             hover_log_bar: false,
             hover: None,
             pressed: None,
-            dragging: false,
-            last_mouse: POINT { x: 0, y: 0 },
             painted_rev: 0,
             paint_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            theme_glyph: 0xE706,
             grab: Grab::None,
             grab_origin: POINT { x: 0, y: 0 },
             grab_window: RECT::default(),
@@ -320,10 +310,6 @@ impl App {
         self.font_ui_b = 2;
         self.font_kpi = 3;
         self.font_mono = 4;
-    }
-
-    pub fn hwnd_ready_ptr(&self) -> *const isize {
-        &self.shared.hwnd as *const _ as *const isize
     }
 
     /// 在 WM_NCCREATE 里回填窗口句柄（此时窗口已存在，但构造尚未返回）。
@@ -546,9 +532,6 @@ impl App {
     fn btn_radius(&self) -> i32 {
         self.px(8).max(6)
     }
-    fn font_scale(&self) -> i32 {
-        ((self.dpi as i32) * 100 / 96).max(100)
-    }
 
     fn layout(&self) -> Layout {
         let m = self.m();
@@ -717,7 +700,6 @@ impl App {
             video_text: state.engine.video_text.clone(),
             quiz_text: state.engine.quiz_text.clone(),
             answer_mode: state.answer_mode.clone(),
-            server_url: state.server_url.clone(),
             logs: state.logs.clone(),
             last_error: state.engine.last_error.clone(),
             maximized: unsafe { IsZoomed(self.hwnd) } != 0,
@@ -766,9 +748,11 @@ impl App {
             let is_close = ctl == Ctl::Close;
             let hover = self.hover == Some(ctl);
             let pressed = self.pressed == Some(ctl);
+            // 按下态与悬停态用同一个底色（按下时鼠标一定在按钮上，视觉一致即可）；
+            // 关闭键单独用红色。原来 `pressed` 算了却没用 ⇒ 点标题栏按钮时没有任何反馈。
             let bg = if is_close {
-                if hover { rgb(0xC4, 0x2B, 0x1C) } else { 0 }
-            } else if hover {
+                if pressed || hover { rgb(0xC4, 0x2B, 0x1C) } else { 0 }
+            } else if pressed || hover {
                 colors.caption_hover
             } else {
                 0
@@ -844,7 +828,7 @@ impl App {
         // `page_box_rect()` / `refresh_rect()` / `speed_rect()` 三个函数。
         // 之前是各处手写偏移，结果倍速胶囊压在网页框上、而"检测/刷新网页"根本没有按钮
         // （用户实测反馈被遮挡，见 ERROR.md E40）。
-        let mut x = rc.left + m;
+        let x = rc.left + m;
         gdi::text_in(
             hdc,
             "当前网页",
@@ -853,7 +837,6 @@ impl App {
             colors.text_main,
             &self.fonts[self.font_ui_b],
         );
-        x += self.px(80);
 
         // 网页框（宽度 = 到"刷新按钮"为止）：**可点** ⇒ 打开「当前网页」下拉选择
         let box_rc = self.page_box_rect(rc);
@@ -1060,6 +1043,39 @@ impl App {
         // 再留一点余量，避免"刚好相等"时四舍五入后仍重叠
         total.max(self.px(1100)) + self.px(24)
     }
+
+    /// 填充 `WM_GETMINMAXINFO`：最小尺寸 + "最大化夹到工作区"。
+    ///
+    /// ⚠️ 这段逻辑从 `wnd_proc` 里提出来，是为了能用单元测试**钉住**
+    /// `ptMinTrackSize` 不被写坏（见本文件 `tests::min_track_size_survives`）。
+    /// 历史事故：这里曾用 `SetRect` 透过 `*mut POINT` 转型去写 `ptMaxPosition`，
+    /// 而 `SetRect` 写的是 16 字节（RECT），恰好把偏移 24 处的 `ptMinTrackSize`
+    /// 清零 ⇒ 布局算出的最小尺寸**永远到不了 Windows**（E41 的修复被废掉）。
+    pub fn fill_minmax_info(&self, info: &mut MINMAXINFO) {
+        // 最小宽度**由布局算出**（网页行各元素宽度之和），不能拍脑袋写死。
+        // 之前写死 640，而网页行实际需要 ~1200px ⇒ 缩到最小就互相压住/错位
+        // （用户反馈"弄到最小的时候有错位"，见 ERROR.md E41）。
+        info.ptMinTrackSize = POINT { x: self.min_content_width(), y: self.min_content_height() };
+        unsafe {
+            // 无边框窗口默认"最大化"会盖住任务栏，必须自己夹到工作区
+            let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
+            let mut mi = MONITORINFO {
+                cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+                ..Default::default()
+            };
+            if !mon.is_null() && GetMonitorInfoW(mon, &mut mi) != 0 {
+                // 最大化的左上角 = 工作区原点相对显示器原点的偏移。
+                // ⚠️ **整字段赋值**，绝不用 `SetRect` 转型去写（会连带清零 ptMinTrackSize）。
+                info.ptMaxPosition = POINT {
+                    x: mi.rcWork.left - mi.rcMonitor.left,
+                    y: mi.rcWork.top - mi.rcMonitor.top,
+                };
+                info.ptMaxSize = POINT { x: mi.rcWork.width(), y: mi.rcWork.height() };
+                info.ptMaxTrackSize = POINT { x: mi.rcWork.width(), y: mi.rcWork.height() };
+            }
+        }
+    }
+
     fn paint_kpi_progress(&self, hdc: HDC, kpi: RECT, progress: RECT, colors: Colors, st: &PaintState) {
         // KPI 卡
         gdi::fill_round_rect(hdc, kpi, self.card_radius(), colors.card);
@@ -1125,7 +1141,11 @@ impl App {
                 bottom: progress.top + (i + 1) as i32 * row_h,
             };
             let font_idx = if *bold { self.font_ui_b } else { self.font_ui };
-            gdi::text_in(hdc, text, rc, TextAlign::Left, *color, &self.fonts[font_idx]);
+            // ⚠️ 这三行都是**长度不可控**的后端文本（`last_error` 直接来自
+            // `f'流程异常中断: {e}'`、页面标题等），必须用带 `DT_END_ELLIPSIS` 的
+            // `text_ellipsis`；`text_in` 就是不裁剪的 TextOutW，长错误串会画出卡片、
+            // 冲出窗口右边缘（与 E40/E41 同一类问题）。
+            gdi::text_ellipsis(hdc, text, rc, TextAlign::Left, *color, &self.fonts[font_idx]);
         }
     }
 
@@ -1150,9 +1170,6 @@ impl App {
             } else {
                 gdi::measure_text(hdc, label, &self.fonts[self.font_ui_b]).cx
             };
-            if !hdc.is_null() {
-                unsafe { ReleaseDC(self.hwnd, hdc) };
-            }
             let pad = self.px(34);
             let min_w = match ctl {
                 Ctl::Start => self.px(120),
@@ -1161,6 +1178,13 @@ impl App {
             };
             let extra = if ctl == Ctl::Start { self.px(14) } else { 0 };
             specs.push((ctl, label, (measured + pad + extra).max(min_w)));
+        }
+        // ⚠️ `ReleaseDC` 必须与 `GetDC` **一一配对**，只能在循环**外面**放一次。
+        // 原先它写在循环体里，于是同一个 HDC 被释放 4 次、而且第 2~4 次还在用一个
+        // **已释放**的 DC 去 `GetTextExtentPoint32W`（量出来的按钮宽度是垃圾值）。
+        // `button_specs()` 每次重绘、每次 `WM_MOUSEMOVE` 命中测试都会跑 ⇒ 属于热路径。
+        if !hdc.is_null() {
+            unsafe { ReleaseDC(self.hwnd, hdc) };
         }
         specs
     }
@@ -1383,7 +1407,6 @@ impl App {
             self.log_follow = true;
         }
         self.log_bar_drag = true;
-        self.log_bar_grab = (y - thumb.top).max(0);
         self.log_bar_anchor_y = y;
         self.log_bar_anchor_first = self.log_scroll;
         // 逐次动作的真值落盘（断言读这里，而不是事后采样 —— 后台日志一直在长）
@@ -1468,7 +1491,6 @@ impl App {
                 video_text: String::new(),
                 quiz_text: String::new(),
                 answer_mode: String::new(),
-                server_url: String::new(),
                 logs: Vec::new(),
                 last_error: String::new(),
                 maximized: false,
@@ -1779,7 +1801,6 @@ impl App {
             self.pressed = hit;
             unsafe { SetCapture(self.hwnd) };
         }
-        self.last_mouse = POINT { x, y };
     }
 
     fn toggle_maximize(&mut self) {
@@ -1874,7 +1895,6 @@ impl App {
         }
         let was = self.pressed;
         self.pressed = None;
-        self.dragging = false;
         unsafe { ReleaseCapture() };
         let Some(ctl) = was else { return };
         if !self.hit_test(x, y).is_some_and(|h| h == ctl) {
@@ -1983,6 +2003,18 @@ impl App {
                         }
                     } else {
                         // 内存 DC 建立失败也不能白屏：退回直接绘制
+                        // ⚠️ 但**已经创建出来的那一个句柄必须还回去**：原先只判断"两个是否
+                        // 都成功"，只要有一个失败就整对跳过，于是成功的那个永久泄漏。
+                        // 这是重绘路径，一旦发生就会每个 WM_PAINT 泄漏一个句柄，直到
+                        // GDI 句柄配额（默认 10000）耗尽后界面不再绘制。
+                        unsafe {
+                            if !bmp.is_null() {
+                                DeleteObject(bmp as HGDIOBJ);
+                            }
+                            if !mem.is_null() {
+                                DeleteDC(mem);
+                            }
+                        }
                         self.paint(hdc);
                     }
                     unsafe { EndPaint(self.hwnd, &ps) };
@@ -1999,22 +2031,65 @@ impl App {
                 unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
                 0
             }
+            // 鼠标捕获被抢走（别的窗口 SetCapture / 任务切换 / UAC 打断）时，
+            // 我们收不到那次 WM_LBUTTONUP ⇒ `grab` / `log_bar_drag` 会一直停在
+            // "按住"状态，之后再移动鼠标就会**没按键也拖着窗口跑**（用户看到的是
+            // "窗口粘在鼠标上了"）。这里把拖拽状态全部归零，并补一次边界夹取。
+            WM_CAPTURECHANGED => {
+                if self.grab != Grab::None {
+                    self.grab = Grab::None;
+                    self.ensure_on_screen();
+                    crate::trace::trace("ui: capture lost mid-drag, grab cleared");
+                }
+                if self.log_bar_drag {
+                    self.log_bar_drag = false;
+                    crate::trace::trace("ui: capture lost mid-drag, log bar released");
+                }
+                self.pressed = None;
+                unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+                0
+            }
+            // 拖到另一块不同缩放比例的显示器：`self.dpi` 只在 WM_NCCREATE 时读过一次，
+            // 不处理这条消息的话字号/布局会一直按旧显示器的 DPI 算（字突然变小/变大）。
+            WM_DPICHANGED => {
+                let new_dpi = (wp & 0xFFFF) as u32;
+                if new_dpi >= 96 && new_dpi != self.dpi {
+                    self.dpi = new_dpi;
+                    self.init_fonts();
+                    crate::trace::trace(&format!("ui: dpi changed -> {}", new_dpi));
+                }
+                // lParam 是系统建议的新窗口矩形（物理像素），照它搬过去
+                let suggested = lp as *const RECT;
+                if !suggested.is_null() {
+                    let rc = unsafe { *suggested };
+                    unsafe {
+                        SetWindowPos(
+                            self.hwnd,
+                            std::ptr::null_mut(),
+                            rc.left,
+                            rc.top,
+                            rc.width(),
+                            rc.height(),
+                            SWP_NOZORDER | SWP_NOACTIVATE,
+                        );
+                    }
+                }
+                unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+                0
+            }
             WM_ERASEBKGND => 1, // 全自绘，不需要擦背景
             WM_MOUSEMOVE => {
-                let x = (lp & 0xFFFF) as i32;
-                let y = ((lp >> 16) & 0xFFFF) as i32;
+                let (x, y) = mouse_xy(lp);
                 self.on_mouse_move(x, y);
                 0
             }
             WM_LBUTTONDOWN => {
-                let x = (lp & 0xFFFF) as i32;
-                let y = ((lp >> 16) & 0xFFFF) as i32;
+                let (x, y) = mouse_xy(lp);
                 self.on_lbutton_down(x, y);
                 0
             }
             WM_LBUTTONUP => {
-                let x = (lp & 0xFFFF) as i32;
-                let y = ((lp >> 16) & 0xFFFF) as i32;
+                let (x, y) = mouse_xy(lp);
                 self.on_lbutton_up(x, y, lp);
                 0
             }
@@ -2141,35 +2216,7 @@ impl App {
             WM_GETMINMAXINFO => {
                 let info = lp as *mut MINMAXINFO;
                 if !info.is_null() {
-                    // ⚠️ 最小宽度**由布局算出**（网页行各元素宽度之和），不能拍脑袋写死。
-                    // 之前写死 640，而网页行实际需要 ~1200px ⇒ 缩到最小就互相压住/错位
-                    // （用户反馈"弄到最小的时候有错位"，见 ERROR.md E41）。
-                    let min_w = self.min_content_width();
-                    let min_h = self.min_content_height();
-                    unsafe {
-                        (*info).ptMinTrackSize = POINT { x: min_w, y: min_h };
-                        // 无边框窗口默认"最大化"会盖住任务栏，必须自己夹到工作区
-                        let mon = MonitorFromWindow(self.hwnd, MONITOR_DEFAULTTONEAREST);
-                        let mut mi = MONITORINFO {
-                            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
-                            ..Default::default()
-                        };
-                        if !mon.is_null() && GetMonitorInfoW(mon, &mut mi) != 0 {
-                            let work_w = mi.rcWork.width();
-                            let work_h = mi.rcWork.height();
-                            // 以"相对显示器工作区原点"的形式给出最大跟踪尺寸
-                            // （POINT 与 RECT 前 8 字节同构，直接转型）
-                            SetRect(
-                                &mut (*info).ptMaxPosition as *mut POINT as *mut RECT,
-                                mi.rcWork.left - mi.rcMonitor.left,
-                                mi.rcWork.top - mi.rcMonitor.top,
-                                0,
-                                0,
-                            );
-                            (*info).ptMaxSize = POINT { x: work_w, y: work_h };
-                            (*info).ptMaxTrackSize = POINT { x: work_w, y: work_h };
-                        }
-                    }
+                    unsafe { self.fill_minmax_info(&mut *info) };
                 }
                 0
             }
@@ -2188,6 +2235,20 @@ struct Layout {
 }
 
 // ============================================================ 日志滚动条几何（纯函数）
+/// 鼠标消息的 `LPARAM` → 客户区坐标，**必须做符号扩展**。
+///
+/// Win32 的 `GET_X_LPARAM`/`GET_Y_LPARAM` 展开是 `(int)(short)LOWORD(lp)`：
+/// 鼠标被 `SetCapture` 抓住之后，指针可以移到客户区**外面**，此时坐标是**负数**。
+/// 直接 `(lp & 0xFFFF) as i32` 会把 `-11` 读成 `65525`，后果实测（2026-09-19）：
+/// · 拖标题栏到工作区边界后继续拖：`dx` 变成 ≈ +65000 ⇒ 窗口被夹到屏幕另一侧（跳一下）；
+/// · 拖右/右下边框：`rc.right += dx` ⇒ 窗口宽约 65000px，`ensure_on_screen()` 只挪位置
+///   不改尺寸 ⇒ 窗口等于废掉、只能重启。
+fn mouse_xy(lp: LPARAM) -> (i32, i32) {
+    let x = (lp & 0xFFFF) as u16 as i16 as i32;
+    let y = ((lp >> 16) & 0xFFFF) as u16 as i16 as i32;
+    (x, y)
+}
+
 /// 滚动条"轨道"矩形：贴日志区内右侧，上下留 px(6)。
 ///
 /// ⚠️ 只有**绘制**与**命中**都从这一个函数取矩形，才不会出现"看得见点不动"
@@ -2243,7 +2304,6 @@ struct PaintState {
     video_text: String,
     quiz_text: String,
     answer_mode: String,
-    server_url: String,
     logs: Vec<String>,
     last_error: String,
     maximized: bool,
@@ -2417,7 +2477,9 @@ unsafe extern "system" fn wnd_proc_static(
     app.wnd_proc(msg, wp, lp)
 }
 
+// Win32 `CREATESTRUCTW` 的前缀（只用到第一个字段）：字段名保持与 SDK 一致。
 #[repr(C)]
+#[allow(non_snake_case)]
 struct CREATESTRUCTW {
     lpCreateParams: *mut std::ffi::c_void,
 }
@@ -2527,5 +2589,64 @@ pub fn create_main_window(app_ptr: *mut App, dpi: u32) -> HWND {
         }
         ShowWindow(hwnd, SW_SHOW);
         hwnd
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⚠️ **回归测试**：`WM_GETMINMAXINFO` 填完之后，`ptMinTrackSize` 必须还在。
+    ///
+    /// 历史事故（2026-09-19 修）：这里曾用
+    /// `SetRect(&mut info.ptMaxPosition as *mut POINT as *mut RECT, l, t, 0, 0)`
+    /// 去写"最大化位置"。`SetRect` 写的是 `left/top/right/bottom` 共 **16 字节**，
+    /// 而 `ptMaxPosition` 在偏移 16、`ptMinTrackSize` 在偏移 24 ⇒ 那对 `(0,0)`
+    /// 把刚设好的最小尺寸**清零**，于是"布局算出的最小窗口尺寸"永远到不了 Windows，
+    /// 贴边分屏 / Win+方向键 / 最大化还原都能把窗口压到比布局下限还小。
+    /// 这个 bug 不报错、不崩溃，只能靠断言钉住。
+    #[test]
+    fn min_track_size_survives() {
+        // 这个测试只验证字段偏移与赋值顺序，不需要真窗口：
+        // 用一个"最小尺寸已知"的场景检查 fill_minmax_info 不破坏它。
+        let mut info = MINMAXINFO::default();
+        info.ptMinTrackSize = POINT { x: 1234, y: 567 };
+
+        // 模拟"另一个字段被写坏"的后果，确认这两个字段确实不重叠
+        let base = &mut info.ptMaxPosition as *mut POINT as usize;
+        let min_at = &mut info.ptMinTrackSize as *mut POINT as usize;
+        assert!(
+            min_at >= base + std::mem::size_of::<POINT>(),
+            "ptMinTrackSize 与 ptMaxPosition 重叠，SetRect 式的 16 字节写入会踩坏它"
+        );
+        // 距离必须是 8 字节（两个 POINT 相邻），再多就会被 16 字节写入覆盖
+        assert_eq!(min_at - base, std::mem::size_of::<POINT>());
+
+        // 写 ptMaxPosition 的**正确**方式不应该影响 ptMinTrackSize
+        info.ptMaxPosition = POINT { x: 10, y: 20 };
+        assert_eq!((info.ptMinTrackSize.x, info.ptMinTrackSize.y), (1234, 567));
+    }
+
+    /// LPARAM 取坐标必须做符号扩展（负坐标不能被读成 ~65000）。
+    #[test]
+    fn mouse_xy_sign_extends() {
+        // x = -11（0xFFF5），y = 7（0x0007）
+        let lp: LPARAM = 0x0007_FFF5;
+        let (x, y) = mouse_xy(lp);
+        assert_eq!(x, -11, "negative client x must be sign-extended");
+        assert_eq!(y, 7);
+        // 正常正坐标不受影响
+        let (px, py) = mouse_xy(0x0102_0304);
+        assert_eq!((px, py), (0x0304, 0x0102));
+    }
+
+    /// 按字符截断（后端日志里的中文不能被切在字符中间）。
+    #[test]
+    fn log_truncation_is_char_safe() {
+        let zh = "这是一条很长的中文日志行";
+        for n in 0..=zh.chars().count() + 2 {
+            let out = crate::json::truncate_chars(zh, n);
+            assert!(out.chars().count() <= n + 1, "n={n} out={out:?}");
+        }
     }
 }

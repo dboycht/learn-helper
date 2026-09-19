@@ -430,6 +430,80 @@ def test_logic():
     check('C6 答题配置钳位', 10 <= acfg['solver_timeout'] <= 600
           and 1 <= acfg['workers'] <= 16 and acfg['mode'] in ('server', 'llm', 'off'), str(acfg))
 
+    # C7/C8：config.json 的写入健壮性（2026-09-19 修，见 ERROR.md E60）
+    #   C7 想证明的是**落盘方式**本身：旧实现 `open(path,'w')` 先截断再 dump，
+    #      中途失败就留下半截文件；`save_config` 的原子替换无论成功失败都不该留半截。
+    #      （故意不用 update_config 单独做这件事 —— 把新 config.json 内容整段替换后
+    #        写回是一个"合法写入"，那样测不出原子性，只能测出它真的写了。）
+    #   C8 想证明的是**并发安全**：界面线程与引擎线程会同时改不同键，一个都不能丢。
+    import json as _json
+    import tempfile
+    import threading
+
+    from learn_helper.config import CONFIG_PATH, load_config, update_config
+
+    original_bytes = b''
+    had_config = os.path.exists(CONFIG_PATH)
+    if had_config:
+        with open(CONFIG_PATH, 'rb') as f:
+            original_bytes = f.read()
+    try:
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            _json.dump({'server_url': 'http://keep.me', 'llm': {'api_key': 'sk-x'}}, f)
+        # 模拟"写到一半失败"：目标文件先被写成半截，再让 save_config 正常写入。
+        # 期望：坏文件被**备份**成 config.json.bad（保住现场），然后重建一份可用配置。
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            f.write('{')
+        update_config({'run': {'video_speed': 3.0}})
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+            raw = f.read()
+        try:
+            parsed = _json.loads(raw)
+        except Exception:
+            parsed = None
+        check('C7 半截 config 被重建且原文件备份为 .bad（原子写不留半截）',
+              isinstance(parsed, dict) and parsed.get('run', {}).get('video_speed') == 3.0
+              and os.path.exists(CONFIG_PATH + '.bad'),
+              f'raw={raw[:80]!r} bad={os.path.exists(CONFIG_PATH + ".bad")}')
+        check('C7b 写入后不留 .tmp 残留',
+              not os.path.exists(CONFIG_PATH + '.tmp'))
+
+        # 备份目录里那份必须是"坏掉的原文"，而不是新内容（否则现场就丢了）
+        with open(CONFIG_PATH + '.bad', 'r', encoding='utf-8') as f:
+            check('C7c .bad 里保存的是坏掉的原文件', f.read().strip() == '{')
+
+        # C8：并发合并写入。先写回一份**正常**配置（C7 已经把坏文件挪走并重建了），
+        # 然后再让多线程同时改**不同**的键 —— 一个都不能丢。
+        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+            _json.dump({'server_url': 'http://keep.me', 'llm': {'api_key': 'sk-x'}}, f)
+        lost = []
+        errs = []
+
+        def _writer(n):
+            try:
+                for _ in range(25):
+                    update_config({f't{n}': n})
+            except Exception as exc:          # pragma: no cover - 失败即断言失败
+                errs.append(repr(exc))
+
+        threads = [threading.Thread(target=_writer, args=(n,)) for n in range(1, 7)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+        final = load_config()
+        lost = [f't{n}' for n in range(1, 7) if final.get(f't{n}') != n]
+        check('C8 并发合并写入不丢键（界面线程 vs 引擎线程）',
+              not lost and not errs
+              and final.get('llm', {}).get('api_key') == 'sk-x'
+              and final.get('server_url') == 'http://keep.me',
+              f'lost={lost} errs={errs[:2]} keys={sorted(final)[:10]}')
+    finally:
+        # 恢复测试前的 config（自测目录本来也是临时的，这里只是保持"自测不留副作用"）
+        if had_config:
+            with open(CONFIG_PATH, 'wb') as f:
+                f.write(original_bytes)
+
 
 def main():
     seed_config()

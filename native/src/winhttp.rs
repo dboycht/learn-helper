@@ -183,8 +183,12 @@ pub fn request(
             header_text.push_str(v);
             header_text.push_str("\r\n");
         }
+        // ⚠️ `Content-Length` 必须是**字节数**（`body.len()` 是字符数）。
+        // 当前调用方都用 `json::stringify`（非 ASCII 已转义成 \uXXXX）所以数值恰好相等，
+        // 但一旦哪天有人传了带中文的 body，这里就会告诉服务器一个偏小的长度 ⇒
+        // 请求体被截断、后端报 JSON 解析失败（而且很难看出是发的人算错了）。
         if let Some(body) = json_body {
-            header_text.push_str(&format!("Content-Length: {}\r\n", body.len()));
+            header_text.push_str(&format!("Content-Length: {}\r\n", body.as_bytes().len()));
         }
 
         let body_bytes: Vec<u8> = match json_body {

@@ -53,11 +53,3 @@ pub fn apply_plain(hwnd: HWND, dark: bool) {
         native::windows_build()
     ));
 }
-
-/// 供自检/日志：本机是否开启了 DWM 合成（纯信息，不做任何透明处理）。
-pub fn composition_enabled() -> bool {
-    let mut enabled: BOOL = 0;
-    unsafe {
-        DwmIsCompositionEnabled(&mut enabled) == 0 && enabled != 0
-    }
-}

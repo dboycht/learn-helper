@@ -22,10 +22,13 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .config import APP_VERSION, DEVICE_ID, LOGGER
+from .config import APP_VERSION, DEVICE_ID, LOGGER, _as_bool
 
 PROTOCOL_VERSION = 1
 PIPE_PREFIX = 'learn-helper-'
+# 本接口的请求体都很小（设置/控制指令），1 MiB 是宽松上限；
+# 超过一律 400，避免"声明超大 Content-Length 却慢慢发"白占线程（见 _read_json）。
+MAX_BODY_BYTES = 1024 * 1024
 
 # Windows 命名管道常量的字面量（避免依赖 pywin32）
 _ERROR_PIPE_CONNECTED = 535
@@ -119,14 +122,20 @@ class Hub:
             LOGGER.debug(f'[IPC] log seq={seq} -> {n} 个管道客户端')
 
     def emit_progress(self, task=None, video=None, quiz=None):
+        # ⚠️ `engine` 在 `Backend.start()` 里 `attach` 之前是 None，退出阶段也可能被清掉。
+        # 原来这里直接 `self.engine.task_text = …` ⇒ AttributeError（实测）。
+        # `snapshot()` 本来就有 None 判断，这里补齐，语义一致。
+        eng = self.engine
+        if eng is None:
+            return
         if task is not None:
-            self.engine.task_text = task
+            eng.task_text = task
         if video is not None:
-            self.engine.video_text = video
+            eng.video_text = video
         if quiz is not None:
-            self.engine.quiz_text = quiz
-        self.broadcast({'type': 'progress', 'task': self.engine.task_text,
-                        'video': self.engine.video_text, 'quiz': self.engine.quiz_text})
+            eng.quiz_text = quiz
+        self.broadcast({'type': 'progress', 'task': eng.task_text,
+                        'video': eng.video_text, 'quiz': eng.quiz_text})
 
     def emit_status(self):
         snapshot = self.snapshot()
@@ -469,6 +478,10 @@ def _make_handler(hub, on_shutdown):
     class Handler(BaseHTTPRequestHandler):
         server_version = f'learn-helper/{APP_VERSION}'
         protocol_version = 'HTTP/1.1'
+        # 单条连接的读写超时（`BaseHTTPRequestHandler` 会在 `setup()` 里把它套到 socket 上）。
+        # `self._httpd.timeout` 只管"等连接"，**管不到已建立的连接**；没有这个值时，
+        # 一个连上就不发数据、也不断开的本机客户端会一直占着一条线程。
+        timeout = 10
 
         # ---- 基础设施 ----
         def log_message(self, fmt, *args):      # 静音默认 stderr 日志
@@ -504,6 +517,13 @@ def _make_handler(hub, on_shutdown):
                 length = 0
             if length <= 0:
                 return {}
+            # ⚠️ `length` 完全来自客户端，必须设上限：`self._httpd.timeout = 0.3` 只管
+            # "等连接"那一步，**连接本身没有读超时**（Handler.timeout 默认 None），
+            # 而 ThreadingHTTPServer 每条连接一个线程 ⇒ 一个声称
+            # `Content-Length: 100000000` 却不发正文的客户端就能白占一个线程 + 内存。
+            # 本接口的请求体只有几十~几百字节，1 MiB 上限绰绰有余。
+            if length > MAX_BODY_BYTES:
+                raise ValueError(f'请求体过大（{length} > {MAX_BODY_BYTES}）')
             raw = self.rfile.read(length)
             try:
                 obj = json.loads(raw.decode('utf-8'))
@@ -537,18 +557,28 @@ def _make_handler(hub, on_shutdown):
                     if res.get('ok'):
                         hub.emit_pages(res.get('pages') or [])
                     return self._ok(res.get('message', ''), res)
-                if path == '/api/logs':
-                    since = int(query.get('since') or 0)
-                    entries = hub.logs_since(since)
-                    return self._ok('', {'entries': entries, 'last': hub._log_seq})
-                if path == '/api/settings':
-                    return self._ok('', settings_payload(hub))
                 if path == '/api/diag':
                     if hub.engine is None:
                         return self._err('引擎未就绪')
                     res = hub.engine.diagnose()
-                    return (self._ok if res.get('ok') else self._err)(
-                        res.get('message', ''), res.get('message', ''))
+                    # ⚠️ 原来写的是 `(self._ok if res.get('ok') else self._err)(msg, msg)`，
+                    # 而 `_err(message, code=400)` 的第二个参数是 **HTTP 状态码** ⇒
+                    # `send_response('刷课运行中…')` 会抛 `TypeError: %d format: a real
+                    # number is required, not str`，`_send` 又把异常吞掉（`except: pass`）
+                    # ⇒ **一个字节都没发出去**，客户端拿到的是空响应（看起来像"接口挂了"）。
+                    # 触发条件很普通：刷课运行中点一次诊断（`diagnose()` 返回 ok=False）。
+                    if res.get('ok'):
+                        return self._ok(res.get('message', ''), res)
+                    return self._err(res.get('message', '诊断失败'))
+                if path == '/api/logs':
+                    try:
+                        since = int(query.get('since') or 0)
+                    except (TypeError, ValueError):
+                        return self._err('since 必须是整数', 400)
+                    entries = hub.logs_since(since)
+                    return self._ok('', {'entries': entries, 'last': hub._log_seq})
+                if path == '/api/settings':
+                    return self._ok('', settings_payload(hub))
                 return self._err(f'未知接口: {path}', 404)
             except Exception as e:
                 LOGGER.exception('[HTTP] GET 异常')
@@ -597,10 +627,16 @@ def _make_handler(hub, on_shutdown):
             if not isinstance(params, dict):
                 params = {}
             if action == 'start':
-                ok, msg = engine.start(selected_title=params.get('page')
-                                       or body.get('page'))
+                # ⚠️ `page` 是外部输入，必须转成 str：不转的话 `{"page": {...}}` 会被
+                # 原样当成"选中的网页"，随后引擎线程里 `.strip()` 抛异常，
+                # 而那个异常抛在 `finally` 之外 ⇒ **引擎永久卡在"正在运行"**（见 E61）。
+                page = params.get('page', body.get('page'))
+                page = page.strip() if isinstance(page, str) else ''
+                ok, msg = engine.start(selected_title=page or None)
             elif action == 'stop':
-                engine.stop(close_browser=bool(params.get('close_browser')))
+                # `bool("false") is True`（实测）⇒ 必须按字面量解析，不能直接 bool()
+                close_browser = _as_bool(params.get('close_browser'), False)
+                engine.stop(close_browser=close_browser)
                 ok, msg = True, '已请求停止'
             elif action == 'pause':
                 ok, msg = engine.pause()
@@ -702,7 +738,10 @@ def _make_handler(hub, on_shutdown):
                     return self._err(msg)
                 messages.append(msg)
             if patch:
-                update_config(patch)
+                # ⚠️ 写盘失败**不能**报成功：磁盘满/文件被锁时原来照样回 ok:true +
+                # "已保存"，用户以为存上了，重启后设置又变回去（静默失败）。
+                if not update_config(patch):
+                    return self._err('配置写入失败（config.json 不可写），本次改动未保存', 500)
             if engine is not None:
                 engine.reload_settings()
             hub.emit_log('；'.join(messages) if messages else '设置已更新')

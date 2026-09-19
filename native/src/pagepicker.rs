@@ -421,7 +421,9 @@ unsafe extern "system" fn picker_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPAR
     }
 }
 
+// Win32 `CREATESTRUCTW` 的前缀（只用到第一个字段）：字段名保持与 SDK 一致。
 #[repr(C)]
+#[allow(non_snake_case)]
 struct CREATESTRUCT {
     lpCreateParams: *mut std::ffi::c_void,
 }
@@ -553,7 +555,8 @@ pub fn show(
             let raw = hwnd as isize;
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(700));
-                unsafe { PostMessageW(raw as HWND, WM_APP_AUTO_PICK, n as WPARAM, 0) };
+                // 已在包含本闭包的 `unsafe` 块里
+                PostMessageW(raw as HWND, WM_APP_AUTO_PICK, n as WPARAM, 0);
             });
         }
 
@@ -568,7 +571,8 @@ pub fn show(
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(delay));
                 crate::trace::trace("pagepicker: hook mode -> closing main window");
-                unsafe { PostMessageW(owner_raw as HWND, WM_CLOSE, 0, 0) };
+                // 已在包含本闭包的 `unsafe` 块里
+                PostMessageW(owner_raw as HWND, WM_CLOSE, 0, 0);
             });
         }
     }
@@ -591,6 +595,11 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
     state.refresh_fonts();
     state.hover = Some(1);
 
+    // 尺寸校验 + 溢出安全的缓冲区长度（探针参数是外部输入，见 native::probe_buffer_bytes）
+    let buf_bytes = match crate::native::probe_buffer_bytes(w, h) {
+        Some(n) => n,
+        None => return,
+    };
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
         if screen.is_null() {
@@ -601,6 +610,12 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
         let bmp = CreateCompatibleBitmap(screen, w, h);
         if mem.is_null() || bmp.is_null() {
             crate::trace::trace("pagepicker-probe: 创建内存 DC/位图失败");
+            if !bmp.is_null() {
+                DeleteObject(bmp as HGDIOBJ);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
             ReleaseDC(std::ptr::null_mut(), screen);
             return;
         }
@@ -619,7 +634,7 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
             },
             ..Default::default()
         };
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let mut pixels = vec![0u8; buf_bytes];
         let lines = GetDIBits(
             mem,
             bmp,

@@ -22,7 +22,8 @@ import threading
 import time
 
 from . import core
-from .config import APP_VERSION, LOGGER, get_answer_cfg, get_run_cfg, update_config
+from .config import (APP_VERSION, LOGGER, _as_bool, get_answer_cfg, get_run_cfg,
+                     update_config)
 
 
 class SolverEngine:
@@ -71,13 +72,15 @@ class SolverEngine:
         return True, f'倍速已设为 {speed}x'
 
     def set_auto_submit(self, auto_submit):
-        auto_submit = bool(auto_submit)
+        # ⚠️ 不能直接 `bool(auto_submit)`：`bool("false") is True`（实测），
+        # 别的客户端发 `{"auto_submit":"false"}` 会**打开**自动提交。
+        auto_submit = _as_bool(auto_submit, self.settings.get('auto_submit', True))
         self.settings['auto_submit'] = auto_submit
         update_config({'run': {'auto_submit': auto_submit}})
         return True, '提交模式已切换为「自动提交」' if auto_submit else '提交模式已切换为「仅暂存」'
 
     def set_auto_launch_browser(self, enabled):
-        enabled = bool(enabled)
+        enabled = _as_bool(enabled, self.settings.get('auto_launch_browser', True))
         self.settings['auto_launch_browser'] = enabled
         update_config({'run': {'auto_launch_browser': enabled}})
         return True, ('启动时将自动打开浏览器' if enabled
@@ -85,7 +88,7 @@ class SolverEngine:
 
     def set_skip_quiz_only(self, enabled):
         """「只刷视频」开关：只跳"纯测验章节"，视频里弹的题不受影响。"""
-        enabled = bool(enabled)
+        enabled = _as_bool(enabled, self.settings.get('skip_quiz_only', False))
         self.settings['skip_quiz_only'] = enabled
         update_config({'run': {'skip_quiz_only': enabled}})
         return True, ('已开启「只刷视频」：只有题目、没有视频/文档的章节会整节跳过'
@@ -127,8 +130,16 @@ class SolverEngine:
         if self.solver_running:
             return False, '刷课流程已在运行中'
         if selected_title:
+            # ⚠️ **一定要转成 str**：`/api/control` 的 `params.page` 是外部输入，
+            # 传 `{"page": 123}` 或 `{"page": {...}}` 时原来的代码会把它原样塞进
+            # `hub.selected_title`，随后 `run()` 里的 `.strip()` / `'[请点击' in title`
+            # 抛 TypeError/AttributeError。后者尤其致命：异常抛在 `run()` 的 try
+            # **之外**，`finally: self.solver_running = False` 永远不执行 ⇒
+            # 引擎**永久卡在"正在运行"**，之后 start/diagnose 全被拒（实测，见 E61）。
+            selected_title = str(selected_title).strip()
             self.hub.selected_title = selected_title
         title = getattr(self.hub, 'selected_title', None) or ''
+        title = title if isinstance(title, str) else ''
         if (not title) or '[请点击' in title or '[安全浏览器' in title:
             self.last_error = '请先在浏览器中点开学习页，并在「当前网页」中选择要刷的网页'
             self.hub.emit_log(f'[启动] 未选择学习页：{self.last_error}')
@@ -188,7 +199,10 @@ class SolverEngine:
 
     def close_browser(self):
         """退出流程用：关闭沙盒浏览器（含兜底 terminate 自拉起的进程）。"""
-        with self._cleanup_lock:
+        # 同样要拿 `_io_lock`：`core.close_sandbox_browser` 会**另开一条 CDP 连接**，
+        # 而 `/api/pages`、`diagnose()` 也在这把锁下面用短连接 —— 不互斥的话
+        # `Browser.close` 可能在别人正查询时把浏览器抽走（虽然只记日志，但会误报）。
+        with self._cleanup_lock, self._io_lock:
             try:
                 acted = core.close_sandbox_browser(self.browser_proc)
                 self.hub.emit_log('[退出] 沙盒浏览器已关闭。' if acted
@@ -264,6 +278,39 @@ class SolverEngine:
         threading.Thread(target=_work, daemon=True, name='self-test').start()
         return True, '自检已开始（结果见日志）'
 
+    def _safe_title(self, page, fallback='(未知页面)'):
+        """读页面标题，**任何异常都不许打断主流程**。
+
+        `page.title()` 在"标签页正被关闭 / 正在导航"时会抛 `TargetClosedError`，
+        而调用点（锁定页面、重连后重新锁定）恰恰是最容易出现这种时序的地方；
+        原来它裸调用，一抛就冒到 `run()` 的兜底 except ⇒ 整条刷课流程"异常中断"。
+        """
+        try:
+            return (page.title() or '').strip() or fallback
+        except Exception:
+            return fallback
+
+    def _register_dialog_handler(self, page):
+        """给页面挂"自动接受 alert/confirm"的处理器 —— **同一页面只挂一次**。
+
+        ⚠️ Playwright 的 `page.on('dialog', ...)` 是**追加**语义，且没有去重。
+        主循环里每次重新锁定页面都挂一遍，同一个 page 对象就会被挂上多个处理器
+        （周期性重建标签页时旧 page 被 close，但重连/复用同一 page 的场景会累积）。
+        这里按对象 id 记一笔，重复调用直接返回。
+        """
+        key = id(page)
+        seen = getattr(self, '_dialog_pages', None)
+        if seen is None:
+            seen = set()
+            self._dialog_pages = seen
+        if key in seen:
+            return
+        try:
+            page.on('dialog', lambda dialog: dialog.accept())
+            seen.add(key)
+        except Exception as e:
+            LOGGER.info(f'[页面] 注册对话框处理器失败: {e}')
+
     # ---------------- 状态快照 ----------------
     def status(self):
         return {
@@ -289,9 +336,14 @@ class SolverEngine:
     def run(self):
         """刷课主流程：锁定页面 → 逐卡片（答题 → 音视频/文档）→ 翻页 → 防弹窗。"""
         hub = self.hub
-        selected_title = (getattr(hub, 'selected_title', None) or '').strip()
         try:
+            # ⚠️ 这一行**必须留在 try 里面**：它原来在 try 之前，一旦
+            # `hub.selected_title` 是异常类型（外部输入未转 str）就会在这里抛出，
+            # `finally` 里的 `solver_running = False` 不执行 ⇒ 引擎永久假"运行中"。
+            selected_title = (getattr(hub, 'selected_title', None) or '').strip()
             self.task_text = '正在准备...'
+            # 挂机必备：阻止系统自动休眠/熄屏（老 Tk 版有、2.x 漏搬，见 core.keep_computer_awake）。
+            core.keep_computer_awake()
             hub.emit_status()
             completed_video_urls = set()
             completed_doc_urls = set()
@@ -321,10 +373,11 @@ class SolverEngine:
                     return
 
                 self.remember_page(target_page)
-                hub.emit_log(f'[系统] 锁定当前网页: 【{target_page.title()}】')
-                target_page.on('dialog', lambda dialog: dialog.accept())
+                hub.emit_log(f'[系统] 锁定当前网页: 【{self._safe_title(target_page)}】')
+                self._register_dialog_handler(target_page)
                 page_counter = 1
                 saved_url = None
+                restore_fails = 0
                 # 内层 while 的 break 只跳出一层（= 进入下一页）；整个流程是否收尾由
                 # end_flow 决定，否则「终止退出」和「刷完最后一页」都会在外层空转（ERROR.md E6）。
                 end_flow = False
@@ -360,10 +413,20 @@ class SolverEngine:
                         target_page = context.pages[-1] if context.pages else context.new_page()
                         try:
                             target_page.goto(saved_url)
+                            hub.emit_log('[系统] 🌟 浏览器重启完毕，已返回目标页，继续刷课...')
                         except Exception as e:
-                            hub.emit_log(f'[警告] 返回目标页失败: {e}')
-                        hub.emit_log('[系统] 🌟 浏览器重启完毕，已返回目标页，继续刷课...')
+                            # ⚠️ **失败也必须消费掉 saved_url**：原来无论成功失败都在
+                            # 后面无条件 `saved_url = None`，那反而没错；真正会死循环的是
+                            # "失败却保留"的写法。这里显式在两条路径上都清掉，并在
+                            # 失败时计数，连续失败就不再尝试（否则外层 `while True`
+                            # 会一直回到这里重试同一件事，用户只能手动停止）。
+                            restore_fails += 1
+                            hub.emit_log(f'[警告] 返回目标页失败（第 {restore_fails} 次）: {e}')
                         saved_url = None
+                        if restore_fails >= 2:
+                            hub.emit_log('[错误] 多次无法返回学习页，结束本次刷课。')
+                            end_flow = True
+                            break
                     else:
                         found = self._locate_page(context, selected_title)
                         if found is not None:
@@ -378,8 +441,8 @@ class SolverEngine:
                         else:
                             target_page = context.pages[-1]
                     self.remember_page(target_page)
-                    hub.emit_log(f'[系统] 锁定当前网页: 【{target_page.title()}】')
-                    target_page.on('dialog', lambda dialog: dialog.accept())
+                    hub.emit_log(f'[系统] 锁定当前网页: 【{self._safe_title(target_page)}】')
+                    self._register_dialog_handler(target_page)
 
                     while True:
                         if self.check_pause_and_stop():
@@ -642,7 +705,7 @@ class SolverEngine:
                                 hub.emit_log('[系统] 🌟 已连刷 10 页，重建标签页释放内存...')
                                 saved_url = target_page.url
                                 new_page = context.new_page()
-                                new_page.on('dialog', lambda dialog: dialog.accept())
+                                self._register_dialog_handler(new_page)
                                 target_page.close()
                                 new_page.goto(saved_url)
                                 target_page = new_page
@@ -672,6 +735,8 @@ class SolverEngine:
             hub.emit_log(f'[错误] 流程异常中断: {e}')
             self.last_error = f'流程异常中断: {e}'
         finally:
+            # 撤销"阻止休眠"，把电源策略还给系统（与 run() 开头的 keep_computer_awake 配对）
+            core.keep_computer_awake(release=True)
             self.solver_running = False
             self.task_text = '闲置中'
             self.hub.emit_status()
@@ -703,18 +768,20 @@ class SolverEngine:
         """把当前学习页写进 config.json: last_page_url / last_page_title（同址不重复写）。"""
         try:
             url = page.url
-            title = (page.title() or '').strip()
         except Exception:
             return None
+        title = self._safe_title(page, fallback='')
         hub = self.hub
         if getattr(hub, '_last_saved_url', None) == url:
             return None
         hub._last_saved_url = url
         try:
-            from .config import update_config
-            update_config({'last_page_url': url, 'last_page_title': title})
-        except Exception:
-            pass
+            # `update_config` 已经模块级 import；原来这里又局部 import 一次，
+            # 而且把写入失败也吞掉了。写失败至少留一条 warning 便于定位。
+            if not update_config({'last_page_url': url, 'last_page_title': title}):
+                LOGGER.warning('[页面] last_page_* 写入 config.json 失败')
+        except Exception as e:
+            LOGGER.warning(f'[页面] 记忆当前页失败: {e}')
         return None
 
     def _reopen_last_page(self, context):
@@ -727,7 +794,7 @@ class SolverEngine:
                 return None
             self.hub.emit_log('[系统] 页面被关闭，尝试自动跳回上次的学习页...')
             page = context.new_page()
-            page.on('dialog', lambda dialog: dialog.accept())
+            self._register_dialog_handler(page)
             page.goto(url)
             for _ in range(30):
                 try:
@@ -822,6 +889,14 @@ class SolverEngine:
                 hub.emit_log(f'         [题 {it["idx"] + 1}] 求解失败: {it["error"][1]}')
                 continue
             resp = it['answer'] or {}
+            # ⚠️ **空答案不算"求解成功"**：`run_parallel` 在退出时会直接 return，
+            # 那些没轮到的题 `answer` 还是 None；后端返回 200 但内容是空/无字母时
+            # `_normalize_answer` 也会给出空答案。原来这两种都按"已求解"计数，
+            # 一旦本批里**有任意一题**填涂成功（`nc > 0`）就会触发自动提交 ——
+            # 交上去的是一份"其余题目全空白"的答卷。
+            if not (resp.get('answer_key') or resp.get('text_answers')):
+                hub.emit_log(f'         [题 {it["idx"] + 1}] 未取得有效答案，跳过填涂。')
+                continue
             show = resp.get('answer_key') or ', '.join(resp.get('text_answers', []))
             tag = ' [后端缓存命中]' if resp.get('cached') else ''
             hub.emit_log(f'         [题 {it["idx"] + 1}] 答案: {show or "(空)"}{tag}')
@@ -840,11 +915,25 @@ class SolverEngine:
         self.quiz_text = f'完成 {nc}/{total_q}'
 
         # ---- 阶段 4：提交 / 暂存 ----
-        if nc > 0 and not self.check_pause_and_stop():
-            if self.settings.get('auto_submit', True):
-                self._do_submit_target_page(target_page)
-            else:
-                self._do_save_target_page(target_page)
+        # ⚠️ **只有整批全部填涂成功才自动提交**（2026-09-19）：原来的判据是 `nc > 0`，
+        # 于是 8 道题里填对 1 道也会把整份测验交上去，其余 7 道留空。
+        # 有题没填上就**降级为暂存**——答案留在页面上，用户可以自己补完再交。
+        if nc == 0:
+            hub.emit_log('      [跳过] 本卡片没有任何题目填涂成功，不提交。')
+            return None
+        if self.check_pause_and_stop():
+            return None
+        # `len(items)` 才是"真正识别成功、参与本批"的题数；`total_q` 是扫描到的题数，
+        # 截图失败被丢掉的题会让两者不等，所以两个都要比。
+        if nc < len(items) or len(items) < total_q:
+            hub.emit_log(f'      [提示] 未全部填涂（{nc}/{total_q}），本次不自动提交，'
+                         f'改为暂存以免交出空白答卷。')
+            self._do_save_target_page(target_page)
+            return None
+        if self.settings.get('auto_submit', True):
+            self._do_submit_target_page(target_page)
+        else:
+            self._do_save_target_page(target_page)
         return None
 
     def _do_submit_target_page(self, target_page):
@@ -957,6 +1046,13 @@ class SolverEngine:
         except Exception:
             return f'p{page_counter}_t{tab_idx}_i{task_idx}_fallback'
 
+    # 单个任务点"完全没进展"多久就放弃（秒）。
+    # ⚠️ 没有这个上限时：视频永久缓冲（`paused=True, ended=False`，且线路切换函数
+    # 没报错）会让 `while not media_completed` 每 0.5s 空转**永远不退出**；
+    # 文档 `percent` 卡在 99.x 或滚动高度一直在长也一样。用户在界面看到的是
+    # "一直不动也不结束"，只能手动点停止。
+    TASK_STALL_TIMEOUT = 300.0
+
     def run_video_task(self, target_page, task_frame, target_container, task_sig,
                        completed_video_urls):
         media_completed = False
@@ -965,6 +1061,7 @@ class SolverEngine:
         line_switch_count = 0
         hub = self.hub
         self.task_text = '正在播放音视频'
+        last_progress_at = time.time()
         try:
             task_frame.evaluate(core.HACK_SCRIPT)
         except Exception:
@@ -972,6 +1069,12 @@ class SolverEngine:
 
         while not media_completed:
             if self.check_pause_and_stop() or target_page.is_closed():
+                return None
+            # 进展看门狗：进度百分比变了就刷新时间戳，长时间不变即放弃该任务点。
+            if time.time() - last_progress_at > self.TASK_STALL_TIMEOUT:
+                hub.emit_log(f'         [放弃] 视频 {int(self.TASK_STALL_TIMEOUT)}s 无进展'
+                             f'（仍停在 {self.video_text}），跳过该任务点。')
+                completed_video_urls.add(task_sig)
                 return None
             try:
                 is_finished = target_container.evaluate(
@@ -1001,7 +1104,16 @@ class SolverEngine:
                 if 'error' in status:
                     raise Exception(status['error'])
                 inner_err_count = 0
-                if status and not status.get('paused', True) and not status.get('ended', False):
+                # ⚠️ 进程退出后 `evaluate` 可能返回 None；`status['percent']` 这种下标
+                # 取值一旦缺键/为 None 就会抛 KeyError/TypeError（虽然被下面兜住，
+                # 但会白白吃掉 5 次容错额度并最终"假装完成"）。统一走 `.get`。
+                status = status or {}
+                if not isinstance(status, dict):
+                    raise Exception('视频状态未返回有效结果')
+                percent_txt = str(status.get('percent', '0.0'))
+                if percent_txt != f'{last_percent}.0' and percent_txt != str(last_percent):
+                    last_progress_at = time.time()
+                if not status.get('paused', True) and not status.get('ended', False):
                     self.accumulated_video_seconds += 0.5
                     if self.accumulated_video_seconds >= 600.0:
                         self.accumulated_video_seconds -= 600.0
@@ -1012,6 +1124,7 @@ class SolverEngine:
                     if is_line_error:
                         hub.emit_log('         [警告] 视频源异常，正在自动切换线路...')
                         line_switch_count += 1
+                        last_progress_at = time.time()   # 切线路也算"有动作"，别被看门狗误杀
                         recovered = False
                         for _ in range(15):
                             if self.check_pause_and_stop():
@@ -1039,12 +1152,13 @@ class SolverEngine:
                     task_frame.evaluate("() => { let v = document.querySelector('video, audio'); if(v) v.play(); }")
                 else:
                     try:
-                        current_percent_float = float(status['percent'])
+                        current_percent_float = float(percent_txt)
                         if int(current_percent_float) != last_percent:
-                            hub.emit_log(f'         [视频] 播放进度: {status["percent"]}%')
-                            self.video_text = f'{status["percent"]}%'
+                            hub.emit_log(f'         [视频] 播放进度: {percent_txt}%')
+                            self.video_text = f'{percent_txt}%'
                             last_percent = int(current_percent_float)
-                    except Exception:
+                            last_progress_at = time.time()
+                    except (TypeError, ValueError):
                         pass
                 if status.get('ended'):
                     hub.emit_log('         [完成] 音视频播放结束。')
@@ -1073,9 +1187,24 @@ class SolverEngine:
         inner_err_count = 0
         hub = self.hub
         self.task_text = '步进阅读文档'
+        last_progress_at = time.time()
+        last_percent = ''
+
+        def _percent_value(text):
+            try:
+                return float(str(text).replace('%', ''))
+            except (TypeError, ValueError):
+                return -1.0
 
         while not doc_completed:
             if self.check_pause_and_stop() or target_page.is_closed():
+                return None
+            # 看门狗：`percent` 长时间不动（滚动高度一直在长、或卡在 99.x）
+            # 就放弃该任务点，否则外层 while 永远转下去（用户只能手动停止）。
+            if time.time() - last_progress_at > self.TASK_STALL_TIMEOUT:
+                hub.emit_log(f'         [放弃] 文档 {int(self.TASK_STALL_TIMEOUT)}s 无进展'
+                             f'（停在 {last_percent or "?"}%），跳过该任务点。')
+                completed_doc_urls.add(task_sig)
                 return None
             try:
                 is_finished = target_container.evaluate(
@@ -1089,12 +1218,24 @@ class SolverEngine:
                     return None
                 task_frame.evaluate(core.SCROLL_SCRIPT)
                 status = task_frame.evaluate('window.autoScrollDocument()')
-                if 'error' in status:
+                # ⚠️ `evaluate` 在 frame 已导航/脚本未注入时返回 None；原来直接
+                # `'error' in status` ⇒ `TypeError: argument of type 'NoneType' is
+                # not iterable`，被下面当成"普通异常"吃掉 5 次后**把任务标记成已完成**
+                # （等于没读就跳过）。
+                if not isinstance(status, dict):
+                    raise Exception('滚动脚本未返回结果（frame 可能已失效）')
+                if status.get('error'):
                     raise Exception(status['error'])
                 inner_err_count = 0
-                hub.emit_log(f'         [文档] 阅读进度: {status["percent"]}%')
-                self.video_text = f'阅读进度 {status["percent"]}%'
-                if status.get('ended') or status.get('percent') == '100.0':
+                percent_txt = str(status.get('percent', '0.0'))
+                if percent_txt != last_percent:
+                    last_percent = percent_txt
+                    last_progress_at = time.time()
+                hub.emit_log(f'         [文档] 阅读进度: {percent_txt}%')
+                self.video_text = f'阅读进度 {percent_txt}%'
+                # 触底判定：脚本说 ended，或进度已经到 99% 以上（`toFixed(1)` 常常
+                # 停在 99.9/99.8 而永远不出现字面量 "100.0"），或已到 100%。
+                if status.get('ended') or _percent_value(percent_txt) >= 99.0:
                     hub.emit_log('         [完成] 文档已触底。')
                     self.video_text = '已完成'
                     completed_doc_urls.add(task_sig)

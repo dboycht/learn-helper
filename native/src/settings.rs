@@ -601,6 +601,11 @@ fn mask_secret(s: &str) -> String {
 }
 
 /// 最小 JSON 字符串转义（后端要求 ASCII 安全的报文）。
+///
+/// ⚠️ 非 ASCII **必须转义**：与后端的约定是"纯 ASCII JSON"（`ipc.dumps_ascii`
+/// 用 `ensure_ascii=True`）—— 见 `rules/01 §8` 那套跨进程编码纪律。
+/// 原来这里把中文原样留着，于是 `Content-Length` 用的是 `body.len()`（**字节数**）
+/// 而字符串长度按**字符数**算，两边在中文上必然不一致，请求体会被截断/错位。
 fn json_str(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -612,6 +617,18 @@ fn json_str(s: &str) -> String {
             '\r' => out.push_str("\\r"),
             '\t' => out.push_str("\\t"),
             c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            // 非 ASCII → \uXXXX；BMP 之外（emoji 等）要按 UTF-16 代理对拆成两个
+            c if (c as u32) > 0x7F => {
+                let cp = c as u32;
+                if cp <= 0xFFFF {
+                    out.push_str(&format!("\\u{:04x}", cp));
+                } else {
+                    let v = cp - 0x10000;
+                    let hi = 0xD800 + (v >> 10);
+                    let lo = 0xDC00 + (v & 0x3FF);
+                    out.push_str(&format!("\\u{:04x}\\u{:04x}", hi, lo));
+                }
+            }
             c => out.push(c),
         }
     }
@@ -622,7 +639,8 @@ fn json_str(s: &str) -> String {
 // ================================================================ 状态
 struct SettingsState {
     shared: Arc<Shared>,
-    theme: Theme,
+    /// 主题只用于构造时算出 `colors`；绘制点都读 `colors`，不再单独存 theme
+    /// （原来存了却没人读）。
     colors: Colors,
     fonts: Vec<ui::FontOwned>,
     hwnd: HWND,
@@ -649,7 +667,6 @@ impl SettingsState {
     fn new(shared: Arc<Shared>, theme: Theme) -> SettingsState {
         SettingsState {
             shared,
-            theme,
             colors: Colors::for_theme(theme),
             fonts: ui::make_dialog_fonts(96),
             hwnd: NULL_HANDLE,
@@ -1443,7 +1460,9 @@ fn caret_bar(hdc: HDC, caret_x: i32, rc: RECT, px: &dyn Fn(i32) -> i32, color: u
 }
 
 // ================================================================ 窗口过程
+// Win32 `CREATESTRUCTW` 的前缀（只用到第一个字段）：字段名保持与 SDK 一致。
 #[repr(C)]
+#[allow(non_snake_case)]
 struct CREATESTRUCT {
     lpCreateParams: *mut std::ffi::c_void,
 }
@@ -1935,10 +1954,14 @@ fn hook_action(hwnd: HWND, state: *mut SettingsState, action: usize) {
                 if closed {
                     crate::trace::trace("settings-hook: dialog closed after save");
                 } else {
-                    crate::trace::trace(&format!(
-                        "settings-hook: save still open status={}",
-                        s.form.status
-                    ));
+                    // ⚠️ 保存成功会**销毁对话框**，`WM_NCDESTROY` 里已经把
+                    // `s` 指向的那个 Box `drop(Box::from_raw(user))` 掉了。
+                    // `IsWindow` 只是"那一刻窗口还在不在"的快照 —— 它返回 0 就
+                    // **绝对不能再去读 `s.form.*`**，那是 use-after-free。
+                    // 这里原来在 else 分支里读了 `s.form.status`，等于在已释放的
+                    // 内存上取值（虽然只走 `LH_UI_ACTION=settings_save` 这条验证路径，
+                    // 但那是实打实的 UB）。要打状态就在**点保存之前**取样。
+                    crate::trace::trace("settings-hook: save still open (dialog alive)");
                 }
                 exit_after_hook();
             }
@@ -2182,7 +2205,8 @@ fn create(owner: HWND, shared: Arc<Shared>, theme: Theme, hook: usize) -> HWND {
             std::thread::spawn(move || {
                 std::thread::sleep(std::time::Duration::from_millis(if hook == HOOK_OPEN { 1200 } else { 2600 }));
                 if hwnd_raw != 0 {
-                    unsafe { PostMessageW(hwnd_raw as HWND, WM_APP_HOOK, hook as WPARAM, 0) };
+                    // 已在包含本闭包的 `unsafe` 块里
+                    PostMessageW(hwnd_raw as HWND, WM_APP_HOOK, hook as WPARAM, 0);
                 }
             });
         }
@@ -2276,6 +2300,11 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
     state.form.focus_on(Field::ServerUrl);
     state.form.status = "示例状态行：测试连接：后端 v2.1.1 · 正常".to_string();
 
+    // 尺寸校验 + 溢出安全的缓冲区长度（探针参数是外部输入，见 native::probe_buffer_bytes）
+    let buf_bytes = match crate::native::probe_buffer_bytes(w, h) {
+        Some(n) => n,
+        None => return,
+    };
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
         if screen.is_null() {
@@ -2286,6 +2315,12 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
         let bmp = CreateCompatibleBitmap(screen, w, h);
         if mem.is_null() || bmp.is_null() {
             crate::trace::trace("settings-probe: 创建内存 DC/位图失败");
+            if !bmp.is_null() {
+                DeleteObject(bmp as HGDIOBJ);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
             ReleaseDC(std::ptr::null_mut(), screen);
             return;
         }
@@ -2303,7 +2338,7 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
             },
             ..Default::default()
         };
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let mut pixels = vec![0u8; buf_bytes];
         let lines = GetDIBits(
             mem,
             bmp,
@@ -2323,5 +2358,35 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
         DeleteObject(bmp as HGDIOBJ);
         DeleteDC(mem);
         ReleaseDC(std::ptr::null_mut(), screen);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 报文必须是**纯 ASCII**（与后端的约定），否则 `Content-Length`（字节数）
+    /// 与字符串长度（字符数）在中文上不一致，请求体会被截断。
+    #[test]
+    fn json_str_escapes_non_ascii() {
+        let encoded = json_str("模型-中文");
+        assert!(encoded.is_ascii(), "must be pure ASCII, got {encoded:?}");
+        assert!(encoded.contains("\\u"), "CJK must be \\uXXXX escaped: {encoded:?}");
+        assert!(!encoded.contains('模'));
+        assert_eq!(json_str("gpt-4o"), "\"gpt-4o\"");
+        let emoji = json_str("😀");
+        assert!(emoji.is_ascii());
+        assert_eq!(emoji, "\"\\ud83d\\ude00\"");
+        assert_eq!(json_str("a\"b"), "\"a\\\"b\"");
+        assert_eq!(json_str("a\\b"), "\"a\\\\b\"");
+        assert_eq!(json_str("\n"), "\"\\n\"");
+    }
+
+    /// ASCII 输入必须一字不改（不能把普通键值搞坏）。
+    #[test]
+    fn json_str_leaves_ascii_alone() {
+        for original in ["http://127.0.0.1:8000", "server", "gpt-4o", "", "a/b?c=d"] {
+            assert_eq!(json_str(original), format!("\"{original}\""));
+        }
     }
 }

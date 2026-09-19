@@ -79,6 +79,10 @@ pub const WM_NCACTIVATE: u32 = 0x0086;
 pub const WM_NCLBUTTONDOWN: u32 = 0x00A1;
 pub const WM_GETMINMAXINFO: u32 = 0x0024;
 pub const WM_DPICHANGED: u32 = 0x02E0;
+/// 鼠标捕获被系统/别的窗口抢走时发来（`lParam` = 抢走捕获的窗口）。
+/// ⚠️ 不处理它，`grab`/`log_bar_drag` 会一直停在"按下"状态 ⇒ 之后再移动鼠标
+/// 会**没有按键也拖着窗口跑**（用户视角是"窗口粘在鼠标上了"）。
+pub const WM_CAPTURECHANGED: u32 = 0x0215;
 pub const WM_ACTIVATE: u32 = 0x0006;
 /// `WM_ACTIVATE` 的 wParam 低 16 位：窗口失活（= 用户点了别处）。
 pub const WA_INACTIVE: u32 = 0;
@@ -291,28 +295,6 @@ pub struct WNDCLASSEXW {
 /// 把 Rust 字符串转成 NUL 结尾的 UTF-16（调用方持有所有权）。
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-/// 供窗口过程使用的极小 utf16 工具。
-pub fn utf16_len(p: *const u16) -> usize {
-    if p.is_null() {
-        return 0;
-    }
-    let mut n = 0;
-    unsafe {
-        while *p.add(n) != 0 {
-            n += 1;
-        }
-    }
-    n
-}
-
-pub fn utf16_to_string(p: *const u16, len: usize) -> String {
-    if p.is_null() || len == 0 {
-        return String::new();
-    }
-    let slice = unsafe { std::slice::from_raw_parts(p, len) };
-    String::from_utf16_lossy(slice)
 }
 
 pub fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -592,6 +574,31 @@ pub struct MARGINS {
     pub cyBottomHeight: i32,
 }
 
+/// 渲染探针的尺寸校验 + 像素缓冲字节数（**溢出安全**）。
+///
+/// 探针的 `w`/`h` 来自命令行参数，属于外部输入。原来的写法是
+/// `vec![0u8; (w * h * 4) as usize]`：乘法在 **i32** 里做，会静默回绕。
+/// 例如 `--render-probe 65536 65536`：`65536*65536*4` 回绕成 0 ⇒ 缓冲区长度 0，
+/// 随后 `GetDIBits` 仍按 h 行往这个空缓冲区里写 ⇒ **堆破坏**（不是崩溃，是更糟的
+/// 内存写坏，后面随机时刻炸）。这里统一：先挡掉非法尺寸，再用 i64 算字节数，
+/// 并给一个上限（4 亿像素 ≈ 1.6 GB 显然超出探针用途）。
+pub fn probe_buffer_bytes(w: i32, h: i32) -> Option<usize> {
+    if w <= 0 || h <= 0 {
+        crate::trace::trace(&format!("probe: 非法尺寸 {}x{}，放弃渲染", w, h));
+        return None;
+    }
+    const MAX_PIXELS: i64 = 400_000_000;
+    let pixels = (w as i64) * (h as i64);
+    if pixels > MAX_PIXELS {
+        crate::trace::trace(&format!(
+            "probe: 尺寸过大 {}x{}（{} 像素），放弃渲染",
+            w, h, pixels
+        ));
+        return None;
+    }
+    Some((pixels * 4) as usize)
+}
+
 #[link(name = "shcore")]
 extern "system" {
     pub fn SetProcessDpiAwareness(value: i32) -> i32;
@@ -663,6 +670,11 @@ pub fn windows_build() -> u32 {
 /// 背板（实测四角采到的仍是壁纸蓝），根本取不到我们自绘的客户区；而 `CopyFromScreen`
 /// 会抓到用户的屏幕内容（红线，绝不使用）。直接调用自己的绘制代码则完全绕开这两者。
 pub fn render_client_to_bmp(app: &mut crate::ui::App, w: i32, h: i32, out_path: &str) {
+    // 尺寸校验 + 溢出安全的缓冲区长度（见 probe_buffer_bytes 的注释）
+    let buf_bytes = match probe_buffer_bytes(w, h) {
+        Some(n) => n,
+        None => return,
+    };
     unsafe {
         let screen = GetDC(std::ptr::null_mut());
         if screen.is_null() {
@@ -673,6 +685,13 @@ pub fn render_client_to_bmp(app: &mut crate::ui::App, w: i32, h: i32, out_path: 
         let bmp = CreateCompatibleBitmap(screen, w, h);
         if mem.is_null() || bmp.is_null() {
             crate::trace::trace("probe: 创建内存 DC/位图失败");
+            // ⚠️ 只失败一个时，另一个也必须还回去（原来成对判断 ⇒ 泄漏）
+            if !bmp.is_null() {
+                DeleteObject(bmp as HGDIOBJ);
+            }
+            if !mem.is_null() {
+                DeleteDC(mem);
+            }
             ReleaseDC(std::ptr::null_mut(), screen);
             return;
         }
@@ -694,7 +713,7 @@ pub fn render_client_to_bmp(app: &mut crate::ui::App, w: i32, h: i32, out_path: 
             },
             ..Default::default()
         };
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let mut pixels = vec![0u8; buf_bytes];
         let lines = GetDIBits(
             mem,
             bmp,
