@@ -216,8 +216,14 @@ window.autoScrollDocument = function() {
             window.scrollBy(0, 400);
             let nextCurrent = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
             let reached = (nextCurrent + clientH) >= (maxScroll - 30);
-            return { ended: true, percent: ((nextCurrent + clientH)/maxScroll*100).toFixed(1) };
+            // ⚠️ 这里原来**无条件** `ended: true`（上一行算出来的 `reached` 被丢掉），
+            // 于是走"窗口滚动"这条路的文档**第一步滚动就被判"读完了"**，
+            // 引擎随即翻到下一节 —— 表现就是"没读完就切走了"（与用户报的
+            // "无法自动切换页面"同一条链路，见 ERROR.md E69）。
+            // 现在与上面两个分支一致：用真实滚动位置判断是否触底。
+            return { ended: reached, percent: ((nextCurrent + clientH)/maxScroll*100).toFixed(1) };
         }
+        // 文档本身不可滚动（内容比视口还短）：确实"没什么可读的"，算完成是对的。
         return { ended: true, percent: "100.0" };
     } catch(e) {
         return { ended: true, percent: "100.0", error: e.toString() };
@@ -1491,12 +1497,12 @@ def fill_and_click_smart(question_locator, response_data):
                         if should_select and not is_selected:
                             el.scroll_into_view_if_needed()
                             time.sleep(0.05)
-                            el.click(True, force=True)
+                            el.click(force=True)
                             time.sleep(0.12)
                         elif not should_select and is_selected and q_type == 'multi_choice':
                             el.scroll_into_view_if_needed()
                             time.sleep(0.05)
-                            el.click(True, force=True)
+                            el.click(force=True)
                             time.sleep(0.12)
                     except Exception as e:
                         LOGGER.info(f'[填涂] 选项 {idx + 1} 异常: {e}')
@@ -1513,7 +1519,7 @@ def fill_and_click_smart(question_locator, response_data):
                                 try:
                                     if not target_ipt.is_checked():
                                         target_ipt.scroll_into_view_if_needed()
-                                        target_ipt.click(True, force=True)
+                                        target_ipt.click(force=True)
                                         time.sleep(0.12)
                                 except Exception:
                                     pass

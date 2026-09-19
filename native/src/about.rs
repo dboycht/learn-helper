@@ -590,8 +590,10 @@ pub fn render_probe(out_path: &str, _w: i32, _h: i32, dpi: u32) {
     let shared = Shared::new();
     {
         let mut st = shared.lock();
-        st.status_text = "已连接 v2.1.2 · http://127.0.0.1:6225".to_string();
-        st.version = "2.1.2".to_string();
+        // 版本号从单一来源取（Cargo.toml），示例文案里不再写死（写死过，产物会是旧版本）
+        let v = crate::backend::APP_VERSION;
+        st.status_text = format!("已连接 v{} · http://127.0.0.1:6225", v);
+        st.version = v.to_string();
         st.device_id = "DEV-9700E71B8EDA".to_string();
         st.base_url = "http://127.0.0.1:6225".to_string();
         st.backend_exe = "D:\\code\\DeepSeekHarness\\learn-helper\\backend\\main.py".to_string();

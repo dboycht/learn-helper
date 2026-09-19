@@ -477,6 +477,72 @@ def test_logic():
           os.path.exists(_CP) and not os.path.exists(_bad),
           f'bad_exists={os.path.exists(_bad)}')
 
+    # C11 ⭐⭐：**不许给 Playwright 的 keyword-only 方法传位置参数**
+    #   教训（2026-09-19，用户报"无法自动切换页面"）：整套刷课里**所有点击**都写成
+    #   `el.click(True, force=True)`，而 `Locator.click` 的签名是 `click(self, *, ...)`
+    #   —— 多出来的位置参数直接抛
+    #   `TypeError: click() takes 1 positional argument but 2 positional arguments
+    #   (and 1 keyword-only argument) were given`。于是**翻页、切卡片、提交、暂存、
+    #   点选项全部静默失败**（各自被 try/except 吞掉，只留一行"翻页受阻"）。
+    #   这个 bug 从 2.1.1 重构起就在，而"没有真实浏览器"的自测照不到它 ⇒
+    #   在源码层面直接扫一遍是最便宜、最可靠的回归（不需要浏览器、不需要网络）。
+    _scan_ok = True
+    try:
+        import inspect as _inspect
+
+        from playwright.sync_api import ElementHandle as _EH
+        from playwright.sync_api import Frame as _FR
+        from playwright.sync_api import Locator as _LOC
+        from playwright.sync_api import Page as _PG
+
+        _kwonly = set()
+        for _cls in (_LOC, _PG, _FR, _EH):
+            for _name, _member in _inspect.getmembers(_cls):
+                if _name.startswith('_') or not callable(_member):
+                    continue
+                try:
+                    _params = list(_inspect.signature(_member).parameters.values())[1:]
+                except (TypeError, ValueError):
+                    continue
+                if _params and not any(
+                    p.kind in (_inspect.Parameter.POSITIONAL_ONLY,
+                               _inspect.Parameter.POSITIONAL_OR_KEYWORD)
+                    for p in _params
+                ):
+                    _kwonly.add(_name)
+    except Exception as e:
+        _scan_ok = False
+        check('C11 扫描 Playwright keyword-only 调用', False, f'取签名失败: {e}')
+
+    if _scan_ok:
+        import re as _re
+        _bad_calls = []
+        _lh_dir = os.path.join(BACKEND_DIR, 'learn_helper')
+        for _fname in sorted(os.listdir(_lh_dir)):
+            if not _fname.endswith('.py'):
+                continue
+            with open(os.path.join(_lh_dir, _fname), encoding='utf-8') as _fh:
+                for _lineno, _line in enumerate(_fh, 1):
+                    for _m in _re.finditer(r'\.([a-z_]+)\(([^)]*)\)', _line):
+                        _meth, _args = _m.group(1), _m.group(2).strip()
+                        if _meth not in _kwonly or not _args:
+                            continue
+                        # 取第一个参数；以 `name=` 形式出现的就是关键字参数（合法）
+                        _depth, _first = 0, ''
+                        for _ch in _args:
+                            if _ch in '([{':
+                                _depth += 1
+                            elif _ch in ')]}':
+                                _depth -= 1
+                            elif _ch == ',' and _depth == 0:
+                                break
+                            _first += _ch
+                        _first = _first.strip()
+                        if _first and not _re.match(r'^[A-Za-z_][A-Za-z0-9_]*\s*=', _first):
+                            _bad_calls.append(f'{_fname}:{_lineno} .{_meth}({_first})')
+        check('C11 无位置参数传给 Playwright keyword-only 方法（click 等）',
+              not _bad_calls, '; '.join(_bad_calls[:5]))
+
     # C7/C8：config.json 的写入健壮性（2026-09-19 修，见 ERROR.md E60）
     #   C7 想证明的是**落盘方式**本身：旧实现 `open(path,'w')` 先截断再 dump，
     #      中途失败就留下半截文件；`save_config` 的原子替换无论成功失败都不该留半截。

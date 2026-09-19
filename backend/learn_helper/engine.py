@@ -492,7 +492,7 @@ class SolverEngine:
                                         target_tab = current_tabs[tab_idx]
                                         target_tab.scroll_into_view_if_needed()
                                         time.sleep(0.3)
-                                        target_tab.click(True, force=True)
+                                        target_tab.click(force=True)
                                         hub.emit_log(f'      [卡片] 已切换至卡片 {tab_idx + 1}...')
                                         time.sleep(1.5)
                                         core.robust_wait_for_tasks_to_render(
@@ -684,7 +684,7 @@ class SolverEngine:
                         try:
                             next_btn.scroll_into_view_if_needed()
                             time.sleep(0.5)
-                            next_btn.click(True, force=True)
+                            next_btn.click(force=True)
                             hub.emit_log('[导航] 已翻页，检查是否有确认弹窗...')
                             for _ in range(5):
                                 if self.check_pause_and_stop():
@@ -693,7 +693,7 @@ class SolverEngine:
                                 bypass_btn, _bf = core.find_confirmation_bypass_button(target_page)
                                 if bypass_btn:
                                     hub.emit_log('[系统] 检测到未完成提示弹窗，已强制跳过。')
-                                    bypass_btn.click(True, force=True)
+                                    bypass_btn.click(force=True)
                                     break
                             hub.emit_log('[导航] 等待页面载入...')
                             time.sleep(0.8)
@@ -946,7 +946,7 @@ class SolverEngine:
         try:
             submit_btn.scroll_into_view_if_needed()
             time.sleep(0.3)
-            submit_btn.click(True, force=True)
+            submit_btn.click(force=True)
             self.hub.emit_log('         [提交] 已点击提交，等待二次确认弹窗...')
             time.sleep(0.8)
             confirm_btn = None
@@ -966,7 +966,7 @@ class SolverEngine:
                     pass
             if confirm_btn:
                 confirm_btn.scroll_into_view_if_needed()
-                confirm_btn.click(True, force=True)
+                confirm_btn.click(force=True)
                 self.hub.emit_log('         [提交] 二次确认完成，任务点已提交。')
             else:
                 self.hub.emit_log('         [提示] 未检测到确认弹窗（可能已被浏览器自动放行）。')
@@ -989,7 +989,7 @@ class SolverEngine:
         try:
             save_btn.scroll_into_view_if_needed()
             time.sleep(0.3)
-            save_btn.click(True, force=True)
+            save_btn.click(force=True)
             self.hub.emit_log('         [存档] 暂存成功，答案已留存。')
             for _ in range(10):
                 if self.stop_requested:

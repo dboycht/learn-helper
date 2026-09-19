@@ -49,12 +49,22 @@ public class CA3 {
     if (btn < 40) btn = 40;
     int w = cr.Right;
 
-    // Title bar right side: x_start = w - 3*btn;
-    // About = x_start - 3*btn, Settings = x_start - 2*btn.
-    // (2026-09-15: the new Settings entry shifted About left by one slot --
-    //  whenever you touch title-bar buttons, update these coordinates too.)
-    int xAbout = w - btn * 3 - btn * 3 + btn / 2;
-    int xSettings = w - btn * 3 - btn * 2 + btn / 2;
+    // Title bar right side, counted from the RIGHT edge (same rule as titlebar_scan.ps1):
+    //   slot 0 = Close, 1 = Max, 2 = Min, 3 = Theme, 4 = Settings(gear), 5 = About(info)
+    // so with `btn` = px(48) at the current DPI:
+    //   Close    centre = w - 1*btn + btn/2
+    //   Max      centre = w - 2*btn + btn/2
+    //   Min      centre = w - 3*btn + btn/2
+    //   Theme    centre = w - 4*btn + btn/2
+    //   Settings centre = w - 5*btn + btn/2
+    //   About    centre = w - 6*btn + btn/2
+    // (2026-09-19: this file previously assumed only THREE right-side slots
+    //  ("x_start = w - 3*btn"), which stopped matching reality once Theme/Settings were
+    //  added. It happened to still land because the arithmetic collapsed to
+    //  `w - 6*btn + btn/2` for About, but the comment was actively misleading --
+    //  keep this table in sync with `paint_title_bar`'s controls array.)
+    int xAbout = w - btn * 6 + btn / 2;
+    int xSettings = w - btn * 5 + btn / 2;
     int y = 30;
     log.AppendLine("probe: dpi=" + dpi + " client=" + cr.Right + "x" + cr.Bottom + " btn=" + btn + " xAbout=" + xAbout + " xSettings=" + xSettings);
 

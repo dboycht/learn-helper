@@ -2298,7 +2298,12 @@ pub fn render_probe(out_path: &str, w: i32, h: i32, dpi: u32) {
     ]);
     state.form.load_from(&data);
     state.form.focus_on(Field::ServerUrl);
-    state.form.status = "示例状态行：测试连接：后端 v2.1.1 · 正常".to_string();
+    // 版本号从单一来源取（`APP_VERSION` = Cargo.toml），别在示例文案里写死 ——
+    // 写死过一次，结果渲染探针产物上显示的还是旧版本（2026-09-19）。
+    state.form.status = format!(
+        "示例状态行：测试连接：后端 v{} · 正常",
+        crate::backend::APP_VERSION
+    );
 
     // 尺寸校验 + 溢出安全的缓冲区长度（探针参数是外部输入，见 native::probe_buffer_bytes）
     let buf_bytes = match crate::native::probe_buffer_bytes(w, h) {
