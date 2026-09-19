@@ -1,4 +1,4 @@
-﻿__pycache__/
+__pycache__/
 *.pyc
 logs/
 browser_profile/
@@ -24,6 +24,8 @@ dist/
 # Dev-only docs and artifacts (never pushed)
 DEVELOPMENT.md
 ERROR.md
+HANDOVER.md
 _release/
 _research/
+_tools/
 *.log
