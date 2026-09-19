@@ -208,7 +208,13 @@ $decisionMarker = '] [' + $browserTag + ']'
 Check "the backend logged the auto-launch decision" (@($backLines | Where-Object { $_ -match [regex]::Escape($decisionMarker) }).Count -gt 0) ("log=" + $backendLog)
 Check "the logged decision says it was skipped" (@($backLines | Where-Object { ($_ -match [regex]::Escape($decisionMarker)) -and ($_ -match [regex]::Escape($skipTag)) }).Count -gt 0)
 $portNow = Port-Open
-Check "no browser was launched (9222 still closed)" ((-not $portNow) -or $portWasOpen) ("port open now = " + $portNow)
+# Case 2 has auto_launch_browser = false, so the app must NOT open a browser.
+# The old assertion was `(-not $portNow) -or $portWasOpen`, which is a tautology whenever the
+# port was already open at probe start -- i.e. it could never fail after case 1 had run
+# (found by audit). The honest requirement is: the port state must be UNCHANGED by this run.
+# If it was closed, it must still be closed; if it was already open (case 1 left one, or the
+# user had one), it must not have been closed either.
+Check "no browser was launched (9222 state unchanged by this run)" ($portNow -eq $portWasOpen) ("was=" + $portWasOpen + " now=" + $portNow)
 $cfg2 = Get-Content (Join-Path $d2 'config.json') -Raw -Encoding UTF8 | ConvertFrom-Json
 Check "config.json still says auto_launch_browser = false" ($cfg2.run.auto_launch_browser -eq $false)
 

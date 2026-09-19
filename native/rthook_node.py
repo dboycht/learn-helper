@@ -44,14 +44,50 @@ def _find_node():
     return None
 
 
+def _base_dir():
+    """Where the app's runtime files live (config.json / logs / native-diag.log).
+
+    NOTE: `sys.executable` alone is NOT it: in a PyInstaller **onefile** build the child
+    process runs from a temporary `_MEIxxxx` directory that is deleted on exit, so a log
+    written next to `sys.executable` (or next to `sys._MEIPASS`) vanishes and can never be
+    inspected -- that was the original bug (see ERROR.md E72).
+
+    Order: the app's own `LH_BASE_DIR` override -> `learn_helper.config.BASE_DIR`
+    (single source of truth; it already handles frozen vs source) -> beside the exe.
+    """
+    override = os.environ.get('LH_BASE_DIR')
+    if override:
+        return override
+    try:
+        from learn_helper.config import BASE_DIR           # single source of truth
+        return BASE_DIR
+    except Exception:
+        pass
+    try:
+        exe = os.path.abspath(sys.executable)
+        if getattr(sys, 'frozen', False):
+            # onefile: sys.executable is the launcher exe (real location);
+            # _MEIPASS would be the throwaway extraction dir, so never use it.
+            return os.path.dirname(exe)
+        return os.path.dirname(os.path.dirname(exe))
+    except Exception:
+        return os.getcwd()
+
+
 def _banner(message):
     """Write a diagnostics line where the operator can actually find it."""
     try:
-        base = os.path.dirname(os.path.abspath(sys.executable))
+        base = _base_dir()
+        try:
+            os.makedirs(base, exist_ok=True)
+        except Exception:
+            pass
         with open(os.path.join(base, 'native-diag.log'), 'a', encoding='utf-8') as fh:
             fh.write('[rthook] %s\n' % message)
     except Exception:
         pass
+    # stderr is still useful: when frozen, the UI captures the backend's stderr and
+    # copies it into its own native-diag.log, so the message survives that way too.
     try:
         sys.stderr.write('[rthook] %s\n' % message)
         sys.stderr.flush()

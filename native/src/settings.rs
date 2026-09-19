@@ -1621,19 +1621,17 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
         }
         WM_CHAR => {
             if let Some(c) = char::from_u32(wp as u32) {
-                if c == '\r' {
-                    if state.form.focus.is_some() {
-                        state.form.finalize();
-                        state.form.focus = None;
-                        state.form.caret_on = false;
-                        InvalidateRect(hwnd, std::ptr::null(), 0);
-                    } else {
-                        state.begin_save();
-                    }
-                } else if c == '\u{1b}' {
+                // ⚠️ **不要在这里处理回车**（原实现有，2026-09-19 删）：
+                // `TranslateMessage` 会在 WM_KEYDOWN(VK_RETURN) 之后**再**投一条
+                // WM_CHAR('\r')，于是按一次回车两个分支都跑 —— keydown 先把 focus 清掉，
+                // char 处理器看到 focus == None 就走去 `begin_save()`，
+                // 结果"在输入框里按回车"变成了**直接保存**，与对话框自己写明的
+                // "改动只在点「保存」后写入 config.json" 矛盾（见 ERROR.md E71）。
+                // 回车统一由 WM_KEYDOWN 处理。
+                if c == '\u{1b}' {
                     DestroyWindow(hwnd);
                     return 0;
-                } else if (c as u32) >= 0x20 && c != '\u{7f}' {
+                } else if c != '\r' && c != '\n' && (c as u32) >= 0x20 && c != '\u{7f}' {
                     state.form.input_char(c);
                     InvalidateRect(hwnd, std::ptr::null(), 0);
                 }
@@ -1821,7 +1819,13 @@ unsafe extern "system" fn settings_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LP
                 // 后台拉到的设置回来了：回填表单（用户已经动手改过就不覆盖）
                 let data = settings_from_state(&state.shared);
                 if let Some(data) = data {
-                    if state.form.touched.is_empty() && !state.form.loaded {
+                    // ⚠️ 守卫用 `!dirty()` 而不是 `touched.is_empty()`（2026-09-19 修，E71）：
+                    // 三张"答题方式"卡片与三个勾选框**不记 `touched`**（它们直接改字段），
+                    // 而这份快照要等 HTTP 回来（最长 6s）。窗口刚打开时用户先点了
+                    // "仅识别不答题"，随后快照到达 ⇒ 原来那次点击会被后端值**静默覆盖**，
+                    // 用户唯一的线索只是标题上的 `*` 消失。
+                    // `dirty()` 判"当前快照 != 初始快照"，覆盖上面所有控件。
+                    if !state.form.dirty() && !state.form.loaded {
                         state.form.load_from(&data);
                         state.form.focus_on(Field::ServerUrl);
                         crate::trace::trace("settings: filled from /api/settings");

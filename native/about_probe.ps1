@@ -108,6 +108,10 @@ Write-Host "CASE 1: open About, click the repository row (browser guarded)"
 $d1 = New-TempDir 'link'
 if (-not (Wait-NoInstance)) { Write-Host "  WARNING: previous instance still running" }
 $env:LH_BASE_DIR = $d1
+    # Guard: this probe does not test the auto-launch-browser feature, and the app arms that
+    # feature 4 seconds after start. Several probes run longer than that, so without this the
+    # app could really open the user's sandbox browser in the middle of a test (found by audit).
+    $env:LH_NO_AUTO_BROWSER = '1'
 $env:LH_UI_ACTION = 'about_link'
 $env:LH_ABOUT_NO_OPEN = '1'
 Reset-Diag

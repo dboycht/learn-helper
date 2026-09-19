@@ -521,6 +521,13 @@ class SolverEngine:
                             # 必须**先**知道本节有哪些媒体任务点，再决定要不要答题（2.1.3）。
                             containers = core.collect_job_containers(target_page, cards_frame)
                             hub.emit_log(f'      [识别] 发现候选任务容器 {len(containers)} 个')
+                            # ⚠️ `inner_html()` 是一次跨进程调用，**每个容器只读一次**：
+                            # 下面判断"有没有媒体"「是视频还是文档」都在用这份结果。
+                            # 原来同一个容器的 HTML 被重复读了 3~4 次（过滤一次、
+                            # has_media 一次、v_count 一次、还要再判断一次），
+                            # 既慢又容易让几处判据漂移（见 ERROR.md E70）。
+                            VIDEO_KW = ('video', 'audio', 'fastforward', 'insertvideo')
+                            DOC_KW = ('pdf', 'ppt', 'doc', 'preview')
                             valid_jobs = []
                             for ph in containers:
                                 try:
@@ -532,24 +539,20 @@ class SolverEngine:
                                         LOGGER.info(f'[识别] 跳过容器：尺寸过小 box={box}')
                                         continue
                                     html = ph.inner_html().lower()
-                                    matched = [kw for kw in
-                                               ('video', 'audio', 'fastforward', 'insertvideo',
-                                                'pdf', 'ppt', 'doc', 'preview') if kw in html]
-                                    if not matched:
+                                    hit_v = [kw for kw in VIDEO_KW if kw in html]
+                                    hit_d = [kw for kw in DOC_KW if kw in html]
+                                    if not hit_v and not hit_d:
                                         LOGGER.info('[识别] 跳过容器：未见媒体关键字 '
                                                     f'html={" ".join(html.split())[:200]}')
                                         continue
-                                    LOGGER.info(f'[识别] 接受容器 命中={matched} '
+                                    LOGGER.info(f'[识别] 接受容器 视频命中={hit_v} 文档命中={hit_d} '
                                                 f'size=({int(box["width"])}x{int(box["height"])})')
-                                    valid_jobs.append(ph)
+                                    # (定位器, 是否是视频)
+                                    valid_jobs.append((ph, bool(hit_v)))
                                 except Exception as ex:
                                     LOGGER.info(f'[识别] 容器检查异常: {ex}')
 
-                            has_media = any(
-                                any(k in ph.inner_html().lower() for k in
-                                    ('video', 'audio', 'fastforward', 'insertvideo',
-                                     'pdf', 'ppt', 'doc', 'preview'))
-                                for ph in valid_jobs)
+                            has_media = bool(valid_jobs)
 
                             # ---- 答题（内部答题 API / 自配大模型 / 仅识别）----
                             questions, target_frame = core.scan_page_recursively(target_page)
@@ -581,15 +584,15 @@ class SolverEngine:
                                 LOGGER.info('[识别] 未识别到任务容器，自动输出页面诊断：')
                                 core.diagnose_page(target_page, hub.emit_log)
                             else:
-                                v_count = sum(1 for ph in valid_jobs
-                                              if any(k in ph.inner_html().lower() for k in
-                                                     ('video', 'audio', 'fastforward', 'insertvideo')))
+                                # 媒体类型在扫描时就算好了（第 2 个元素），不再重复读 HTML
+                                v_count = sum(1 for _, is_video in valid_jobs if is_video)
                                 d_count = len(valid_jobs) - v_count
                                 self.video_count = v_count
                                 self.doc_count = d_count
-                                hub.emit_log(f'      [系统] 检测到 {len(valid_jobs)} 个任务点，开始监控...')
+                                hub.emit_log(f'      [系统] 检测到 {len(valid_jobs)} 个任务点'
+                                             f'（视频 {v_count} / 文档 {d_count}），开始监控...')
 
-                                for task_idx, target_container in enumerate(valid_jobs):
+                                for task_idx, (target_container, looks_video) in enumerate(valid_jobs):
                                     if self.check_pause_and_stop():
                                         break
                                     hub.emit_log(
@@ -628,6 +631,8 @@ class SolverEngine:
                                     has_doc = False
                                     for _ in range(25):
                                         u = (task_frame.url or '').lower()
+                                        # 先按**真实元素**判定，这是最可靠的信号；
+                                        # URL 关键字只作补充。
                                         has_video = (task_frame.locator('video, audio').count() > 0
                                                      or any(k in u for k in ('/video/', '/audio/')))
                                         has_doc = (task_frame.locator('#panView, #container, #scrollBox').count() > 0
@@ -635,6 +640,20 @@ class SolverEngine:
                                         if has_video or has_doc:
                                             break
                                         time.sleep(0.2)
+
+                                    # ⚠️ 容器 HTML 的**关键词分类**（`looks_video`）只用来兜底：
+                                    # 容器里有 "video/doc" 字样、但穿透后的 frame 里既没有
+                                    # video 元素也没有已知文档容器时，按容器分类去试对应流程，
+                                    # 而不是直接"标记已读" —— 后者会让任务点**永远刷不过去**
+                                    # 却看起来成功（见 ERROR.md E70）。
+                                    if not has_video and not has_doc:
+                                        # 两者都判不出来：按容器关键词分类兜底
+                                        if looks_video:
+                                            LOGGER.info('[识别] 容器关键词判定为视频，按视频流程处理')
+                                            has_video = True
+                                        else:
+                                            LOGGER.info('[识别] 容器关键词判定为文档，按文档流程处理')
+                                            has_doc = True
 
                                     try:
                                         if has_video:
@@ -873,11 +892,18 @@ class SolverEngine:
             return it
 
         self.quiz_text = f'求解 0/{len(items)}'
-        core.run_parallel(items, _work, workers=acfg['workers'],
-                          on_progress=lambda n: setattr(self, 'quiz_text', f'求解 {n}/{len(items)}'))
+        outcome = core.run_parallel(items, _work, workers=acfg['workers'],
+                                    on_progress=lambda n: setattr(
+                                        self, 'quiz_text', f'求解 {n}/{len(items)}'))
         if core.SHUTDOWN.is_set():
             hub.emit_log('      [退出] 已放弃剩余在途求解请求。')
             return None
+        if outcome is False:
+            # `run_parallel` 用 False 表示"等超时了、主动放弃在途请求"。
+            # 必须说出来：否则用户只会看到每题都"未取得有效答案"，
+            # 完全联想不到是求解整体超时（2026-09-19 修，E73）。
+            hub.emit_log('      [警告] 求解等待超时，本次只使用已完成的结果；'
+                         '若频繁出现请调大「单题超时」或减少「并发线程」。')
 
         # ---- 阶段 3（本线程）：填涂 ----
         nc = 0
@@ -1000,33 +1026,58 @@ class SolverEngine:
         return None
 
     # ---------------- 视频 / 文档任务 ----------------
+    # 穿透 iframe 时最多下钻几层（真实课程页一般是 1~2 层，留 4 层余量）
+    MAX_FRAME_DEPTH = 4
+
     def traverse_to_leaf_frame(self, container_locator):
-        """穿透 iframe，找到承载 video/文档的最内层 frame。"""
-        iframe_loc = container_locator.locator('iframe').first
-        if iframe_loc.count() == 0:
-            return None
+        """穿透 iframe，找到承载 video/文档的最内层 frame。
+
+        ⚠️ 原来是"只下钻一层"（先探测当前 frame，若没命中就取第一个嵌套 iframe 并
+        **立刻 return**），于是"容器 → 播放器外壳 → <video>"这种两层结构拿到的是外壳
+        frame，`run_video_task` 在里面找不到 `video`，任务点永远不完成（见 ERROR.md E70）。
+        现在按层循环下钻，每层都重新探测，命中或没有更深层就返回。
+        """
         try:
-            handle = iframe_loc.element_handle()
-            current_frame = handle.content_frame() if handle else None
-            if not current_frame:
+            iframe_loc = container_locator.locator('iframe').first
+            if iframe_loc.count() == 0:
                 return None
-            for _ in range(25):
-                if current_frame.url and current_frame.url != 'about:blank':
-                    break
-                time.sleep(0.2)
-            url_lower = (current_frame.url or '').lower()
-            has_media = current_frame.locator('video, audio').count() > 0
-            has_doc = current_frame.locator('#panView, #container, #scrollBox').count() > 0
-            is_task_url = any(kw in url_lower for kw in ('/video/', '/audio/'))
-            if has_media or has_doc or is_task_url:
-                return current_frame
-            nested_iframe_loc = current_frame.locator('iframe').first
-            if nested_iframe_loc.count() > 0:
-                handle = nested_iframe_loc.element_handle()
-                nested_frame = handle.content_frame() if handle else None
-                if nested_frame:
-                    current_frame = nested_frame
-            return current_frame
+            handle = iframe_loc.element_handle()
+            current = handle.content_frame() if handle else None
+            if not current:
+                return None
+
+            for _depth in range(self.MAX_FRAME_DEPTH):
+                # 等这一层真正加载出 url（about:blank 说明还没就绪）
+                for _ in range(25):
+                    try:
+                        if current.url and current.url != 'about:blank':
+                            break
+                    except Exception:
+                        break
+                    time.sleep(0.2)
+                try:
+                    url_lower = (current.url or '').lower()
+                    has_media = current.locator('video, audio').count() > 0
+                    has_doc = current.locator('#panView, #container, #scrollBox').count() > 0
+                    is_task_url = any(kw in url_lower
+                                      for kw in ('/video/', '/audio/', '/pdf/', '/ppt/', '/doc/'))
+                except Exception:
+                    has_media = has_doc = is_task_url = False
+                if has_media or has_doc or is_task_url:
+                    return current
+                # 没命中：有更深一层就继续下钻，否则就拿这一层（调用方还有关键词兜底）
+                nested = current.locator('iframe').first
+                try:
+                    if nested.count() == 0:
+                        return current
+                    nh = nested.element_handle()
+                    nf = nh.content_frame() if nh else None
+                except Exception:
+                    nf = None
+                if not nf:
+                    return current
+                current = nf
+            return current
         except Exception:
             return None
 

@@ -213,7 +213,9 @@ window.autoScrollDocument = function() {
         let maxScroll = document.documentElement.scrollHeight || document.body.scrollHeight || 0;
         let clientH = window.innerHeight || document.documentElement.clientHeight || 0;
         if (maxScroll > clientH) {
-            window.scrollBy(0, 400);
+            // 用 `scrollTo` 而不是 `scrollBy`：与上面两个分支一致，
+            // 且上面读出来的 `current` 不再是死变量（死代码审查，E74）。
+            window.scrollTo(0, current + 400);
             let nextCurrent = window.pageYOffset || document.documentElement.scrollTop || document.body.scrollTop || 0;
             let reached = (nextCurrent + clientH) >= (maxScroll - 30);
             // ⚠️ 这里原来**无条件** `ended: true`（上一行算出来的 `reached` 被丢掉），
@@ -226,7 +228,12 @@ window.autoScrollDocument = function() {
         // 文档本身不可滚动（内容比视口还短）：确实"没什么可读的"，算完成是对的。
         return { ended: true, percent: "100.0" };
     } catch(e) {
-        return { ended: true, percent: "100.0", error: e.toString() };
+        // ⚠️ 失败**绝不能**报"已读完"（2026-09-19 修，E73）：原来返回
+        // `{ended: true, percent: "100.0", error: ...}`，即把"跨域 iframe / 帧已失效 /
+        // 滚动异常"谎报成"文档读完 100%" —— 只要调用方漏看 `error` 字段，
+        // 文档任务就会被跳过，而且进度条还会显示 100%。
+        // 现在明确回报"没读完、进度未知"，把判断权交给调用方。
+        return { ended: false, percent: "0.0", error: e.toString() };
     }
 }
 '''
@@ -239,7 +246,11 @@ FILL_TEXT_SCRIPT = '''
     if (!answers || answers.length === 0) return filled_count;
     let blankContainers = Array.from(element.querySelectorAll('.blankItemDiv'));
     if (blankContainers.length === 0) {
-        let allInputs = Array.from(element.querySelectorAll('textarea[id^="answer"], textarea, input[type="text"], input.blank_input, div[contenteditable="true"]'));
+        // ⚠️ 这里必须与 `detect_question_type_and_inputs` 统计"空的数量"的口径一致，
+        // 否则会出现"答案数 > 容器数"而**静默丢掉后面的答案**（2026-09-19 修，E73）：
+        // 它把 `iframe[id^="ueditor_"]` 也算一个空，这里原来漏了 UEditor 编辑器。
+        let allInputs = Array.from(element.querySelectorAll(
+            'iframe[id^="ueditor_"], textarea[id^="answer"], textarea, input[type="text"], input.blank_input, div[contenteditable="true"]'));
         blankContainers = allInputs.length > 0 ? allInputs : [element];
     }
     function fillSingle(container, text) {
@@ -271,8 +282,13 @@ FILL_TEXT_SCRIPT = '''
                 success = true;
             } catch(e) {}
         }
-        let iframes = Array.from(container.querySelectorAll ? container.querySelectorAll('iframe[id^="ueditor_"], iframe') : []);
-        if (container.tagName === 'IFRAME') iframes.push(container);
+        // ⚠️ 只写**编辑器** iframe（2026-09-19 修，E73）：原来选的是
+        // `iframe[id^="ueditor_"], iframe` —— 后半段会命中同一张题卡里的
+        // 媒体/PDF 预览帧，而下面是 `doc.body.innerHTML = ...`，
+        // **等于把播放器/预览的整个 body 换掉**。现在只认 UEditor（或确实处于
+        // 可编辑状态的）iframe。
+        let iframes = Array.from(container.querySelectorAll ? container.querySelectorAll('iframe[id^="ueditor_"]') : []);
+        if (container.tagName === 'IFRAME' && container.id && container.id.indexOf('ueditor_') === 0) iframes.push(container);
         for (let ifr of iframes) {
             try {
                 let doc = ifr.contentDocument || (ifr.contentWindow ? ifr.contentWindow.document : null);
@@ -284,8 +300,14 @@ FILL_TEXT_SCRIPT = '''
                 }
             } catch(e) {}
         }
-        let inputs = Array.from(container.querySelectorAll ? container.querySelectorAll('input[type="text"], input.blank_input, input:not([type="hidden"]):not([type="radio"]):not([type="checkbox"])') : []);
-        if (container.tagName === 'INPUT' && container.type !== 'hidden' && container.type !== 'radio' && container.type !== 'checkbox') inputs.push(container);
+        // ⚠️ 只写"真正的答题输入框"（2026-09-19 修，E73）：
+        // 原来的 `input:not([type=hidden]):not([type=radio]):not([type=checkbox])`
+        // 会把 submit/button/file/search 也算进来 —— 答案文本被写进按钮标题，
+        // 而且照样算"填成功"。另外原来无差别匹配**所有** iframe，会把同卡片里
+        // 媒体/PDF 预览帧的 body 整个替换掉（那个帧是播放器本体）。
+        let inputs = Array.from(container.querySelectorAll ? container.querySelectorAll(
+            'input[type="text"], input.blank_input, input:not([type]), input[type=""]') : []);
+        if (container.tagName === 'INPUT' && (container.type === 'text' || container.type === '' || container.type === undefined)) inputs.push(container);
         for (let ipt of inputs) {
             try { ipt.focus(); ipt.value = cleanText; ipt.dispatchEvent(new Event('input', { bubbles: true })); ipt.dispatchEvent(new Event('change', { bubbles: true })); ipt.dispatchEvent(new Event('blur', { bubbles: true })); success = true; } catch(e) {}
         }
@@ -296,10 +318,12 @@ FILL_TEXT_SCRIPT = '''
         }
         return success;
     }
-    for (let i = 0; i < answers.length; i++) {
-        if (i < blankContainers.length && fillSingle(blankContainers[i], answers[i])) filled_count++;
+    // 只按"容器数"逐空填写；**不再有"整体兜底写入 element"那一步** ——
+    // 它会把 answers[0] 写进整个题目元素里第一个匹配到的输入框（含提交按钮），
+    // 既写错位置又虚报成功（E73）。
+    for (let i = 0; i < blankContainers.length && i < answers.length; i++) {
+        if (fillSingle(blankContainers[i], answers[i])) filled_count++;
     }
-    if (filled_count === 0 && answers.length > 0 && fillSingle(element, answers[0])) filled_count++;
     return filled_count;
 }
 
@@ -353,6 +377,9 @@ def keep_computer_awake(release=False):
 
     用法：**开始刷课时调一次**（`release=False`），结束时调 `release=True` 撤销。
     用 `ES_CONTINUOUS` 表示"这个状态一直有效，直到下次调用改掉"，所以不必轮询。
+
+    返回是否调用成功 —— 原来成功/失败都 `return None`，调用方无从判断
+    （死代码审查发现两条路径不可区分，E74）。
     """
     try:
         import ctypes
@@ -360,9 +387,9 @@ def keep_computer_awake(release=False):
         ES_SYSTEM_REQUIRED = 0x00000001
         flags = ES_CONTINUOUS | (0 if release else ES_SYSTEM_REQUIRED)
         ctypes.windll.kernel32.SetThreadExecutionState(flags)
+        return True
     except Exception:
-        return None
-    return None
+        return False
 
 
 def clean_text_for_gui(text):
@@ -605,6 +632,9 @@ def run_diagnose_cli():
     """命令行诊断：连接本机 CDP，dump 所有已打开页面的识别信息。
 
     用法：``python -m learn_helper --diagnose``
+
+    返回进程退出码（0 = 诊断成功）。原来恒返回 `None` ⇒ `main()` 直接 `return 0`，
+    "诊断失败"与"诊断成功"在退出码上完全一样，脚本/CI 没法用它做判据（E74）。
     """
     def log(msg):
         print(msg)
@@ -615,23 +645,31 @@ def run_diagnose_cli():
     ok, _ = kill_and_launch_browser()
     if not ok:
         log('[诊断] 无法连接/拉起浏览器（9222 不可用）。')
-        return
+        return 1
     sync_playwright = require_playwright()
     try:
         with sync_playwright() as p:
             browser = p.chromium.connect_over_cdp(CDP_URL)
-            ctx = browser.contexts[0]
+            # ⚠️ 与 `list_page_titles` 一样要判空：`contexts[0]` 直接下标会在
+            # "浏览器起来了但没有任何上下文"时抛 IndexError，被下面 except 吞成
+            # 一句 "异常: list index out of range" —— 看起来像诊断器坏了（E74）。
+            ctx = browser.contexts[0] if browser.contexts else None
+            if ctx is None:
+                log('[诊断] 浏览器已连接但没有可用的上下文（contexts 为空）。')
+                browser.close()
+                return 1
             if not ctx.pages:
                 log('[诊断] 浏览器无已打开页面。')
                 browser.close()
-                return
+                return 1
             for i, pg in enumerate(ctx.pages):
                 log(f'========== 页面 {i + 1} / {len(ctx.pages)} ==========')
                 diagnose_page(pg, log)
             browser.close()
     except Exception as e:
         log(f'[诊断] 异常: {e}')
-    return None
+        return 1
+    return 0
 
 
 # ----------------------------------------------------------------------------
@@ -639,7 +677,7 @@ def run_diagnose_cli():
 # ----------------------------------------------------------------------------
 def find_button_in_frames(page, text_list):
     """在主框架+所有 iframe 中按文本找可见可用按钮，返回 (元素, frame)。"""
-    frames_to_scan = [page.main_frame] + page.frames
+    frames_to_scan = _frames_of(page)
     for frame in frames_to_scan:
         try:
             for text in text_list:
@@ -681,7 +719,7 @@ def find_next_button(page):
         '.next-chapter', "[title='下一节']", ".jb_btn:has-text('下一节')", "span:has-text('下一节')",
         '.next', "[class*='next']", '.btn-next', '#nextChapter', '.prev_next .next',
     ]
-    frames_to_scan = [page.main_frame] + page.frames
+    frames_to_scan = _frames_of(page)
     for frame in frames_to_scan:
         try:
             for sel in fallback_selectors:
@@ -723,7 +761,7 @@ def find_confirmation_bypass_button(page):
         ".popDiv a:has-text('下一节')", ".popDiv a:has-text('确定')", ".popDiv button:has-text('确定')",
         'a.nextChapter', "[class*='pop'] a:has-text('确定')", "[class*='pop'] button:has-text('确定')",
     ]
-    frames_to_scan = [page.main_frame] + page.frames
+    frames_to_scan = _frames_of(page)
     for frame in frames_to_scan:
         try:
             body_text = frame.evaluate("document.body ? document.body.innerText : ''")
@@ -761,7 +799,7 @@ def robust_wait_for_tasks_to_render(page, check_func, timeout=8000):
         if check_func():
             return False
         try:
-            frames = [page.main_frame] + page.frames
+            frames = _frames_of(page)
             for f in frames:
                 if f.locator('video').count() > 0:
                     time.sleep(0.5)
@@ -874,6 +912,12 @@ def parse_llm_answer(content, q_type):
             ta = [str(x) for x in ta if x is not None]
             if qt in ('blank', 'essay'):
                 return {'question_type': qt, 'answer_key': '', 'text_answers': ta}
+            # ⚠️ 选择题但只给了 text_answers（模型把选项字母放进 text_answers 是常见偏差）
+            # 时必须**保留**它 —— 原来这里直接 `text_answers: []` 把非空内容丢掉，
+            # 上游于是判"没取得有效答案"、整题静默跳过；而同样一份数据走
+            # `/solve`（`_normalize_answer`）却能救回来。两条通道行为必须一致（E73）。
+            if not at and ta:
+                return {'question_type': qt, 'answer_key': '', 'text_answers': ta}
             return {'question_type': 'multi_choice' if len(at) > 1 else 'choice',
                     'answer_key': at, 'text_answers': []}
     # ⚠️ 兜底**只从"像答案的片段"里取字母**：原来是把整段文本里所有 A-F 都抓出来
@@ -888,8 +932,6 @@ def parse_llm_answer(content, q_type):
         mm = re.search(pat, content, re.I | re.M)
         if mm:
             keys = normalize_choice_keys(mm.group(1))
-            # 抽出 "AC" 这种多选形式时，里面的分隔符已经被清掉
-            keys = re.sub(r'[^A-F]', '', keys)
             if keys:
                 return {'question_type': 'multi_choice' if len(keys) > 1 else 'choice',
                         'answer_key': keys, 'text_answers': []}
@@ -1143,7 +1185,19 @@ def run_solve_self_test(mode='server', timeout=None, retry=1, base=None, llm_cfg
     """用内置测试图跑一遍指定通道（server=内部答题 API / llm=自配大模型），逐题给出结论。
 
     返回 (ok_all, lines, results)；纯网络调用，调用方应放到后台线程执行。
+
+    ⚠️ `mode` 是**答题方式**（`server | llm | off`）。原来写成"不是 server 就走大模型"，
+    于是 `mode='off'`（仅识别不答题）会拿空 API Key 去请求大模型，每题都失败，
+    最后汇总成"3 题全部请求失败（接口或地址不可用）" —— 把用户引去查后端地址，
+    而真正原因是他自己选了"不答题"（2026-09-19 修，E73）。
     """
+    if mode not in ('server', 'llm'):
+        label = ANSWER_MODE_LABELS.get(mode, mode)
+        msg = (f'当前答题方式为「{label}」，不发起求解请求；'
+               f'自检请在「答题设置」里切换到「内部答题 API」或「自配大模型」后再试。')
+        return (False, [f'✗ {msg}'],
+                [{'name': 'self-test', 'ok': False, 'verdict': 'mode_not_solvable',
+                  'got': '', 'ms': 0, 'detail': msg}])
     acfg = get_answer_cfg()
     limit = acfg['solver_timeout'] if timeout is None else int(timeout)
     limit = max(10, min(limit, 120))          # 自检不必等满 240s
@@ -1251,21 +1305,31 @@ def run_parallel(items, worker, workers=4, on_progress=None):
     # ⚠️ 等待必须有**上限**：worker 里是网络调用，`requests` 的 timeout 覆盖不了
     # "DNS 卡住 / 代理黑洞"这类情况，而主流程是在自动化线程里等这个函数的 ⇒
     # 没有上限就等于"刷课永久卡在求解阶段"，用户只能点停止。
-    # 上限取"单题超时 + 60s 余量"：正常情况（含重试）一定在这个范围内结束，
-    # 真到了说明有请求僵死，放弃它们（daemon 线程随进程结束）比卡死好。
+    #
+    # ⚠️ 但上限**必须算够**（2026-09-19 修，E73）：一个题目要重试 `retry` 次，
+    # 所以单题最长 ≈ `solver_timeout × (retry + 1)`；又因为 `workers` 个一批，
+    # 总时长还要乘批数。原来写死 `solver_timeout + 60`，用默认值就是
+    # 240 + 60 = 300s，而单题最长可达 240×3 = 720s ⇒ **正常的慢后端会被提前放弃**，
+    # 用户看到的是每个题都"未取得有效答案"，完全看不出是被自己掐断的。
     try:
-        per_item = float(get_answer_cfg().get('solver_timeout') or 240)
+        _acfg = get_answer_cfg()
+        per_item = float(_acfg.get('solver_timeout') or 240)
+        tries = int(_acfg.get('retry') or 0) + 1
+        batch = max(1, (len(items) + max(1, workers) - 1) // max(1, workers))
     except Exception:
-        per_item = 240.0
-    deadline = time.time() + per_item + 60.0
+        per_item, tries, batch = 240.0, 1, 1
+    budget = per_item * tries * batch + 60.0
+    deadline = time.time() + budget
     for t in threads:
         while t.is_alive():
             t.join(0.2)
             if SHUTDOWN.is_set():
                 return None      # 放弃在途请求：daemon 线程随进程结束
             if time.time() > deadline:
-                LOGGER.warning('[求解] 等待并发求解超时，放弃剩余在途请求')
-                return None
+                # 返回 False = "因超时放弃"，与正常结束（None）区分开，
+                # 免得被上层当成"每题都答不出来"。
+                LOGGER.error(f'[求解] 等待并发求解超时（预算 {budget:.0f}s），放弃剩余在途请求')
+                return False
     return None
 
 
@@ -1315,9 +1379,17 @@ def scan_page_recursively(page):
         '.question-item', '.test-item', '.Tm_cont', '.problem', '.exercise',
         '.ti-q-c', '.que', '.multiquesid',
     ]
-    xpath_selector = ("//input[(@type='radio' or @type='checkbox')]/ancestor::div[contains(@class, 'que') "
-                      "or contains(@class, 'item') or contains(@class, 'box') or string-length(@class)>2]")
-    frames_to_scan = [page.main_frame] + page.frames
+    # ⚠️ 兜底 XPath 必须取**最近的**那个祖先 div（2026-09-19 修，E73）。
+    # 原判据里带了 `or string-length(@class)>2`，而"class 长度 > 2"对页面上
+    # 几乎所有 div 都成立 ⇒ 它会把**每一个**祖先 div（题目容器、整卡、页面外壳）
+    # 都当成一道题，而后面只用 `box.height > 50` 过滤，这些全都过得去。
+    # 结果是：把整块区域当成一题去截图/求解（多题挤在一张图里 ⇒ 答案必错），
+    # 填涂时 `alphabet.index(letter) → inputs[idx]` 也会点错选项。
+    # `ancestor::` 是**反向轴**，所以 `[last()]` 取到的是**离 input 最近**的祖先。
+    xpath_selector = ("//input[(@type='radio' or @type='checkbox')]"
+                      "/ancestor::div[contains(@class,'que') or contains(@class,'item') "
+                      "or contains(@class,'box')][last()]")
+    frames_to_scan = _frames_of(page)
     for frame in frames_to_scan:
         try:
             for sel in class_selectors:
@@ -1426,6 +1498,14 @@ def normalize_choice_keys(answer_key):
     return ''.join(out)
 
 
+def _safe_is_checked(locator):
+    """安全读 `is_checked()`：句柄失效时返回 False 而不是抛异常（回读校验用）。"""
+    try:
+        return bool(locator.is_checked())
+    except Exception:
+        return False
+
+
 def fill_and_click_smart(question_locator, response_data):
     """按答题结果填涂题目。response_data 形如
        {'question_type':..., 'answer_key':'AC', 'text_answers':[...]}。"""
@@ -1473,20 +1553,19 @@ def fill_and_click_smart(question_locator, response_data):
                     "li.before-after, li[role='radio'], li[role='checkbox']").all()
 
             if len(spans) > 0:
-                all_correct = True
-                for idx, el in enumerate(spans):
-                    try:
-                        letter = parse_option_letter(el, idx)
-                        classes = el.get_attribute('class') or ''
-                        is_selected = ('check_answer' in classes) or ('check_answer_dx' in classes)
-                        should_select = letter in target_set
-                        if is_selected != should_select:
-                            all_correct = False
-                            break
-                    except Exception:
-                        all_correct = False
-                        break
-                if all_correct:
+                def _selected_letters_span():
+                    """回读"当前真正处于选中态"的选项字母集合（读 DOM，不靠点击是否抛异常）。"""
+                    got = set()
+                    for _idx, _el in enumerate(spans):
+                        try:
+                            _cls = _el.get_attribute('class') or ''
+                        except Exception:
+                            continue
+                        if 'check_answer' in _cls or 'check_answer_dx' in _cls:
+                            got.add(parse_option_letter(_el, _idx))
+                    return got
+
+                if _selected_letters_span() == target_set:
                     return True
                 for idx, el in enumerate(spans):
                     try:
@@ -1506,7 +1585,19 @@ def fill_and_click_smart(question_locator, response_data):
                             time.sleep(0.12)
                     except Exception as e:
                         LOGGER.info(f'[填涂] 选项 {idx + 1} 异常: {e}')
-                return True
+                # ⚠️ **必须回读验证**（2026-09-19 修，见 ERROR.md E73）：
+                # 原来这里无条件 `return True`。所有点击各自被 try/except 吞掉，
+                # 而 `spans` 是循环前 `.all()` 取的一次性句柄 —— 平台在第一次点击后
+                # 重渲染选项列表时，剩下的句柄**全部失效**、每次点击都抛异常被吞，
+                # 但函数照样返回 True ⇒ 引擎 `nc` 增加 ⇒ 看起来"成功填涂 N/N"，
+                # 最后**自动提交一份空白/错答案卷**。
+                # 现在以"回读到的选中集合 == 目标集合"为准。
+                got = _selected_letters_span()
+                if got == target_set:
+                    return True
+                LOGGER.warning(f'[填涂] 回读校验未通过：目标 {sorted(target_set)} '
+                               f'实际 {sorted(got)}（选项句柄可能已失效）')
+                return False
             else:
                 inputs = question_locator.locator("input[type='radio'], input[type='checkbox']").all()
                 if inputs:
@@ -1521,14 +1612,30 @@ def fill_and_click_smart(question_locator, response_data):
                                         target_ipt.scroll_into_view_if_needed()
                                         target_ipt.click(force=True)
                                         time.sleep(0.12)
-                                except Exception:
-                                    pass
-                    return True
+                                except Exception as e:
+                                    LOGGER.info(f'[填涂] 选项 {char} 点击异常: {e}')
+                    # 同样回读验证：以 DOM 的真实勾选状态为准
+                    got = {alphabet[i] for i, ipt in enumerate(inputs)
+                           if i < len(alphabet) and _safe_is_checked(ipt)}
+                    if got == target_set:
+                        return True
+                    LOGGER.warning(f'[填涂] 回读校验未通过：目标 {sorted(target_set)} '
+                                   f'实际 {sorted(got)}（input 勾选状态不符）')
+                    return False
                 return False
         if q_type in ('blank', 'essay') and text_answers:
             try:
+                # FILL_TEXT_SCRIPT 现在返回**已填数量**（旧的 `> 0` 会把"3 个空只填上 1 个"
+                # 当成成功，见 ERROR.md E73）；要求把请求的每个空都填上。
                 filled_ok = question_locator.evaluate(FILL_TEXT_SCRIPT, text_answers)
-                return filled_ok > 0
+                try:
+                    filled_n = int(filled_ok)
+                except (TypeError, ValueError):
+                    filled_n = 0
+                if filled_n >= len(text_answers):
+                    return True
+                LOGGER.warning(f'[填涂] 填空未全填：请求 {len(text_answers)} 个、实际填了 {filled_n} 个')
+                return False
             except Exception as e:
                 LOGGER.info(f'[填涂] {q_type} JS 写入异常: {e}')
                 return False
@@ -1538,9 +1645,29 @@ def fill_and_click_smart(question_locator, response_data):
         return False
 
 
+def _frames_of(page):
+    """页面里所有要扫描的 frame —— **主框架只出现一次**。
+
+    ⚠️ 别写 `[page.main_frame] + page.frames`：`page.frames` **本来就已经包含主框架**
+    （`core.collect_job_containers` 里早就为此写了去重），于是每个选择器都要在同一个
+    框架上多跑一遍 CDP 往返，`diagnose_page` 还会把主框架打印两次（看起来像"两个 frame"）。
+    """
+    frames = []
+    try:
+        frames.append(page.main_frame)
+    except Exception:
+        pass
+    try:
+        for fr in page.frames:
+            if fr not in frames:
+                frames.append(fr)
+    except Exception:
+        pass
+    return frames
+
+
 def _find_by_selectors(page, selectors):
-    frames_to_scan = [page.main_frame] + page.frames
-    for frame in frames_to_scan:
+    for frame in _frames_of(page):
         try:
             for sel in selectors:
                 loc = frame.locator(sel)
@@ -1577,24 +1704,66 @@ def find_save_button(page):
     return _find_by_selectors(page, fallback)
 
 
-def check_quiz_completed(questions, target_frame):
-    """判断测试页是否已被平台标记完成/已作答。"""
+def quiz_completed_signals(target_frame):
+    """判断"这个测验任务点是否已经被平台判定完成"，返回 `(done, 依据)`。
+
+    ⚠️ 判据必须**保守**：误判成"已完成"会让引擎**整节跳过答题**（还写一句
+    "平台已标记完成"，用户完全看不出来），比"多答一遍"严重得多。
+
+    原来这里有三处过宽/过弱的判据（2026-09-19 修，见 ERROR.md E70/E73）：
+    1. `.answer-right` / `[class*="score"]` —— `[class*="score"]` 是**子串**匹配，
+       只要页面上存在任何类名含 "score" 的元素（答题页的容器/提示/图标很常见）
+       就算"已完成"；
+    2. `innerText` 里出现 `已完成` —— 任何地方的一句提示都可能命中；
+    3. `input 全部 disabled` —— 没答题时输入框本来就可能是 disabled
+       （⚠️ 这条**连定义带判定一起删掉了**：它与本函数"宁可多答一遍"的保守原则
+        直接冲突，见 E73）。
+
+    现在的判据（任一条成立才算完成）：
+    - 出现**判分标记**：`.answer-right` / `.answer-wrong` / `.dui` / `.cuo`
+      （"对/错"角标是作答后的产物，`.score` 之类容器不算）；
+    - 题干区出现**答案/成绩**类文案（`得分：`/`正确答案`/`查看作答`/`已批阅`…）。
+    """
+    if target_frame is None:
+        return (False, 'no-frame')
     try:
-        if target_frame:
-            done = target_frame.evaluate(
-                '() => { let b = document.body ? document.body.innerText : ""; '
-                'let t = /得分：|成绩：|已提交|已完成|我的答案|正确答案|查看作答|已批阅|本题得\\s*\\d+/.test(b); '
-                'let i = document.querySelectorAll(\'input[type="radio"], input[type="checkbox"], textarea\'); '
-                'let d = i.length > 0 && Array.from(i).every(e => e.disabled); '
-                'let m = document.querySelectorAll(\'.answer-right, .score, .scoreNum, .dui, .cuo, [class*="score"]\').length > 0; '
-                'return t || d || m; }')
-            if done:
-                return True
-            fe = target_frame.frame_element()
-            if fe:
-                return fe.evaluate(
-                    '(iframe) => { let p = iframe.closest(\'div.ans-attach-ct\') || iframe.closest(\'.ans-attach-online\'); '
-                    'return p ? (p.classList.contains("ans-job-finished") || /ans-job-finished|icon_Completed|jobFinish|job-finished/.test(p.className || \'\')) : false; }')
+        done = target_frame.evaluate(
+            '() => {'
+            '  let b = document.body ? document.body.innerText : "";'
+            "  let t = /得分：|成绩：|已提交|我的答案|正确答案|查看作答|已批阅|本题得\\s*\\d/.test(b);"
+            '  let m = document.querySelectorAll(\'.answer-right, .answer-wrong, .dui, .cuo\').length > 0;'
+            '  return { text: t, marked: m };'
+            '}')
+        if isinstance(done, dict):
+            if done.get('marked'):
+                return (True, 'judge-mark')
+            if done.get('text'):
+                return (True, 'answer-text')
     except Exception as e:
         LOGGER.info(f'[答题] 完成态检查异常: {e}')
+    return (False, '')
+
+
+def check_quiz_completed(questions, target_frame):
+    """判断测试页是否已被平台标记完成/已作答（见 `quiz_completed_signals` 的判据说明）。"""
+    done, _why = quiz_completed_signals(target_frame)
+    if done:
+        return True
+    # 平台在"任务点容器"上打的完成标记同样算完成（有的页面前者不改、只改这里）
+    #
+    # ⚠️ 必须跳过主框架（2026-09-19 修，E73）：`Frame.frame_element()` 在
+    # `frame.parent_frame() is None`（= 主框架）时**必然抛** "Frame has been detached"，
+    # 而 `scan_page_recursively` 优先返回的就是 `page.main_frame` ⇒ 这段"容器完成态"
+    # 判定在**绝大多数测验页上从来没生效过**，异常还被下面 `except` 吞成一行 INFO。
+    try:
+        if target_frame is not None and target_frame.parent_frame is not None:
+            fe = target_frame.frame_element()
+            if fe:
+                return bool(fe.evaluate(
+                    '(iframe) => { let p = iframe.closest(\'div.ans-attach-ct\') '
+                    '|| iframe.closest(\'.ans-attach-online\'); '
+                    'return p ? (p.classList.contains("ans-job-finished") || '
+                    '/ans-job-finished|icon_Completed|jobFinish|job-finished/.test(p.className || \'\')) : false; }'))
+    except Exception as e:
+        LOGGER.info(f'[答题] 容器完成态检查异常: {e}')
     return False

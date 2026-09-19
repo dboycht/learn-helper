@@ -188,6 +188,10 @@ if ($running.Count -gt 0) {
 function Start-Case([string]$dir, [string]$logs, [string]$exePath = $Exe, [string]$hoverPin = '', [string]$noBackend = '') {
     if (-not (Wait-NoInstance)) { Write-Host "  WARNING: previous instance still running" }
     $env:LH_BASE_DIR = $dir
+    # Guard: this probe does not test the auto-launch-browser feature, and the app arms that
+    # feature 4 seconds after start. Several probes run longer than that, so without this the
+    # app could really open the user's sandbox browser in the middle of a test (found by audit).
+    $env:LH_NO_AUTO_BROWSER = '1'
     $env:LH_PROBE_LOGS = $logs
     Remove-Item Env:LH_UI_ACTION -ErrorAction SilentlyContinue
     # NOTE: these must be in the environment BEFORE Start-Process: a child inherits the environment
@@ -485,7 +489,12 @@ Check "wheel in the bar area does not scroll (first stays 0)" ((Field $log3b 'fi
 # legitimately turns following ON -- asserting follow=1 before the wheel was simply wrong on my
 # side (and a wheel-up correctly turns it off). What matters is that the viewport never moved and
 # a following viewport really is pinned to the newest line.
-Check "the viewport is pinned to the newest line" ((Field $log3b 'first') -eq ((Field $log3b 'total') - (Field $log3b 'visible'))) ("first=" + (Field $log3b 'first') + " total=" + (Field $log3b 'total'))
+# Expected "first" is max(0, total - visible): when fewer lines than fit exist there is nothing
+# to scroll and `first` is 0, whereas `total - visible` goes NEGATIVE. The probe compared against
+# the raw difference, so it failed whenever the injected log lines had not all arrived yet (a race
+# on `total`) -- exactly the "flaky probe" class this project hates.
+$expFirst3 = [Math]::Max(0, ((Field $log3b 'total') - (Field $log3b 'visible')))
+Check "the viewport is pinned to the newest line" ((Field $log3b 'first') -eq $expFirst3) ("first=" + (Field $log3b 'first') + " total=" + (Field $log3b 'total') + " visible=" + (Field $log3b 'visible') + " expected=" + $expFirst3)
 Remove-Item Env:LH_PROBE_HOVER_BAR -ErrorAction SilentlyContinue
 
 $log3c = Stop-Case $case3 $snap3

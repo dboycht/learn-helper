@@ -431,8 +431,8 @@ def main(argv=None):
         return 0
     if args.diagnose:
         from . import core
-        core.run_diagnose_cli()
-        return 0
+        # 把诊断的真实结果作为退出码传出去（原来恒返回 0，脚本没法判成败）
+        return core.run_diagnose_cli() or 0
 
     backend = Backend(port=args.port, force=args.force)
     if backend.start() is None:

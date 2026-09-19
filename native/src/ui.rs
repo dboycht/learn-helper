@@ -217,7 +217,7 @@ pub struct App {
 
     // ---- 自实现的窗口拖拽 / 缩放（无系统标题栏）----
     grab: Grab,
-    grab_origin: POINT,      // 按下时的**屏幕**坐标
+    grab_client: POINT,      // 按下时的**客户区**坐标 —— 位移计算必须用它（见 E75）
     grab_window: RECT,       // 按下时的窗口矩形
     last_click_ms: u64,      // 双击最大化用
     last_click_pt: POINT,
@@ -265,7 +265,7 @@ impl App {
             painted_rev: 0,
             paint_count: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             grab: Grab::None,
-            grab_origin: POINT { x: 0, y: 0 },
+            grab_client: POINT { x: 0, y: 0 },
             grab_window: RECT::default(),
             last_click_ms: 0,
             last_click_pt: POINT { x: 0, y: 0 },
@@ -1574,13 +1574,31 @@ impl App {
         }
         // 正在拖拽/缩放：直接按位移算新矩形
         if self.grab != Grab::None {
-            let mut pt = POINT { x, y };
-            unsafe {
-                crate::native::ClientToScreen(self.hwnd, &mut pt);
-            }
-            let dx = pt.x - self.grab_origin.x;
-            let dy = pt.y - self.grab_origin.y;
+            // ⚠️ **位移必须用客户区坐标算**（2026-09-19 修，见 ERROR.md E75）。
+            // 原实现把"当前客户区点"先 `ClientToScreen` 再减去按下时的**屏幕**点：
+            //
+            //     pt = ClientToScreen(hwnd, {x,y});          // 随窗口一起移动
+            //     dx = pt.x - grab_origin.x;                 // grab_origin 是按下时的屏幕点
+            //
+            // 窗口每移动一点，`ClientToScreen` 的结果就跟着移一点，于是 `dx` 一直约等于 0
+            // ⇒ **拖动过程中窗口几乎不动**，直到松手那一刻才整体跳一段。
+            // 客户区坐标是**窗口相对**的：鼠标真实移动 D 像素时，客户区读数正好变化 D，
+            // 与窗口当前在哪无关 ⇒ 直接用客户区差值即为真实位移。
+            let dx = x - self.grab_client.x;
+            let dy = y - self.grab_client.y;
             let mut rc = self.grab_window;
+            // `LH_TRACE_DRAG=1`（仅验证用）：把"这次移动算出的位移"落盘。
+            // ⚠️ 探针**必须**断言这里算出来的 `dx/dy`，而不是最终窗口位置 ——
+            // 应用无法区分"我们 PostMessage 的移动"与"用户真实鼠标的移动"（设计如此），
+            // 所以只要真鼠标在窗口上动一下，最终位置就被污染、断言会随机失败（实测踩到）。
+            // 位移只取决于消息里的坐标，是确定性的。
+            if std::env::var("LH_TRACE_DRAG").is_ok() {
+                crate::trace::trace(&format!(
+                    "ui: drag x={} y={} client0=({},{}) dx={} dy={} win0=({},{}) size={}x{}",
+                    x, y, self.grab_client.x, self.grab_client.y, dx, dy,
+                    self.grab_window.left, self.grab_window.top,
+                    self.grab_window.width(), self.grab_window.height()));
+            }
             // 最小尺寸由布局算出（见 min_content_width/height），与 WM_GETMINMAXINFO 一致
             let min_w = self.min_content_width();
             let min_h = self.min_content_height();
@@ -1671,6 +1689,19 @@ impl App {
                     SWP_NOZORDER | SWP_NOACTIVATE,
                 );
             }
+            // `LH_TRACE_DRAG=1`（仅验证用）：落盘"算出的位移"与"真正应用到窗口的位移"。
+            // 探针断言的是**这两者的一致性**（`rect - win0 == dx/dy`，除非被工作区夹取），
+            // 而不是屏幕上的最终位置 —— 应用无法区分"探针 PostMessage 的移动"与
+            // "用户真实鼠标的移动"（设计如此），所以任何基于最终位置的断言都会被真鼠标污染。
+            // 这条一致性断言正好抓 E75：那时算出的 dx 恒为 ~0，`rect - win0` 却应为真值。
+            if std::env::var("LH_TRACE_DRAG").is_ok() {
+                crate::trace::trace(&format!(
+                    "ui: drag apply dx={} dy={} delivered=({},{}) rect=({},{},{},{}) win0=({},{})",
+                    dx, dy,
+                    rc.left - self.grab_window.left, rc.top - self.grab_window.top,
+                    rc.left, rc.top, rc.right, rc.bottom,
+                    self.grab_window.left, self.grab_window.top));
+            }
             return;
         }
 
@@ -1735,14 +1766,12 @@ impl App {
         let border = self.border_hit(x, y);
         if border != Grab::None {
             self.grab = border;
-            let mut pt = POINT { x, y };
             let mut rc = RECT::default();
             unsafe {
-                crate::native::ClientToScreen(self.hwnd, &mut pt);
                 GetWindowRect(self.hwnd, &mut rc);
                 SetCapture(self.hwnd);
             }
-            self.grab_origin = pt;
+            self.grab_client = POINT { x, y };   // 位移基准（客户区）
             self.grab_window = rc;
             return;
         }
@@ -1782,14 +1811,12 @@ impl App {
                         }
                     }
                     self.grab = Grab::Move;
-                    let mut pt = POINT { x, y };
                     let mut rc = RECT::default();
                     unsafe {
-                        crate::native::ClientToScreen(self.hwnd, &mut pt);
                         GetWindowRect(self.hwnd, &mut rc);
                         SetCapture(self.hwnd);
                     }
-                    self.grab_origin = pt;
+                    self.grab_client = POINT { x, y };   // 位移基准（客户区）
                     self.grab_window = rc;
                 }
             }

@@ -77,6 +77,10 @@ $cfg = @{ server_url='http://127.0.0.1:9'; answer=@{mode='server'}; run=@{ auto_
 [IO.File]::WriteAllText((Join-Path $dir 'config.json'), $cfg, (New-Object System.Text.UTF8Encoding($false)))
 
 $env:LH_BASE_DIR = $dir
+    # NOTE: do NOT set LH_NO_AUTO_BROWSER here. This probe's WHOLE POINT is that the app comes
+    # back 4s later and decides to give way to the open dialog; suppressing the feature would
+    # make the probe unable to fail (the same mistake as the tautology in autolaunch_probe).
+    # The app still must not really open a browser -- that is what the "skipped" assertion checks.
 $env:LH_PROBE_PAGES = "page one|page two|page three"
 $env:LH_UI_ACTION = 'pages'
 # Keep the dropdown's own hook teardown out of the way: it would close the main window after 1.8s,

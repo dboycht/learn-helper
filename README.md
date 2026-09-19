@@ -4,6 +4,27 @@
 
 ## 版本
 
+- **2.1.4**（2026-09-19，源码包）：
+  - **修「无法自动切换页面」**：整套刷课里所有"点一下"（翻页 / 切卡片 / 提交 / 暂存 / 选选项）
+    都写着 `click(True, force=True)`，而 Playwright 的 `click` 是 **keyword-only** ⇒
+    每次点击都抛 `TypeError` 并被各自的 `try/except` 吞掉。**从 2.1.1 起翻页从未成功过**，
+    且因为异常被吞，表现像"功能没实现"而不是报错。现已全部改为 `click(force=True)`，
+    并用真实浏览器 + 源码级扫描回归钉住。
+  - **修「填涂成功」是假的**：选项点击失败时函数仍无条件返回"成功"，
+    导致引擎把**空白/错答案卷自动提交**（界面还显示"成功填涂 N/N"）。
+    现在改为**回读 DOM 校验**：选中集合与目标不符即如实报失败；填空也要求每个空都填上。
+  - **修「测验整节被跳过」**：完成态判据里 `.score` / `[class*="score"]` 是子串匹配，
+    页面上任何带 "score" 的元素都会被当成"已判分" ⇒ 整节跳过答题。
+    判据已收紧为"判分角标 / 答案成绩文案"。
+  - **整包从 51.4 MB 瘦到约 10.6 MB**（zip 约 10.2 MB）：去掉 Playwright 自带的
+    `node.exe`（88 MB 未压缩）、TypeScript 类型定义、trace viewer 资源与 Pillow。
+    ⚠️ **代价见下方"运行要求"**。
+  - **修一批健壮性问题**：配置并发写入会丢光（现加锁 + 原子替换，坏文件自动备份为 `.bad`）、
+    拖动窗口不跟手（位移改用客户区坐标）、鼠标负坐标、中文日志导致进程被杀、
+    最小窗口尺寸从未生效、文档任务永远读不完、求解等待超时算错等。
+  - 稳定性：为上述行为补齐无头回归（后端自测 **51** 项；界面探针 settings **24** /
+    pages **16** / about **14** / logscroll **37** / 悬停 **9** / 自动开浏览器 **11** /
+    焦点让路 **7** / 图标 **9**；另有 Rust 单元测试 **10** 项）。
 - **2.1.3**（2026-09-19，源码包）：
   - **「当前网页」可下拉选择** —— 点网页框弹出标签页列表
     （当前页打 ✓、↑↓/Enter/Esc、滚轮翻页），选中即下发后端并**记住**（下次启动仍选中同一页）；
@@ -31,7 +52,7 @@
   - 稳定性：为上述行为补齐无头回归（后端自测 **38** 项；界面探针 settings **24** / pages **16** /
     about **14** / logscroll **37** / 悬停 **9** / 自动开浏览器 **11** / 焦点让路 **7** / 图标 **9**）。
 - **2.1.1**（已发布，源码包）：**界面重构为原生 Win32（Rust）+ Python 后端服务**，主打「好传播」。
-  - **前端**：`native/` —— Rust 手写 Win32/GDI/DWM，**单 exe 约 0.37 MB，零运行时依赖**，
+  - **前端**：`native/` —— Rust 手写 Win32/GDI/DWM，**单 exe 约 0.56 MB**，
     解压即用；**纯色自绘界面**（用系统标题栏 + Win11 圆角 + 深色标题栏，
     客户区不透明自绘 —— 不做玻璃背板），保留原生缩放 / 贴边。
   - **后端**：`backend/` —— Python 服务（Playwright 刷课 + 答题），
@@ -57,10 +78,10 @@
 | --- | --- | --- |
 | 1.0.3（WinUI 3，框架依赖） | 26.1 MB | **.NET 9 Desktop Runtime + Windows App SDK Runtime** |
 | 1.0.3（WinUI 3，自包含） | 85.7 MB | 无 |
-| **2.1.1（原生 UI 单 exe）** | **0.37 MB** | **什么都不用装** |
+| **2.1.4（原生 UI + 瘦身后端）** | **0.56 MB** | **需要 Node.js**（见"运行要求"） |
 
 > 后端仍然需要本机有 Python + playwright（或者用 `build_release.ps1` 把它打成 exe 一起分发）；
-> 打整包时体积的大头（约 51 MB）几乎全是 Playwright 自带的浏览器运行时，UI 只占 0.7%。
+> 打整包时体积的大头曾经是 Playwright 自带运行时；2.1.4 起已瘦身到约 10.6 MB（UI 约占 5%）。
 
 ### 新增
 
@@ -77,7 +98,7 @@
 - **「答题设置」对话框**（界面标题栏齿轮图标）：答题方式三选一、后端地址、并发线程、
   单题超时、失败重试、大模型 Base URL / API Key / 模型名、自动提交开关；
   「测试连接」按钮可当场验证后端地址。**API Key 留空 = 不修改**（不会把已存的 key 抹掉）。
-- **`backend/verify_backend.py`**：31 项无头自动化验收（进程级端到端、引擎状态机、
+- **`backend/verify_backend.py`**：51 项无头自动化验收（进程级端到端、引擎状态机、
   纯逻辑与 mock 后端自检），改动后端后一条命令即可回归。
 
 ### 保留
@@ -90,7 +111,7 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| **`native/`** | **原生 Win32 前端（Rust）** —— 本版默认界面，单 exe 约 0.37 MB |
+| **`native/`** | **原生 Win32 前端（Rust）** —— 本版默认界面，单 exe 约 0.56 MB |
 | `native/src/ui.rs` | 窗口与自绘界面（布局 / 绘制 / 鼠标 / 按钮状态） |
 | `native/src/settings.rs` | 「答题设置」对话框（自绘控件 + 读写 `/api/settings`） |
 | `native/src/backend.rs` | 后端客户端：拉起进程、stdout 握手、命名管道事件、HTTP 调用 |
@@ -102,7 +123,7 @@
 | `backend/learn_helper/core.py` | 刷课 / 答题核心（注入脚本、题型识别、求解、填涂） |
 | `backend/learn_helper/engine.py` | `SolverEngine`：状态机 + 专用自动化线程 |
 | `backend/learn_helper/ipc.py` | HTTP 接口 + 命名管道推送 |
-| `backend/verify_backend.py` | **后端自动化验收（31 项）** |
+| `backend/verify_backend.py` | **后端自动化验收（51 项）** |
 | `winui/` | WinUI 3 界面（1.0.3 起；**现为备选退路**，`winui/RunWinUI.bat` 启动） |
 | `learn_helper.py` | 旧 Tkinter 客户端（逻辑参考） |
 | `client_app_reconstructed.py` | 原软件的反编译重建（研究参考，见 `docs/技术文档.md`） |
@@ -119,7 +140,7 @@ cd native
 cargo build --release
 ```
 
-产物 `native\target\release\learn-helper-native.exe`（约 0.37 MB），双击 `运行界面.bat` 亦可。
+产物 `native\target\release\learn-helper-native.exe`（约 0.56 MB），双击 `运行界面.bat` 亦可。
 
 > 界面会自动寻找并拉起后端：打包后是 `backend\learn-helper-core.exe`；
 > 开发期则是沿目录树找到 `backend\main.py` 并用本机 Python 拉起
@@ -139,8 +160,21 @@ python backend\main.py --port 0
 powershell -ExecutionPolicy Bypass -File native\build_release.ps1 -Zip
 ```
 
-产出 `dist\learn-helper-2.1.1\`（`LearnHelper.exe` + `backend\learn-helper-core.exe` + `Run.bat` + `README.txt`）
-与同名 zip。目标机器**无需安装任何运行时**。（本版本 Release **不附**该整包，只发源码。）
+产出 `dist\learn-helper-<版本>\`（`LearnHelper.exe` + `backend\learn-helper-core.exe` + `Run.bat` + `README.txt` + `config.example.json`）
+与同名 zip。**目标机器需要 Node.js**（见下方"运行要求"）。（本版本 Release **不附**该整包，只发源码。）
+
+## 运行要求
+
+| 需要 | 说明 |
+| --- | --- |
+| Windows 10/11 + Edge 或 Chrome | 自动化连的是**系统已装的浏览器**（`--remote-debugging-port=9222`），不随包分发浏览器 |
+| **Node.js** | ⚠️ 2.1.4 起整包**不再自带** Playwright 的 Node 运行时（那一个文件就近 90 MB，是当时整包 51 MB 的主因）。程序按 `PATH` → `Program Files\nodejs` → `%LOCALAPPDATA%\Programs\nodejs` → `%APPDATA%\npm` 找 `node.exe`；装在别处可用环境变量 **`LH_NODE_PATH`** 指定 |
+| （可选）Pillow | 只有「答题设置 → 自检」的**合成测试图**功能需要；整包为瘦身已排除 Pillow，缺了会提示 `pip install pillow`，**不影响主线刷课** |
+
+- **没装 Node.js 会怎样**：界面能正常打开，但点「启动刷课」会报**浏览器挂载失败**
+  （自动化层依赖 Node）。装一次 Node.js 即可，或自建包含 `node.exe` 的完整包。
+- 自检入口（排障用，冻结后唯一能看到逐步骤输出）：
+  `backend\learn-helper-core.exe --check-browser` / `--launch-browser`。
 
 ## 工作原理
 

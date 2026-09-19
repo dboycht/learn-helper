@@ -4,7 +4,9 @@ rem ============================================================
 rem  learn-helper 2.x -- native default launcher (developer build)
 rem
 rem  The product UI since 2.1.1 is the ZERO-DEPENDENCY Rust Win32 app
-rem  (native\), a single exe of about 0.3 MB that needs no runtime install.
+rem  (native\), a single exe of about 0.56 MB that needs no runtime install.
+rem  NOTE: the *backend* does need Node.js on this machine since 2.1.4
+rem  (see README "运行要求"); the UI itself needs nothing.
 rem  The former WinUI 3 build is kept as a fallback and has its own
 rem  launcher: winui\RunWinUI.bat
 rem

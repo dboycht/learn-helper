@@ -54,10 +54,25 @@ function Render([string]$hover, [string]$tag) {
     $env:LH_PROBE_HOVER_BAR = $hover
     $env:LH_PROBE_LOGS = (@(1..40 | ForEach-Object { "hover check line " + $_ }) -join '|')
     $env:LH_BASE_DIR = $dir
+    # Guard: this probe does not test the auto-launch-browser feature, and the app arms that
+    # feature 4 seconds after start. Several probes run longer than that, so without this the
+    # app could really open the user's sandbox browser in the middle of a test (found by audit).
+    $env:LH_NO_AUTO_BROWSER = '1'
     $p = Start-Process -FilePath $exe2 -WorkingDirectory $dir -ArgumentList '--render-probe', '1623', '960', $bmp -PassThru -Wait -NoNewWindow
     Remove-Item Env:LH_PROBE_HOVER_BAR -ErrorAction SilentlyContinue
     Remove-Item Env:LH_PROBE_LOGS -ErrorAction SilentlyContinue
     Remove-Item Env:LH_BASE_DIR -ErrorAction SilentlyContinue
+    Remove-Item Env:LH_NO_AUTO_BROWSER -ErrorAction SilentlyContinue
+    $bmpCreated = Test-Path $bmp
+    # The BMP name is fixed per tag and OutDir defaults to %TEMP%, so a render that silently
+    # died (e.g. the single-instance mutex made it exit immediately) used to leave a PREVIOUS
+    # run's image behind -- and the probe would happily grade that stale file and print PASS.
+    # Fail loudly instead (found by audit).
+    if (-not $bmpCreated) {
+        Write-Host ("  [FATAL] render produced no BMP (" + $tag + "): exit=" + $p.ExitCode + " bmp=" + $bmp)
+        Write-Host "          the exe did not render; refusing to grade a stale image."
+        exit 1
+    }
     return @{ Bmp = $bmp; Diag = (Join-Path $dir 'native-diag.log'); Exit = $p.ExitCode }
 }
 

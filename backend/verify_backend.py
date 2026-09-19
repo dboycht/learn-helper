@@ -390,7 +390,7 @@ def test_engine_unit():
     mock = core_mock.MockAnswerBackend().start()
     try:
         print(f'  [info] mock 后端起在 {mock.base_url}', flush=True)
-        ok_all, lines, results = mock.run_self_test_via(eng)
+        ok_all, lines, results = mock.run_self_test_via()
         for line in lines:
             print(f'         {line}', flush=True)
         for r in results:
@@ -425,6 +425,27 @@ def test_logic():
     check('C4 normalize 去逗号', norm['answer_key'] == 'AC', str(norm))
     norm = core._normalize_answer({'text_answers': ['春秋', '战国']}, 'blank')
     check('C5 normalize 文本答案', norm['text_answers'] == ['春秋', '战国'], str(norm))
+
+    # C12：两个通道对"同一份数据"必须给出一致结论（E73）。
+    #   选择题但只有 text_answers（模型常见偏差）时，`/solve` 通道能救回来，
+    #   `parse_llm_answer` 原来把非空内容丢掉 ⇒ 该题静默跳过。
+    ans = core.parse_llm_answer('{"question_type":"choice","text_answers":["B"]}', 'choice')
+    check('C12 parse_llm_answer 保留选择题的 text_answers（与 server 通道一致）',
+          ans['text_answers'] == ['B'], str(ans))
+    srv = core._normalize_answer({'question_type': 'choice', 'text_answers': ['B']}, 'choice')
+    check('C12b 两个通道结论一致', srv['text_answers'] == ans['text_answers'],
+          f'llm={ans} server={srv}')
+
+    # C13：「仅识别不答题」下跑自检**不得发起任何求解请求**（E73）。
+    #   原来写成"不是 server 就走大模型" ⇒ 拿空 key 请求 3 次全失败，
+    #   汇总成"接口或地址不可用"，把用户引去查后端地址。
+    ok_all, lines, results = core.run_solve_self_test(mode='off')
+    check('C13 mode=off 自检不发请求且说明原因',
+          ok_all is False and results and results[0].get('verdict') == 'mode_not_solvable'
+          and '仅识别' in (results[0].get('detail') or ''),
+          f'verdict={results[0].get("verdict") if results else None}')
+    check('C13b mode=off 自检只产出 1 条结论（没有逐题请求）', len(results) == 1,
+          f'results={len(results)}')
 
     acfg = get_answer_cfg()
     check('C6 答题配置钳位', 10 <= acfg['solver_timeout'] <= 600

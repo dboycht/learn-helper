@@ -118,6 +118,10 @@ function Invoke-Ui([string]$dir, [string]$action, [int]$waitSeconds) {
         Write-Host "  WARNING: a previous learn-helper-native is still running; case may be bogus"
     }
     $env:LH_BASE_DIR = $dir
+    # Guard: this probe does not test the auto-launch-browser feature, and the app arms that
+    # feature 4 seconds after start. Several probes run longer than that, so without this the
+    # app could really open the user's sandbox browser in the middle of a test (found by audit).
+    $env:LH_NO_AUTO_BROWSER = '1'
     $env:LH_UI_ACTION = $action
     $env:LH_PROBE_PAGES = $SamplePages
     Reset-Diag

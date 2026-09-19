@@ -74,19 +74,32 @@ class MockAnswerBackend:
         return self
 
     def stop(self):
-        try:
-            self._httpd.shutdown()
-            self._httpd.server_close()
-        except Exception:
-            pass
+        """停掉 mock 服务。**只在确实跑起来之后**才 shutdown。
 
-    def run_self_test_via(self, engine):
+        ⚠️ `socketserver.shutdown()` 会等 `serve_forever()` 把它的事件置位；
+        如果 `serve_forever()` 从没跑过，这个调用**永远不返回**（自测会在退出时挂住）。
+        异常也不再 `pass` 掉 —— 自测工具的失败必须看得见（E74）。
+        """
+        try:
+            if getattr(self, '_thread', None) is not None and self._thread.is_alive():
+                self._httpd.shutdown()
+            self._httpd.server_close()
+        except Exception as e:
+            try:
+                from learn_helper.config import LOGGER
+                LOGGER.warning(f'[mock] 停止 mock 后端时异常: {e}')
+            except Exception:
+                pass
+
+    def run_self_test_via(self):
         """把请求指向 mock 后端跑一遍内置三道题自检。返回 (ok_all, lines, results)。
 
         ⚠️ 两处**必须**做，否则结果不可信：
         1. 先清 ``SHUTDOWN`` —— 引擎在"未选页/未启动"分支里会把它置位，留着会让本次
            求解全部立刻放弃（表现为三题 request_fail，看着像 mock 坏了）；
         2. 不改 config.json：把 base 直接传给 ``run_solve_self_test``，避免污染用户配置。
+
+        （原来这里有个没人用的 `engine` 参数，会让人误以为它走的是引擎链路，已删。）
         """
         from learn_helper import core
         core.SHUTDOWN.clear()
