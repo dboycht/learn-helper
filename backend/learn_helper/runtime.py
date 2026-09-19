@@ -345,8 +345,71 @@ def build_parser():
                    help='打印配置快照 JSON 后退出（排障用）')
     p.add_argument('--force', action='store_true',
                    help='忽略单实例锁，强制启动')
+    p.add_argument('--check-browser', action='store_true',
+                   help='自检：启动 Playwright 驱动并连接本机 CDP，打印结果后退出')
+    p.add_argument('--launch-browser', action='store_true',
+                   help='自检：先真的拉起沙盒浏览器，再做 --check-browser 的全套检查')
     p.add_argument('--version', action='store_true', help='打印版本后退出')
     return p
+
+
+def _check_browser(do_launch=False):
+    """`--check-browser`：把"Playwright 驱动能不能起来 + 能不能连上 9222"一次问清。
+
+    为什么要有这个开关（2026-09-19）：发布包**刻意不带** Playwright 自带的
+    88 MB `node.exe`，改用本机 Node（见 `_release/learn-helper-core.spec` 与
+    `rthook_node.py`）。这条改动一旦出问题，表现是"点了启动刷课就没反应"，
+    而冻结成 exe 之后**看不到 traceback**（stdout/stderr 都被界面收走了）。
+    所以留一个能单独跑、逐步打印的自检入口 —— 排障时一行命令就能定位到
+    "驱动没起来 / 拉不起浏览器 / 连不上浏览器"里的哪一步。
+
+    `--launch-browser` 额外**真的拉一次沙盒浏览器**：这是冻结环境下最容易出事的
+    一步（要 spawn Edge + 等 9222 就绪），而它在 HTTP 线程里跑，崩了看不到任何输出。
+    """
+    from . import core
+    print(f'backend version : {APP_VERSION}')
+    print(f'frozen          : {bool(getattr(sys, "frozen", False))}')
+    print(f'executable      : {sys.executable}')
+    print(f'PLAYWRIGHT_NODEJS_PATH : {os.environ.get("PLAYWRIGHT_NODEJS_PATH") or "(not set)"}')
+    print(f'node candidates : {core._find_system_node() or "(none found)"}')
+    print(f'cdp 9222 open   : {core.is_cdp_port_open()}')
+    try:
+        sync_playwright = core.require_playwright()
+        print('import playwright : OK')
+    except Exception as e:
+        print(f'import playwright : FAILED -> {e}')
+        return 2
+    if do_launch:
+        print('launch browser  : ...')
+        try:
+            ok, proc = core.kill_and_launch_browser()
+            print(f'launch browser  : {"OK" if ok else "FAILED"}'
+                  f'{"" if proc is None else f" (pid {proc.pid})"}')
+        except Exception as e:
+            print(f'launch browser  : EXCEPTION -> {type(e).__name__}: {e}')
+            import traceback
+            traceback.print_exc()
+            return 5
+        print(f'cdp 9222 open   : {core.is_cdp_port_open()}')
+    try:
+        print('starting driver   : ...')
+        with sync_playwright() as p:
+            print('starting driver   : OK')
+            try:
+                browser = p.chromium.connect_over_cdp(core.CDP_URL, timeout=8000)
+            except Exception as e:
+                print(f'connect_over_cdp  : FAILED -> {e}')
+                return 3
+            print(f'connect_over_cdp  : OK (browser {browser.version}, '
+                  f'{len(browser.contexts)} context(s))')
+            browser.close()
+    except Exception as e:
+        print(f'playwright run    : FAILED -> {type(e).__name__}: {e}')
+        import traceback
+        traceback.print_exc()
+        return 4
+    print('RESULT: browser automation is sane')
+    return 0
 
 
 def main(argv=None):
@@ -357,6 +420,10 @@ def main(argv=None):
     if args.version:
         print(APP_VERSION)
         return 0
+    if args.check_browser:
+        return _check_browser()
+    if args.launch_browser:
+        return _check_browser(do_launch=True)
     if args.print_config:
         from .ipc import settings_payload
         hub = Hub()

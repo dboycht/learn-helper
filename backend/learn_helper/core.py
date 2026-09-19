@@ -15,6 +15,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import threading
 import time
@@ -47,8 +48,71 @@ BROWSER_PATHS = [
 CDP_URL = 'http://127.0.0.1:9222'
 
 
+def _find_system_node():
+    """找一个**本机已装**的 node.exe（用于替掉 Playwright 自带的 88 MB node.exe）。
+
+    Playwright 官方支持用 `PLAYWRIGHT_NODEJS_PATH` 指定 node 可执行文件
+    （`playwright/_impl/_driver.py: compute_driver_executable()`），实测把本机
+    Node v24 指过去后，`connect_over_cdp` 驱动沙盒 Edge 一切正常。
+    所以发布包**不必**背着自己的 node.exe —— 只是必须保证"找不到本机 Node 时
+    还能回退到自带的那个"（开发副本 / 完整包仍然带）。
+
+    返回可执行文件路径，或 None（= 让 Playwright 用自带的）。
+    """
+    candidates = []
+    env = os.environ.get('LH_NODE_PATH')
+    if env:
+        candidates.append(env)
+    # 常见安装位置（PATH 里没有时也能命中）
+    candidates += [
+        os.path.join(os.environ.get('ProgramFiles', r'C:\Program Files'), 'nodejs', 'node.exe'),
+        os.path.join(os.environ.get('ProgramFiles(x86)', r'C:\Program Files (x86)'),
+                     'nodejs', 'node.exe'),
+        os.path.join(os.environ.get('LOCALAPPDATA', ''), 'Programs', 'nodejs', 'node.exe'),
+        os.path.join(os.environ.get('APPDATA', ''), 'npm', 'node.exe'),
+    ]
+    # PATH 里找（用户可能装在别处）
+    candidates.append(shutil.which('node') or '')
+    for path in candidates:
+        try:
+            if path and os.path.isfile(path):
+                return path
+        except Exception:
+            continue
+    return None
+
+
+_NODE_RESOLVED = False
+
+
+def ensure_node_available():
+    """在**第一次用 Playwright 之前**决定用哪个 node.exe。
+
+    - 本机有 Node ⇒ 设 `PLAYWRIGHT_NODEJS_PATH`，发布包就不必带 88 MB 的 node.exe；
+    - 本机没有 ⇒ 什么都不做，Playwright 用自带的（完整包/开发副本的行为不变）。
+
+    幂等，可在任意线程调用；失败只记日志（绝不影响主流程）。
+    """
+    global _NODE_RESOLVED
+    if _NODE_RESOLVED:
+        return
+    _NODE_RESOLVED = True
+    if os.environ.get('PLAYWRIGHT_NODEJS_PATH'):
+        return                      # 用户/环境已经指定，尊重它
+    try:
+        found = _find_system_node()
+        if found:
+            os.environ['PLAYWRIGHT_NODEJS_PATH'] = found
+            LOGGER.info(f'[环境] 使用本机 Node：{found}')
+        else:
+            LOGGER.info('[环境] 未发现本机 Node，使用内置运行时。')
+    except Exception as e:
+        LOGGER.warning(f'[环境] 探测本机 Node 失败（继续用内置运行时）: {e}')
+
+
 def require_playwright():
     """按需导入 Playwright；缺依赖时抛可读异常（不阻塞服务启动）。"""
+    ensure_node_available()
     try:
         from playwright.sync_api import sync_playwright
         return sync_playwright

@@ -430,6 +430,53 @@ def test_logic():
     check('C6 答题配置钳位', 10 <= acfg['solver_timeout'] <= 600
           and 1 <= acfg['workers'] <= 16 and acfg['mode'] in ('server', 'llm', 'off'), str(acfg))
 
+    # C9/C10：发布包瘦身相关（2026-09-19，见 ERROR.md E68）
+    #   C9  node 探测：发布包**刻意不带** Playwright 自带的 88 MB node.exe，改用本机
+    #       Node（`PLAYWRIGHT_NODEJS_PATH`）。探测逻辑错了 ⇒ 发布版一启动刷课就报
+    #       "浏览器挂载失败"，而冻结成 exe 后看不到 traceback，所以必须在这里钉住。
+    #   C10 配置扩展名必须能被 JSON 解析回来（`.bad` 备份/原子替换的配套）。
+    from learn_helper import core as _core
+
+    real_env = os.environ.pop('PLAYWRIGHT_NODEJS_PATH', None)
+    real_node = os.environ.pop('LH_NODE_PATH', None)
+    try:
+        # 显式 override 优先，且必须是**存在的文件**才被采纳
+        os.environ['LH_NODE_PATH'] = sys.executable
+        check('C9 LH_NODE_PATH 覆盖生效', _core._find_system_node() == sys.executable,
+              f'got={_core._find_system_node()!r}')
+        # 指向不存在的路径时不能瞎认，必须回落（本机有 Node 就返回它，否则 None）
+        os.environ['LH_NODE_PATH'] = r'C:\definitely\not\here\node.exe'
+        fallback = _core._find_system_node()
+        check('C9b 无效路径不被采纳（回落或 None）',
+              fallback is None or os.path.isfile(fallback), f'got={fallback!r}')
+        # 环境里已有 PLAYWRIGHT_NODEJS_PATH 时，ensure_node_available 不得覆盖它
+        os.environ.pop('LH_NODE_PATH', None)
+        os.environ['PLAYWRIGHT_NODEJS_PATH'] = r'C:\already\set\node.exe'
+        _core._NODE_RESOLVED = False
+        _core.ensure_node_available()
+        check('C9c 已显式指定的 PLAYWRIGHT_NODEJS_PATH 不被覆盖',
+              os.environ.get('PLAYWRIGHT_NODEJS_PATH') == r'C:\already\set\node.exe',
+              f'got={os.environ.get("PLAYWRIGHT_NODEJS_PATH")!r}')
+    finally:
+        os.environ.pop('LH_NODE_PATH', None)
+        os.environ.pop('PLAYWRIGHT_NODEJS_PATH', None)
+        if real_env is not None:
+            os.environ['PLAYWRIGHT_NODEJS_PATH'] = real_env
+        if real_node is not None:
+            os.environ['LH_NODE_PATH'] = real_node
+        _core._NODE_RESOLVED = False
+
+    # C10：正常写入**不该**产生 .bad 备份（.bad 只在"读到坏文件"时出现）
+    from learn_helper import config as _cfgmod
+    _CP = _cfgmod.CONFIG_PATH
+    _bad = _CP + '.bad'
+    if os.path.exists(_bad):
+        os.remove(_bad)
+    _cfgmod.update_config({'healthcheck': 'ok'})
+    check('C10 正常写入不产生 .bad 备份',
+          os.path.exists(_CP) and not os.path.exists(_bad),
+          f'bad_exists={os.path.exists(_bad)}')
+
     # C7/C8：config.json 的写入健壮性（2026-09-19 修，见 ERROR.md E60）
     #   C7 想证明的是**落盘方式**本身：旧实现 `open(path,'w')` 先截断再 dump，
     #      中途失败就留下半截文件；`save_config` 的原子替换无论成功失败都不该留半截。

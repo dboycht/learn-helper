@@ -60,14 +60,20 @@ if (Test-Path $icon) {
 # ---------------------------------------------------------------- backend
 $backendExe = Join-Path $root '_release\pyi\learn-helper-core.exe'
 if (-not $SkipBackend) {
-    Write-Host "[2/3] PyInstaller onefile (Python backend)" -ForegroundColor Yellow
+    Write-Host "[2/3] PyInstaller onefile (Python backend, slim spec)" -ForegroundColor Yellow
+    # NOTE: we build through native\learn-helper-core.spec instead of passing flags here,
+    # because the spec filters out ~106 MB of raw payload that must never ship:
+    #   playwright\driver\node.exe                      88.25 MB  (system Node is used instead)
+    #   playwright\driver\package\lib\vite\*             3.41 MB  (trace viewer / recorder / report)
+    #   playwright\driver\package\types\*                1.85 MB  (TypeScript definitions)
+    #   PIL/Pillow (excludes=)                          ~13.0 MB  (only the optional test image)
+    # Measured result: 51.06 MB -> 10.03 MB. The spec prints what it dropped, so a
+    # regression here is visible in the build log (see ERROR.md E68).
     Push-Location $root
-    & py -3.10 -m PyInstaller --noconfirm --clean --onefile `
-        --name learn-helper-core `
+    & py -3.10 -m PyInstaller --noconfirm --clean `
         --distpath '_release\pyi' `
         --workpath '_release\pyi-work' `
-        --specpath '_release\pyi-work' `
-        'backend\main.py'
+        'native\learn-helper-core.spec'
     $pyiCode = $LASTEXITCODE
     Pop-Location
     if ($pyiCode -ne 0 -or -not (Test-Path $backendExe)) { throw "PyInstaller build failed" }
@@ -125,12 +131,22 @@ How to run
 3. Open your course page in that browser, then click
    "check/refresh pages" in the app and pick the page, then "start".
 
-No runtime needs to be installed: this package is fully self-contained.
+Requirements
+------------
+* Microsoft Edge or Google Chrome (already installed on any Windows 10/11 PC).
+* Node.js (https://nodejs.org) -- the browser automation layer runs on it.
+  The app looks for node.exe in PATH and in the usual install locations
+  (Program Files\nodejs, %LOCALAPPDATA%\Programs\nodejs, %APPDATA%\npm).
+  If Node.js is missing, the UI still opens but starting the course flow
+  reports that the browser could not be mounted.
+  Set LH_NODE_PATH to point at a specific node.exe if yours lives elsewhere.
+
+No Python needs to be installed: the backend ships as a single self-contained exe.
 
 Files
 -----
-  LearnHelper.exe            UI (native Win32, ~0.3 MB, zero dependency)
-  backend\learn-helper-core.exe   Python backend (Playwright automation + solving)
+  LearnHelper.exe            UI (native Win32, ~0.4 MB, zero dependency)
+  backend\learn-helper-core.exe   Python backend (browser automation + solving)
   config.example.json        copy to config.json and edit to change the
                              answering backend / model / speed
   logs\learn_helper.log      created on first run (backend log)
