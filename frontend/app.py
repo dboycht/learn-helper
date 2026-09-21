@@ -23,6 +23,7 @@ from __future__ import annotations
 import ctypes
 import os
 import sys
+import threading
 import time
 from ctypes import wintypes
 from typing import Optional
@@ -303,14 +304,37 @@ class SettingsDialog(QDialog):
         btns.addWidget(self.save_btn)
         root.addLayout(btns)
 
-        self.reload()
+        # ⚠️ `settings_read` 是**全局广播**信号，主窗口也连着它。对话框只在
+        # "这次读取是我发起的" 时才吃这份数据，否则会拿别人的结果覆盖自己的表单。
+        self._awaiting_settings = False
+        self.client.settings_read.connect(self._maybe_apply_settings)
 
-    def reload(self) -> None:
-        cfg = self.client.settings()
-        data = cfg.get('data') or cfg
+        # ⚠️ 打开对话框时**不要**同步读设置：`/api/settings` 是 HTTP（timeout 8s），
+        # 后端慢的时候会连"对话框都弹不出来"。先让窗口显示出来，数据异步填。
+        self._awaiting_settings = True
+        self.client.read_settings_async()
+        self.hint.setText('正在读取设置…')
+
+    def _maybe_apply_settings(self, data: dict) -> None:
+        if not self._awaiting_settings:
+            return
+        self._awaiting_settings = False
+        self._on_settings_loaded(data)
+
+    def _on_settings_loaded(self, data: dict) -> None:
+        """异步拿到的设置快照填进表单（**在 UI 线程**）。"""
         if not data:
             self.hint.setText('读取设置失败（后端未就绪）')
             return
+        self.apply(data)
+
+    def apply(self, data: dict) -> None:
+        """把一份设置快照填进表单。
+
+        ⚠️ 这里**没有** `reload()` 这种"同步读设置"的方法：读设置是 HTTP，
+        UI 线程上同步等会冻界面（本轮把唯一一处删掉了；自检要填表就直接调
+        `apply({...})`，既更快也不依赖后端）。
+        """
         self._initial = data
         answer = data.get('answer') or {}
         run = data.get('run') or {}
@@ -380,8 +404,11 @@ class SettingsDialog(QDialog):
             return
         self.save_btn.setEnabled(False)
         self.save_btn.setText('保存中…')
-        QApplication.processEvents()
-        ok, msg = self.client.put_settings(patch)
+        # ⚠️ 异步保存：`put_settings` 是 HTTP，不能堵 UI 线程（否则对话框也"卡死一下"）
+        self.client.call_async_result(
+            'settings_save', patch, on_done=self._on_saved)
+
+    def _on_saved(self, ok: bool, msg: str) -> None:
         self.save_btn.setEnabled(True)
         self.save_btn.setText('保存')
         if ok:
@@ -392,9 +419,13 @@ class SettingsDialog(QDialog):
     def _test(self) -> None:
         mode = self.mode.currentData()
         self.hint.setText('测试中…')
-        QApplication.processEvents()
-        ok, msg = self.client.control('test_backend',
-                                      {'server_url': self.server_url.text().strip()})
+        self.test_btn.setEnabled(False)
+        self.client.call_async(
+            'test_backend', {'server_url': self.server_url.text().strip()},
+            on_done=lambda ok, msg: self._on_tested(mode, ok, msg))
+
+    def _on_tested(self, mode, ok: bool, msg: str) -> None:
+        self.test_btn.setEnabled(True)
         prefix = '测试连接' if mode == 'server' else '测试连接（大模型）'
         self.hint.setText(f'{prefix}：{msg}')
 
@@ -412,6 +443,9 @@ class MainWindow(QMainWindow):
         self._selected_page = ''
         self._pages: list[str] = []
         self._pages_synced = False      # view 是否已按 `_pages` 同步过（见 _apply_pages）
+        # 正在跑的后端动作（用于"忙"状态显示；见 _set_busy）
+        self._busy_actions: set[str] = set()
+        self._busy_prev = ''
         self._speed = 2.0
         self._last_status: dict = {}
         self._pending_autolaunch = False
@@ -565,6 +599,8 @@ class MainWindow(QMainWindow):
         self.client.logged.connect(self._on_log)
         self.client.status_changed.connect(self._on_status)
         self.client.pages_changed.connect(self._on_pages)
+        self.client.action_done.connect(self._on_action_done)
+        self.client.settings_read.connect(self._on_settings_read)
 
         self.start_btn.clicked.connect(lambda: self._control('start'))
         self.stop_btn.clicked.connect(self._on_stop)
@@ -633,11 +669,19 @@ class MainWindow(QMainWindow):
 
     def _after_connect(self) -> None:
         """握手完成后：拉一次设置/状态/页面，并按设置决定要不要自动开浏览器。"""
-        self._refresh_settings_label()
         self._control('refresh_pages')
-        cfg = self.client.settings()
-        data = cfg.get('data') or cfg
+        # 设置要异步取（`/api/settings` 也是个 HTTP 请求，后端卡住时一样会堵 UI 线程）
+        self.client.read_settings_async()
+
+    def _on_settings_read(self, data: dict) -> None:
+        """拿到设置后：更新界面上的"倍速/答题方式"，并按需自动开浏览器。"""
+        answer = (data or {}).get('answer') or {}
         run = (data or {}).get('run') or {}
+        if answer.get('mode_label'):
+            self.mode_label.setText(f"答题方式：{answer['mode_label']}")
+        if run.get('video_speed'):
+            self._speed = float(run['video_speed'])
+            self.speed_btn.setText(f'倍速 {self._speed:.1f}x')
         # ⚠️ `LH_NO_AUTO_BROWSER=1` 也必须对**界面自己**生效：自检/探针跑的时候绝不
         # 该去接管用户的沙盒浏览器（会把正在用的那个界面挤掉，后端随即退出）。
         # 这个约定原来只在后端侧有，前端漏了（实测自检因此误报"与已有后端冲突"）。
@@ -653,10 +697,21 @@ class MainWindow(QMainWindow):
         ⚠️ 必须两步：`refresh_pages` 要靠 CDP 9222，而浏览器是这一步才拉起来的。
         只刷一次的话下拉框会一直停在"未检测到网页"（实测：后端日志报
         `connect ECONNREFUSED 127.0.0.1:9222`），用户以为界面坏了。
+        ⚠️ 必须**异步**：`launch_browser` 要拉起整个浏览器（实测 4~8 秒），
+        同步调用会把启动阶段的界面冻住 —— 这也是"卡死一下"的来源之一。
+        ⚠️ 而且**不加忙状态**：这是启动时的自动动作，禁用"检测/刷新网页"按钮会让界面
+        一开始就像坏的（用户还没做任何操作，按钮却是灰的）。
         """
-        ok, msg = self.client.control('launch_browser')
+        self.client.call_async('launch_browser', None, on_done=self._on_launch_done)
+
+    def _on_launch_done(self, ok: bool, msg: str) -> None:
+        # ⚠️ 这里**必须**清忙状态：`launch_browser` 走的是 `on_done` 回调通道，
+        # 不会发 `action_done` 信号 ⇒ 如果只在 `_on_action_done` 里清，
+        # 「检测/刷新网页」按钮会**一直保持禁用**（实测踩到）。
+        self._set_busy('launch_browser', False)
         self.diag(f'ui: launch_browser -> {"OK" if ok else "FAIL"} {msg[:100]}')
-        # 浏览器启动 + 页面就绪需要几秒，隔一会儿再刷，并把结果写进日志
+        self._append_log(f'[浏览器] {msg}' if msg else '[浏览器] 已启动')
+        # 浏览器启动 + 页面就绪需要几秒，隔一会儿再刷（异步）
         QTimer.singleShot(5000, lambda: self._control('refresh_pages'))
 
     def _on_failed(self, msg: str) -> None:
@@ -756,40 +811,112 @@ class MainWindow(QMainWindow):
         if not title or title == self._selected_page:
             return
         self._selected_page = title
-        self.diag(f'ui: invoke select_page -> {title!r}')
-        ok, msg = self.client.control('select_page', {'title': title})
-        self._append_log(f'[native] 选择网页 → {msg or title}')
+        # `select_page` 在后端也要连 CDP 落盘，属于慢调用 ⇒ 走异步（别堵 UI 线程）
+        self._control('select_page', {'title': title}, busy_text=f'正在选择网页：{title}')
 
     def _refresh_settings_label(self) -> None:
-        cfg = self.client.settings()
-        data = cfg.get('data') or cfg
-        answer = (data or {}).get('answer') or {}
-        label = answer.get('mode_label') or '—'
-        run = (data or {}).get('run') or {}
-        self._speed = float(run.get('video_speed') or self._speed)
-        self.speed_btn.setText(f'倍速 {self._speed:.1f}x')
-        self.mode_label.setText(f'答题方式：{label}')
+        """重新读设置并刷新"倍速/答题方式"标签。**异步**（读设置也是 HTTP）。"""
+        self.client.read_settings_async()
 
     # ------------------------------------------------------------ 动作
-    def _control(self, action: str, params: Optional[dict] = None) -> None:
-        self.diag(f'ui: invoke {action}')
-        ok, msg = self.client.control(action, params)
-        self.diag(f'ui: {action} -> {"OK" if ok else "FAIL"} {msg[:160]}')
-        if action not in ('launch_browser',):
-            self._append_log(f'[native] {action} → {msg}' if msg else f'[native] {action}')
+    #
+    # ⚠️⚠️ **所有后端调用一律异步**（用户报"点「下一章」经常卡死一下"，2026-09-21）。
+    # 原来这里是 `ok, msg = self.client.control(action)` —— 在 UI 线程上同步等 HTTP。
+    # `next_page` 在后端要"连 CDP → 找按钮 → 点击 → 轮询最多 6s 等确认弹窗 → 等标题变化"，
+    # 正常 2~8 秒，而 `control` 的 timeout 是 **300 秒**；这段时间 Qt 事件循环被完全堵住
+    # ⇒ 不重绘、按钮点不动、拖动无反应。现在只投递请求，结果通过 `action_done` 回来。
+    def _control(self, action: str, params: Optional[dict] = None,
+                 busy_text: str = '') -> None:
+        self._set_busy(action, True, busy_text)
+        self.client.call_async(action, params)
+
+    def _set_busy(self, action: str, busy: bool, text: str = '') -> None:
+        """把"某个动作正在跑"体现在界面上（按钮禁用 + 状态栏提示）。
+
+        没有这个的话，动作期间界面虽然不卡了，但用户会以为"点了没反应"。
+        """
+        self._busy_actions.add(action) if busy else self._busy_actions.discard(action)
+        busy_now = bool(self._busy_actions)
+        # 会阻塞的操作期间禁用对应按钮，避免重复提交
+        for ctl_action, btn in (('next_page', self.next_btn),
+                                ('refresh_pages', self.refresh_btn),
+                                ('diagnose', self.diag_btn),
+                                ('launch_browser', self.refresh_btn)):
+            if ctl_action == action:
+                btn.setEnabled(not busy)
+        if busy:
+            self._busy_prev = self.status.currentMessage()
+            self.next_btn.setText('翻页中…' if action == 'next_page' else self.next_btn.text())
+            self.status.showMessage(text or f'正在执行 {action} …')
+        else:
+            if self.next_btn.text() == '翻页中…':
+                self.next_btn.setText('下一章')
+            if not busy_now and getattr(self, '_busy_prev', ''):
+                self.status.showMessage(self._busy_prev)
+                self._busy_prev = ''
+
+    def _on_action_done(self, action: str, ok: bool, msg: str) -> None:
+        """后台动作回来了（**在 UI 线程**）。所有界面更新都只在这里做。"""
+        self._set_busy(action, False)
+        if action == 'next_page':
+            self._append_log(f'[翻页] {msg}')
+            if not ok:
+                self.status.showMessage(msg or '翻页失败')
+            return
+        if action in ('launch_browser',):
+            # 自动开浏览器是"后台动作"：只记日志，不打扰用户（沿用原设计）
+            return
+        if action == 'select_page':
+            self._append_log(f'[native] 选择网页 → {msg}')
+            return
+        if msg:
+            self._append_log(f'[native] {action} → {msg}')
+        else:
+            self._append_log(f'[native] {action}')
 
     def _on_next_page(self) -> None:
         self._append_log('[native] 手动翻页：正在查找「下一页/下一章」...')
-        self.diag('ui: invoke next_page')
-        ok, msg = self.client.control('next_page')
-        self.diag(f'ui: next_page -> {"OK" if ok else "FAIL"} {msg[:200]}')
-        self._append_log(f'[翻页] {msg}')
-        if not ok:
-            self.status.showMessage(msg or '翻页失败')
+        self._control('next_page', busy_text='正在翻页（查找「下一页/下一章」并处理确认弹窗）…')
+
+    def _request_stop(self, wait_seconds: float = 0.0) -> bool:
+        """请求后端停止，返回"停止是否已完成"。
+
+        ⚠️ 同样不许在 UI 线程上"同步等 HTTP"：原来的写法是
+        `ok, msg = self.client.control('stop')`，而 `stop` 在后端会去杀它拉起的
+        沙盒浏览器，慢的时候要好几秒 ⇒ 点「终止并退出」界面也会僵住。
+        现在：后台发请求；**只有调用方明确需要"停干净再继续"时才等**，
+        而且是**有上限的等**（`QApplication.processEvents()` 让界面继续活着），
+        等不到就照常往下走 —— 绝不无限期冻住界面。
+        """
+        done = threading.Event()
+        box: dict = {}
+
+        def _cb(ok: bool, msg: str) -> None:
+            box['ok'], box['msg'] = ok, msg
+            done.set()
+
+        self.diag('ui: invoke stop')
+        self.client.call_async('stop', None, on_done=_cb)
+        if wait_seconds <= 0:
+            return False
+        deadline = time.time() + wait_seconds
+        while not done.is_set() and time.time() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.05)
+        ok = bool(box.get('ok'))
+        msg = str(box.get('msg') or '')
+        if not done.is_set():
+            self.diag(f'ui: stop 等待 {wait_seconds}s 未完成，继续退出')
+            self._append_log('[native] stop 未在预期时间内完成，继续退出')
+            return False
+        self.diag(f'ui: stop -> {"OK" if ok else "FAIL"} {msg[:120]}')
+        self._append_log(f'[native] stop → {msg}' if msg else '[native] stop')
+        return ok
 
     def _on_stop(self) -> None:
-        self._control('stop')
-        QTimer.singleShot(300, self.close)
+        # 「终止并退出」：给它最多 8 秒停干净（要杀沙盒浏览器），等不到也照常关窗。
+        self._request_stop(wait_seconds=8.0)
+        QTimer.singleShot(200, self.close)
 
     def _cycle_speed(self) -> None:
         steps = [1.0, 1.5, 2.0, 3.0]
@@ -799,9 +926,8 @@ class MainWindow(QMainWindow):
             cur = 2
         self._speed = steps[(cur + 1) % len(steps)]
         self.speed_btn.setText(f'倍速 {self._speed:.1f}x')
-        ok, msg = self.client.put_settings({'run': {'video_speed': self._speed}})
-        self.diag(f'ui: invoke speed -> {self._speed} ({msg[:80]})')
-        self._append_log(f'[native] 倍速已设为 {self._speed:.1f}x')
+        self._append_log(f'[native] 倍速已设为 {self._speed:.1f}x（保存中…）')
+        self.client.call_async_result('speed', {'run': {'video_speed': self._speed}})
 
     def open_settings(self) -> None:
         self.diag('ui: invoke settings')
@@ -904,10 +1030,8 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             if clicked is btn_quit:
-                try:
-                    self.client.control('stop')
-                except Exception:
-                    pass
+                # 有上限地等它停干净（后端要顺手杀沙盒浏览器），等不到也照常退出
+                self._request_stop(wait_seconds=3.0)
             else:
                 event.ignore()
                 return
@@ -919,10 +1043,7 @@ class MainWindow(QMainWindow):
             if ask != QMessageBox.Yes:
                 event.ignore()
                 return
-            try:
-                self.client.control('stop')
-            except Exception:
-                pass
+            self._request_stop(wait_seconds=3.0)
 
         self.diag('ui: invoke Close')
         self.status.showMessage('正在退出…')

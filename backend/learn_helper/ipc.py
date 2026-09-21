@@ -381,50 +381,16 @@ class PipeServer:
 
     @staticmethod
     def _make_nowait(handle):
-        """复制出一个**非阻塞**的写句柄（`PIPE_NOWAIT`），供推送使用。
+        """**不再改句柄语义** —— 返回原句柄。
 
-        ⚠️⚠️ 这里修的是一个会让**整个后端冻死**的严重 bug（2026-09-21，用户报"界面不更新"）：
-        原实现直接用 `CreateNamedPipe` 给的句柄 `WriteFile`。该句柄是**阻塞**模式，
-        当对端不读（客户端已死/卡住/读得慢）时 `WriteFile` 会**永久阻塞**；
-        而 Python 的 ctypes 调用**不释放 GIL** ⇒ 这个卡住的线程把整个解释器拖死：
-        `/api/status` 超时、`/api/shutdown` 不响应、进程永不退出（实测日志停在
-        「收尾②：关闭命名管道」）。
-        **最小复现**：`PipeServer` + 一个普通 Python 读取端，收到 hello/status 之后
-        再 `emit_pages` 就永久卡住。Rust 界面用 Win32 读原始字节，所以从没暴露它。
-
-        修法：给**写**单独复制一个 `PIPE_NOWAIT` 句柄。非阻塞模式下缓冲满时
-        `WriteFile` 立刻返回失败（而不是等），我们据此剔除该客户端 —— 宁可丢一个客户端，
-        也绝不能让后端陪着它一起僵死。读仍用原句柄（`PeekNamedPipe`/`ReadFile` 语义不变）。
+        ⚠️ 这里曾经真的复制一个 `PIPE_NOWAIT` 句柄来避免"对端不读时永久阻塞"，
+        但实测（2026-09-21，E82）：`PIPE_NOWAIT` 会让**正常场景**也频繁失败
+        （`err=232 ERROR_NO_DATA`，客户端明明在正常读）⇒ 客户端被误剔除、界面收不到推送。
+        **正确做法是"写之前确认缓冲有空位、有限等待"，保持在阻塞句柄上工作**
+        （见 `_write_raw` 的说明）。这个函数保留成"直接返回原句柄"，是为了让
+        `_spawn_client` / `_drop_client` 里"两个句柄可能不同"的处理不必大改。
         """
-        import ctypes
-        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
-        # ⚠️ 每个函数的 restype/argtypes 都必须写全：`GetCurrentProcess` 返回**句柄**，
-        # 不设 restype 会按 c_int 截断成 32 位（64 位下句柄是 64 位）⇒ DuplicateHandle 必失败。
-        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
-        kernel32.DuplicateHandle.restype = ctypes.c_int
-        kernel32.DuplicateHandle.argtypes = [
-            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
-            ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
-        kernel32.SetNamedPipeHandleState.restype = ctypes.c_int
-        kernel32.SetNamedPipeHandleState.argtypes = [
-            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p, ctypes.c_void_p]
-        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
-
-        cur = ctypes.c_void_p(0)
-        proc = kernel32.GetCurrentProcess()
-        ok = kernel32.DuplicateHandle(ctypes.c_void_p(proc), ctypes.c_void_p(handle),
-                                      ctypes.c_void_p(proc), ctypes.byref(cur),
-                                      0, 0, 0x00000002)      # DUPLICATE_SAME_ACCESS
-        if not ok or not cur.value:
-            raise OSError(f'DuplicateHandle 失败 err={ctypes.get_last_error()}')
-        PIPE_NOWAIT = ctypes.c_uint32(0x00000001)
-        ok = kernel32.SetNamedPipeHandleState(ctypes.c_void_p(cur.value),
-                                              ctypes.byref(PIPE_NOWAIT), None, None)
-        if not ok:
-            err = ctypes.get_last_error()
-            kernel32.CloseHandle(ctypes.c_void_p(cur.value))
-            raise OSError(f'SetNamedPipeHandleState(PIPE_NOWAIT) 失败 err={err}')
-        return cur.value
+        return handle
 
     @staticmethod
     def _write_raw(handle, text):
@@ -434,18 +400,61 @@ class PipeServer:
         我们把异常抛给 `_writer`，由它剔除该客户端。
         """
         import ctypes
-        kernel32 = ctypes.windll.kernel32
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
         data = text.encode('ascii', 'replace')
         kernel32.WriteFile.restype = ctypes.c_int
         kernel32.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
                                        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
+        kernel32.PeekNamedPipe.restype = ctypes.c_int
+        kernel32.PeekNamedPipe.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32)]
+        kernel32.GetNamedPipeInfo.restype = ctypes.c_int
+        kernel32.GetNamedPipeInfo.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32)]
+
+        # ⚠️⚠️ 这一段的来龙去脉值得完整记下来（2026-09-21，E82）—— 前后试了三种方案：
+        #   ① 直接 `WriteFile`（阻塞句柄）：对端不读时会**永久阻塞**，而 ctypes 调用
+        #      **不释放 GIL** ⇒ 整个后端冻死（/api/status 超时、/api/shutdown 不响应）。
+        #   ② 复制一个 `PIPE_NOWAIT` 句柄：不再冻死，但**普通场景下也会频繁失败**
+        #      （实测 `err=232 ERROR_NO_DATA`，客户端明明在正常读）⇒ 客户端被误剔除、
+        #      界面从此收不到推送。**不可用**。
+        #   ③ 现在的做法：**保留阻塞句柄，但写之前先确认缓冲有空位**；没有空位就短暂等待
+        #      （有上限），等不到再剔除该客户端。既不冻死，也不会误杀正常客户端。
+        # 判据：**"非阻塞"不是免费的** —— 对管道这种带缓冲的 IPC，正确做法是"有限等待
+        # 可用空间"，而不是把句柄改成非阻塞（那会改变正常路径的语义）。
+        out_buf = ctypes.c_uint32(0)
+        kernel32.GetNamedPipeInfo(ctypes.c_void_p(handle), None, ctypes.byref(out_buf),
+                                  None, None)
+        capacity = int(out_buf.value) or 65536
+        margin = max(1024, len(data) + 256)      # 留出本条消息 + 余量
+        last = ''
+        deadline = time.time() + 2.0             # 最多等 2 秒腾出空间
+        while True:
+            avail = ctypes.c_uint32(0)
+            if kernel32.PeekNamedPipe(ctypes.c_void_p(handle), None, 0, None,
+                                      ctypes.byref(avail), None):
+                if avail.value + margin <= capacity:
+                    break
+            else:
+                err = ctypes.get_last_error()
+                raise OSError(f'PeekNamedPipe 失败 err={err}（对端多半已关闭）')
+            if time.time() > deadline:
+                raise OSError(
+                    f'对端读取积压过多（{avail.value}/{capacity} 字节），'
+                    f'等待 2 秒仍未腾出空间')
+            last = f'{avail.value}/{capacity}'
+            time.sleep(0.05)
+
         written = ctypes.c_uint32(0)
         ok = kernel32.WriteFile(ctypes.c_void_p(handle), data, len(data),
                                 ctypes.byref(written), None)
-        if not ok:
-            raise OSError(f'WriteFile 失败 err={ctypes.get_last_error()}')
-        if written.value != len(data):
-            raise OSError(f'WriteFile 只写了 {written.value}/{len(data)} 字节')
+        if not ok or written.value != len(data):
+            err = ctypes.get_last_error()
+            raise OSError(f'WriteFile 未写完 ok={bool(ok)} wrote={written.value}/{len(data)} '
+                          f'err={err} (buffered={last})')
 
     def _drop_client(self, cid):
         with self._lock:

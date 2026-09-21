@@ -242,12 +242,25 @@ def main() -> int:
           seen == [1.0, 1.5, 2.0, 3.0] or sorted(set(seen)) == [1.0, 1.5, 2.0, 3.0],
           str(seen))
     # 未选页时不发 select_page
+    #
+    # ⚠️⚠️ 这里**必须**在用完立刻恢复 `control`（2026-09-21 实测踩到）：
+    # 我原来把它换成 stub 后没恢复，于是**后面 §D 的"真后端"其实一直在用 stub**，
+    # `_get` 也被 `{}` 掉 ⇒ 报出 "GET /api/status 可用 -- {}" 这种假失败。
+    # 教训：**测试里替换被测对象的方法，用完必须还原**，否则污染后续所有断言，
+    # 而且报出来的错会指向完全无关的地方。
     calls = []
+    _real_control_for_b = win.client.control
     win.client.control = lambda a, p=None: (calls.append((a, p)), (True, 'stub'))[1]  # type: ignore
-    win.page_box.setCurrentIndex(0)          # 索引 0 = "未选择"
-    win._on_page_picked(0)
+    try:
+        win.page_box.setCurrentIndex(0)          # 索引 0 = "未选择"
+        win._on_page_picked(0)
+    finally:
+        win.client.control = _real_control_for_b    # type: ignore
     check('未选择网页时不发 select_page', not any(c[0] == 'select_page' for c in calls),
           str(calls))
+    check('（自检自身）stub 已还原，后续用的是真 control',
+          win.client.control is _real_control_for_b or
+          getattr(win.client.control, '__self__', None) is not None)
 
     print('\n=== C. 设置对话框：只提交改动过的键 ===')
     dlg = SettingsDialog(win.client, win)
@@ -395,6 +408,59 @@ def main() -> int:
     win._apply_pages(['page-A', 'page-B', 'page-C'])
     check('列表没变时不重建下拉框（去重生效）',
           win.page_box.count() == n_before, f'{n_before} -> {win.page_box.count()}')
+
+    print('\n=== G. 后端调用不许阻塞 UI 线程（用户报"点下一章卡死一下"）===')
+    # ⚠️ 这一段的判据很直接：**在 UI 线程里调这些动作，函数必须立刻返回**。
+    # 原来的写法是在 UI 线程上同步 `self.client.control('next_page')`（HTTP，
+    # timeout 300s，后端一次翻页正常 2~8 秒）⇒ Qt 事件循环被堵死 ⇒ 界面卡住不重绘。
+    # 这里用一个"会睡 2 秒"的假 control 来代表慢后端：真异步的话调用方 100ms 内就回来。
+    import threading as _th
+    import time as _time
+
+    slow_calls = []
+
+    def _slow_control(action, params=None):
+        slow_calls.append(action)
+        _time.sleep(2.0)                    # 模拟慢后端
+        return True, f'stub-{action}'
+
+    real_control = win.client.control
+    real_call_async = win.client.call_async
+    win.client.control = _slow_control      # type: ignore
+
+    t0 = _time.time()
+    win._on_next_page()                     # 用户点「下一章」
+    elapsed = _time.time() - t0
+    check('点「下一章」立刻返回（不阻塞 UI 线程）', elapsed < 0.5, f'耗时 {elapsed:.2f}s')
+    check('「下一章」期间按钮显示进行中并可用（给了用户反馈）',
+          win.next_btn.text() == '翻页中…', win.next_btn.text())
+
+    t0 = _time.time()
+    win._control('diagnose')
+    elapsed = _time.time() - t0
+    check('诊断/刷新类动作也立刻返回', elapsed < 0.5, f'耗时 {elapsed:.2f}s')
+
+    # 后台线程真的把动作发出去了（不然"不阻塞"只是没干活）
+    deadline = _time.time() + 3
+    while not slow_calls and _time.time() < deadline:
+        app.processEvents()
+        _time.sleep(0.05)
+    check('后台线程确实发出了后端请求', len(slow_calls) >= 1, str(slow_calls))
+
+    # 结果回来时会复位按钮（用 on_done 通道直接喂一次）
+    win._on_action_done('next_page', True, '已翻页：【a】→【b】')
+    check('动作完成后「下一章」按钮复位',
+          win.next_btn.text() == '下一章', win.next_btn.text())
+    check('动作完成后按钮重新可用', win.next_btn.isEnabled())
+
+    # 等后台那两个 2 秒的 stub 跑完，避免退出时线程还在访问已销毁的对象
+    for _ in range(60):
+        if len(slow_calls) >= 2:
+            break
+        app.processEvents()
+        _time.sleep(0.1)
+    win.client.control = real_control      # type: ignore
+    win.client.call_async = real_call_async  # type: ignore
 
     print()
     bad = sum(1 for _n, ok, _d in RESULTS if not ok)

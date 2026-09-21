@@ -33,6 +33,43 @@ from PySide6.QtCore import QObject, Signal
 
 READY_TOKEN = 'learn-helper-backend-ready'
 
+# 本机回环一律直连（绕开系统代理），并**禁用 HTTP keep-alive**。
+#
+# ⚠️ 为什么要加 `Connection: close`（2026-09-21 实测）：
+# 后端是 `http.server.ThreadingHTTPServer`，它对空闲连接的保活行为不受我们控制；
+# 客户端复用一条已被服务端关掉的连接时会报
+#   `Connection aborted.', ConnectionResetError(10054, '远程主机强迫关闭了一个现有的连接')`
+# 或 `Max retries exceeded`。
+# 现象很误导人：**同一个后端**，`/api/settings` 成功、紧随其后的 `/api/status` 失败
+#（前者复用了连接池里刚建好的连接，后者拿到的是刚被服务端关掉的那条）。
+# 回环请求本来就亚毫秒级，每次新建连接的开销可以忽略，所以直接关掉 keep-alive 最省事。
+_NO_PROXY = {'http': None, 'https': None}
+_NO_KEEPALIVE = {'Connection': 'close'}
+
+
+def _session() -> requests.Session:
+    s = requests.Session()
+    s.trust_env = False          # 忽略 HTTP_PROXY 等环境变量
+    s.headers.update(_NO_KEEPALIVE)
+    return s
+
+
+_tls = threading.local()
+
+
+def _thread_session() -> requests.Session:
+    """**每个线程一个**会话。
+
+    ⚠️ HTTP 调用来自多个线程（轮询线程、管道线程、每个后台动作线程），
+    而 `requests.Session` 官方并不保证线程安全 ⇒ 用 thread-local 各持一份最省心
+    （又因为禁用了 keep-alive，也不存在"连接池被别人用着"的问题）。
+    """
+    s = getattr(_tls, 'sess', None)
+    if s is None:
+        s = _session()
+        _tls.sess = s
+    return s
+
 
 def _app_dir() -> str:
     """界面应该把**自己的运行时数据**（config.json / logs / native-diag.log）放在哪。
@@ -57,8 +94,6 @@ def _app_dir() -> str:
 PROJECT_DIR = _app_dir()
 BACKEND_ENTRY = os.path.join(PROJECT_DIR, 'backend', 'main.py')
 
-_NO_PROXY = {'http': None, 'https': None}
-
 
 def _truncate(text: str, limit: int) -> str:
     """按**字符**截断（中文安全）。"""
@@ -75,6 +110,10 @@ class BackendClient(QObject):
     failed = Signal(str)
     status_changed = Signal()         # 拉到新 status 时通知界面刷新
     pages_changed = Signal(list)
+    # 异步控制动作的返回：(动作名, ok, 消息)。**绝不在 UI 线程上同步等结果**（见 call_async）
+    action_done = Signal(str, bool, str)
+    # 异步读取设置的结果（`/api/settings` 也是 HTTP，同样不能堵 UI 线程）
+    settings_read = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -89,6 +128,72 @@ class BackendClient(QObject):
         self._pipe_thread: Optional[threading.Thread] = None
         self._last_status: dict = {}
         self._trace_hook: Optional[Callable[[str], None]] = None
+        self._action_seq = 0
+
+    # ---------------------------------------------------------------- 异步动作
+    def call_async(self, action: str, params: Optional[dict] = None,
+                   on_done: Optional[Callable[[bool, str], None]] = None) -> None:
+        """在**后台线程**里发一个控制动作，完成后用 `action_done` 信号回主线程。
+
+        `on_done` 给"只想在这个对话框里接结果"的调用方用（信号是全局广播的，
+        对话框不该收到别人的结果）—— 它**在 UI 线程**里被调用。
+
+        ⚠️⚠️ 这里修的是用户报的"点「下一章」经常卡死一下"（2026-09-21）。
+        原来界面在 **UI 线程**上直接 `control(action)`，而这是个 HTTP 请求：
+        · `control` 的 timeout 是 **300 秒**；
+        · 后端做一次 `next_page` 要"连 CDP → 找按钮 → 点击 → 轮询最多 6 秒等确认弹窗
+          → 再等标题变化"，正常也要 2~8 秒，慢的时候更久。
+        这段时间里 Qt 的事件循环被**完全堵住** ⇒ 界面不重绘、按钮点不动、拖动都没反应，
+        用户看到的就是"卡死一下"。
+        **判据：任何可能超过 ~100ms 的调用都不许放在 UI 线程上**（网络、CDP、子进程都算）。
+        """
+        self._action_seq += 1
+        seq = self._action_seq
+        self._trace(f'ui: invoke {action}' + (f' #{seq}' if seq else ''))
+
+        def _work():
+            try:
+                ok, msg = self.control(action, params)
+            except Exception as e:                      # pragma: no cover - 兜底
+                ok, msg = False, f'{type(e).__name__}: {e}'
+            self._trace(f'ui: {action} -> {"OK" if ok else "FAIL"} {_truncate(msg, 200)}')
+            if on_done is not None:
+                try:
+                    on_done(bool(ok), str(msg))
+                except Exception as e:                  # pragma: no cover
+                    self._trace(f'ui: on_done({action}) 抛异常: {e}')
+                return
+            self.action_done.emit(action, bool(ok), str(msg))
+
+        threading.Thread(target=_work, daemon=True, name=f'action-{action}').start()
+
+    def call_async_result(self, action: str, params: Optional[dict] = None,
+                          on_done: Optional[Callable[[bool, str], None]] = None) -> None:
+        """同 `call_async`，但走 `put_settings`（设置类写入）。"""
+        self._action_seq += 1
+        self._trace(f'ui: invoke {action}(settings)')
+
+        def _work():
+            ok, msg = self.put_settings(params or {})
+            self._trace(f'ui: {action} -> {"OK" if ok else "FAIL"} {_truncate(msg, 200)}')
+            if on_done is not None:
+                try:
+                    on_done(bool(ok), str(msg))
+                except Exception:                       # pragma: no cover
+                    pass
+                return
+            self.action_done.emit(action, bool(ok), str(msg))
+
+        threading.Thread(target=_work, daemon=True, name=f'action-{action}').start()
+
+    def read_settings_async(self) -> None:
+        """后台读设置，结果用 `settings_read` 发回主线程。"""
+        def _work():
+            cfg = self.settings()
+            data = cfg.get('data') or cfg or {}
+            self.settings_read.emit(dict(data))
+
+        threading.Thread(target=_work, daemon=True, name='read-settings').start()
 
     # ---------------------------------------------------------------- 启动
     def set_trace_hook(self, hook: Callable[[str], None]) -> None:
@@ -205,7 +310,7 @@ class BackendClient(QObject):
         # 健康检查（最多重试几次，后端刚起时 HTTP 还没 listen）
         for i in range(1, 11):
             try:
-                r = requests.get(f'{self.base_url}/api/health', timeout=3, proxies=_NO_PROXY)
+                r = _thread_session().get(f'{self.base_url}/api/health', timeout=3, proxies=_NO_PROXY)
                 if r.status_code == 200:
                     self._trace(f'backend: health attempt={i} status=200')
                     break
@@ -307,15 +412,33 @@ class BackendClient(QObject):
             # 管道若还活着，它推送的事件会比轮询更快到；两条路都更新同一个 model，无冲突。
 
     # ---------------------------------------------------------------- HTTP
-    def _get(self, path: str, timeout: float = 8.0) -> dict:
+    def _get(self, path: str, timeout: float = 8.0, retries: int = 2) -> dict:
+        """GET 一个本机接口。**对瞬时连接错误重试**。
+
+        ⚠️ 为什么要重试（2026-09-21 实测）：后端是 `http.server.ThreadingHTTPServer`，
+        多个线程（轮询线程 + 界面线程 + 后台动作线程）同时打它时，偶发
+        `Connection aborted / ConnectionResetError(10054)` 或
+        `Max retries exceeded`。这类错误**下一次请求就好了**，属于回环连接的正常抖动；
+        不重试的话界面会间歇性地"这一秒状态是空的"（自检里表现为
+        `/api/status 可用 -- {}` 这种时红时绿）。
+        回环请求是亚毫秒级，重试两次的代价可以忽略。
+        """
         if not self.connected_ok:
             return {}
-        try:
-            r = requests.get(f'{self.base_url}{path}', timeout=timeout, proxies=_NO_PROXY)
-            return r.json() if r.content else {}
-        except Exception as e:
-            self._trace(f'backend: GET {path} 失败: {_truncate(str(e), 80)}')
-            return {}
+        last = ''
+        for attempt in range(retries + 1):
+            try:
+                r = _thread_session().get(f'{self.base_url}{path}', timeout=timeout,
+                                          proxies=_NO_PROXY, headers=_NO_KEEPALIVE)
+                return r.json() if r.content else {}
+            except Exception as e:
+                last = f'{type(e).__name__}: {e}'
+                if attempt < retries:
+                    time.sleep(0.15 * (attempt + 1))
+                    continue
+                self._trace(f'backend: GET {path} 失败（重试 {retries} 次后）: '
+                            f'{_truncate(last, 90)}')
+        return {}
 
     def status(self) -> dict:
         return self._get('/api/status', timeout=5)
@@ -335,7 +458,7 @@ class BackendClient(QObject):
         if params:
             body.update(params)
         try:
-            r = requests.post(f'{self.base_url}/api/control', json=body,
+            r = _thread_session().post(f'{self.base_url}/api/control', json=body,
                               timeout=300, proxies=_NO_PROXY)
             data = r.json() if r.content else {}
             return bool(data.get('ok')), str(data.get('message') or '')
@@ -346,7 +469,7 @@ class BackendClient(QObject):
         if not self.connected_ok:
             return False, '后端未就绪'
         try:
-            r = requests.put(f'{self.base_url}/api/settings', json=patch,
+            r = _thread_session().put(f'{self.base_url}/api/settings', json=patch,
                              timeout=20, proxies=_NO_PROXY)
             data = r.json() if r.content else {}
             return bool(data.get('ok')), str(data.get('message') or '')
@@ -367,7 +490,7 @@ class BackendClient(QObject):
         self._stop.set()
         if self.connected_ok:
             try:
-                requests.post(f'{self.base_url}/api/shutdown', json={},
+                _thread_session().post(f'{self.base_url}/api/shutdown', json={},
                               timeout=3, proxies=_NO_PROXY)
             except Exception:
                 pass
