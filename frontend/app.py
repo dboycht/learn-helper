@@ -709,10 +709,21 @@ class MainWindow(QMainWindow):
         # 不会发 `action_done` 信号 ⇒ 如果只在 `_on_action_done` 里清，
         # 「检测/刷新网页」按钮会**一直保持禁用**（实测踩到）。
         self._set_busy('launch_browser', False)
-        self.diag(f'ui: launch_browser -> {"OK" if ok else "FAIL"} {msg[:100]}')
+        self.diag(f'ui: launch_browser done -> {"OK" if ok else "FAIL"} {msg[:80]}')
         self._append_log(f'[浏览器] {msg}' if msg else '[浏览器] 已启动')
-        # 浏览器启动 + 页面就绪需要几秒，隔一会儿再刷（异步）
-        QTimer.singleShot(5000, lambda: self._control('refresh_pages'))
+        # 浏览器启动 + 页面就绪需要几秒，之后**连刷几次**把页面列表补上。
+        # ⚠️ 实测只刷一次不够：浏览器"已打开"到标签页真正可枚举之间有窗口期，
+        # 那一次可能仍然拿到空列表（后端报 ECONNREFUSED / 0 个标签页），
+        # 于是下拉框一直停在"未检测到网页"，用户以为坏了。
+        for delay in (4000, 8000, 14000):
+            QTimer.singleShot(delay, self._refresh_if_no_pages)
+
+    def _refresh_if_no_pages(self) -> None:
+        """页面列表还是空就再刷一次（有列表就不再打扰后端）。"""
+        if self._pages:
+            return
+        self.diag('ui: 页面列表仍为空 -> 再刷一次')
+        self._control('refresh_pages')
 
     def _on_failed(self, msg: str) -> None:
         self.diag(f'backend: FAILED {msg}')

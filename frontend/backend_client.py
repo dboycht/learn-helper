@@ -112,6 +112,8 @@ class BackendClient(QObject):
     pages_changed = Signal(list)
     # 异步控制动作的返回：(动作名, ok, 消息)。**绝不在 UI 线程上同步等结果**（见 call_async）
     action_done = Signal(str, bool, str)
+    # 一次性回调的派发信号：(token, ok, 消息)。见 call_async 的说明（回调必须回主线程）
+    _callback_ready = Signal(str, bool, str)
     # 异步读取设置的结果（`/api/settings` 也是 HTTP，同样不能堵 UI 线程）
     settings_read = Signal(dict)
 
@@ -129,6 +131,30 @@ class BackendClient(QObject):
         self._last_status: dict = {}
         self._trace_hook: Optional[Callable[[str], None]] = None
         self._action_seq = 0
+        # 一次性回调表（token -> callable）。见 call_async 的说明。
+        self._callbacks: dict = {}
+        self._callback_ready.connect(self._dispatch_callback)
+
+    # ---------------------------------------------------------------- 回调派发
+    def _dispatch_callback(self, token: str, ok: bool, msg: str) -> None:
+        """**在主线程**执行一次性回调。
+
+        ⚠️⚠️ 这段修的是一个又隐蔽又危险的 bug（2026-09-21，E84）：
+        原来 `call_async(..., on_done=cb)` 是**在后台线程里直接调 `cb`** 的。后果有两个：
+        1. 回调里 `QTimer.singleShot(...)` **完全无效**，Qt 会打印
+           `QObject::startTimer: Timers can only be used with threads started with QThread`
+           —— 于是"开完浏览器 4/8/14 秒后补刷页面列表"**一次都没跑**，下拉框一直空着；
+        2. 更严重：回调里改界面（`_append_log` / 按钮文字 / 状态栏）是**从非 GUI 线程碰 Qt 控件**，
+           属于未定义行为，随时可能随机崩溃。
+        修法：后台线程只 `emit`，由**主线程**经信号执行回调（token 派发，避免连接泄漏）。
+        """
+        cb = self._callbacks.pop(token, None)
+        if cb is None:
+            return
+        try:
+            cb(ok, msg)
+        except Exception as e:                          # pragma: no cover
+            self._trace(f'ui: on_done 回调抛异常: {type(e).__name__}: {e}')
 
     # ---------------------------------------------------------------- 异步动作
     def call_async(self, action: str, params: Optional[dict] = None,
@@ -150,6 +176,12 @@ class BackendClient(QObject):
         self._action_seq += 1
         seq = self._action_seq
         self._trace(f'ui: invoke {action}' + (f' #{seq}' if seq else ''))
+        # 有回调就登记一个 token：后台线程完成后只 emit，**由主线程**执行回调
+        #（直接在后台线程调回调会导致 QTimer 失效 + 从非 GUI 线程碰控件，见 _dispatch_callback）
+        token: Optional[str] = None
+        if on_done is not None:
+            token = f'{action}#{seq}'
+            self._callbacks[token] = on_done
 
         def _work():
             try:
@@ -157,11 +189,9 @@ class BackendClient(QObject):
             except Exception as e:                      # pragma: no cover - 兜底
                 ok, msg = False, f'{type(e).__name__}: {e}'
             self._trace(f'ui: {action} -> {"OK" if ok else "FAIL"} {_truncate(msg, 200)}')
-            if on_done is not None:
-                try:
-                    on_done(bool(ok), str(msg))
-                except Exception as e:                  # pragma: no cover
-                    self._trace(f'ui: on_done({action}) 抛异常: {e}')
+            if token is not None:
+                # ⚠️ 只 emit，**不在这里调回调** —— 回调必须在主线程跑（见 _dispatch_callback）
+                self._callback_ready.emit(token, bool(ok), str(msg))
                 return
             self.action_done.emit(action, bool(ok), str(msg))
 
@@ -171,16 +201,18 @@ class BackendClient(QObject):
                           on_done: Optional[Callable[[bool, str], None]] = None) -> None:
         """同 `call_async`，但走 `put_settings`（设置类写入）。"""
         self._action_seq += 1
+        seq = self._action_seq
         self._trace(f'ui: invoke {action}(settings)')
+        token: Optional[str] = None
+        if on_done is not None:
+            token = f'{action}#{seq}'
+            self._callbacks[token] = on_done
 
         def _work():
             ok, msg = self.put_settings(params or {})
             self._trace(f'ui: {action} -> {"OK" if ok else "FAIL"} {_truncate(msg, 200)}')
-            if on_done is not None:
-                try:
-                    on_done(bool(ok), str(msg))
-                except Exception:                       # pragma: no cover
-                    pass
+            if token is not None:
+                self._callback_ready.emit(token, bool(ok), str(msg))
                 return
             self.action_done.emit(action, bool(ok), str(msg))
 
