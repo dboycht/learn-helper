@@ -64,6 +64,14 @@ pub const WM_MOUSEWHEEL: u32 = 0x020A;
 /// 没有它的话 `hover` 会一直停在"最后命中的那个控件"上 —— 鼠标离开窗口后控件仍高亮，
 /// 日志滚动条还会继续吞滚轮（2.1.3 实测踩到）。
 pub const WM_MOUSELEAVE: u32 = 0x02A3;
+/// 系统开始/结束"移动或缩放窗口"（`SC_MOVE`/`SC_SIZE` 或拖边框时由系统发出）。
+/// 我们用它在拖动期间**跳过重绘**：拖动会连续触发 `WM_SIZE`，而我们的每帧绘制是整窗
+/// 全量 GDI（180 万像素），不跳过的话跟随鼠标的重绘会明显卡顿/发抖（2026-09-21 实测）。
+pub const WM_ENTERSIZEMOVE: u32 = 0x0231;
+pub const WM_EXITSIZEMOVE: u32 = 0x0232;
+/// 显示器配置变化（拔插外接屏 / 改分辨率 / 改缩放）。用它触发"把窗口拉回可见区域"的兜底 ——
+/// 这是一般情况下唯一真会让窗口落到不存在的工作区里、从而抓不回来的场景。
+pub const WM_DISPLAYCHANGE: u32 = 0x007E;
 pub const WM_KEYDOWN: u32 = 0x0100;
 pub const WM_KEYUP: u32 = 0x0101;
 pub const WM_CHAR: u32 = 0x0102;
@@ -104,6 +112,8 @@ pub const HTBOTTOM: LRESULT = 15;
 pub const HTBOTTOMLEFT: LRESULT = 16;
 pub const HTBOTTOMRIGHT: LRESULT = 17;
 
+pub const SC_SIZE: WPARAM = 0xF000;
+pub const SC_MOVE: WPARAM = 0xF010;
 pub const SC_MINIMIZE: WPARAM = 0xF020;
 pub const SC_MAXIMIZE: WPARAM = 0xF030;
 pub const SC_RESTORE: WPARAM = 0xF120;

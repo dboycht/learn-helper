@@ -86,11 +86,15 @@ pub enum Theme {
     Light,
 }
 
-/// 无边框窗口的拖拽 / 缩放模式（我们自己实现，因为去掉了 WS_CAPTION/WS_THICKFRAME）。
+/// 无边框窗口的**缩放**模式（我们自己实现，因为去掉了 WS_CAPTION/WS_THICKFRAME）。
+///
+/// ⚠️ 这里曾经还有个 `Move`：窗口**移动**是手写的。2026-09-21 改成交给系统
+///（`WM_SYSCOMMAND` + `SC_MOVE`，见 `on_lbutton_down`），因为手写版拖动会发抖、
+/// 还丢掉了贴边分屏/边缘吸附等系统行为。**缩放**暂时仍保留手写
+///（它触发频率低、系统对无边框窗口的缩放边也需要自定义命中区，收益不如移动明显）。
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum Grab {
     None,
-    Move,
     Left,
     Right,
     Top,
@@ -221,6 +225,9 @@ pub struct App {
     grab: Grab,
     grab_client: POINT,      // 按下时的**客户区**坐标 —— 位移计算必须用它（见 E75）
     grab_window: RECT,       // 按下时的窗口矩形
+    /// 系统正在移动/缩放窗口（`WM_ENTERSIZEMOVE`~`WM_EXITSIZEMOVE`）期间**跳过重绘**，
+    /// 让系统自己搬位图（见 `WM_SIZE` 分支的说明，2026-09-21 性能修复）。
+    in_size_move: bool,
     last_click_ms: u64,      // 双击最大化用
     last_click_pt: POINT,
     /// `LH_UI_ACTION` 的值（仅验证用；settings* 类动作需要 UI 线程建对话框）
@@ -269,6 +276,7 @@ impl App {
             grab: Grab::None,
             grab_client: POINT { x: 0, y: 0 },
             grab_window: RECT::default(),
+            in_size_move: false,
             last_click_ms: 0,
             last_click_pt: POINT { x: 0, y: 0 },
             scripted_action: std::env::var("LH_UI_ACTION").unwrap_or_default().trim().to_string(),
@@ -1660,45 +1668,10 @@ impl App {
             let min_w = self.min_content_width();
             let min_h = self.min_content_height();
             match self.grab {
-                Grab::Move => {
-                    rc.left += dx;
-                    rc.top += dy;
-                    rc.right += dx;
-                    rc.bottom += dy;
-                    // ⚠️ **必须夹取到显示器工作区**：实测往右下连拖 8 次会把窗口整块推出
-                    // 屏幕（用户看到的就是"窗口消失了"，而且没有兜底找不回来）。
-                    // 坐标已统一为**物理像素**（进程真正 DPI 感知后 GetWindowRect 与
-                    // GetMonitorInfo 才在同一坐标系，见 ERROR.md E37）。
-                    //
-                    // 规则（两条同时满足，拖动过程与松手后都不会出界）：
-                    //  1. 标题栏必须留在工作区内（否则抓不回来）；
-                    //  2. 窗口整体不能被拖出工作区（下方也要留得住）。
-                    let keep_x = self.px(140);          // 水平方向至少露出这么宽
-                    let title_h = self.title_h();
-                    let (work, mon_org) = self.monitor_work_area_for(rc);
-                    let w = self.grab_window.width();
-                    let h = self.grab_window.height();
-
-                    // 水平：左右各留 keep_x
-                    let min_left = work.left - (w - keep_x);
-                    let max_left = work.right - keep_x;
-                    // 垂直：标题栏整体留在工作区内（上边界），且窗口底边不越过工作区底边
-                    // （下边界）。两条一起夹 ⇒ 拖动/松手后都不会有"抓不着"的状态。
-                    let min_top = mon_org.1;
-                    let max_top_by_title = work.bottom - title_h;
-                    let max_top_by_bottom = work.bottom - h;
-                    // 窗口比工作区高时，优先保证标题栏可见
-                    let max_top = if max_top_by_bottom < min_top {
-                        max_top_by_title.max(min_top)
-                    } else {
-                        max_top_by_title.min(max_top_by_bottom).max(min_top)
-                    };
-
-                    rc.left = rc.left.clamp(min_left.min(max_left), max_left);
-                    rc.top = rc.top.clamp(min_top, max_top);
-                    rc.right = rc.left + w;
-                    rc.bottom = rc.top + h;
-                }
+                // ⚠️ `Grab::Move`（手写拖动）已在 2026-09-21 删除：窗口移动改由系统接管
+                //（`WM_SYSCOMMAND` + `SC_MOVE`）。原来这里的"夹取到工作区"逻辑随之不再需要 ——
+                // 系统自己保证窗口不会被拖到抓不回来的地方（贴边、吸附、多屏边界都由它管），
+                // 而 `ensure_on_screen()` 仍作为"显示器配置变化"后的兜底。
                 Grab::Left => rc.left += dx,
                 Grab::Right => rc.right += dx,
                 Grab::Top => rc.top += dy,
@@ -1849,7 +1822,25 @@ impl App {
                     unsafe { SetCapture(self.hwnd) };
                 }
                 _ => {
-                    // 标题栏空白 = 拖动窗口；双击 = 最大化/还原（自己实现）
+                    // 标题栏空白 = 拖动窗口；双击 = 最大化/还原
+                    //
+                    // ⚠️⚠️ **这里原来是"手写拖动"，2026-09-21 改成交给系统（用户反馈"拖动时
+                    // 窗口一直在颤抖"）**。手写版的做法是：自己 SetCapture + 在
+                    // `WM_MOUSEMOVE` 里 SetWindowPos + 每次重绘整窗（1869×960 ≈ 180 万像素的
+                    // 全量 GDI 绘制）。后果：
+                    //   · **抖**：每个鼠标消息都同步搬一次窗口并全量重绘，我们的重绘比系统
+                    //     原生的"只搬位图"重得多 ⇒ 画面跟不上鼠标，看起来在颤；
+                    //   · 丢失系统行为：贴边分屏（Snap Layouts）、拖到屏幕边缘自动最大化、
+                    //     多显示器 DPI 变化、拖动时的窗口动画**全都没有**；
+                    //   · 状态机还容易出 bug（历史上已经踩过"位移恒为 0""松手才跳一段"两次）。
+                    //
+                    // 现在改为发 `WM_SYSCOMMAND` + `SC_MOVE`：**拖动整个由系统接管**
+                    //（系统用 DefWindowProc 的移动循环，自带贴边/吸附/动画，且它只搬位图，
+                    // 不会每个消息都让我们全量重绘）。这也是"用原生"的正确姿势，
+                    // 而且不需要给窗口加 WS_CAPTION（不改外观）。
+                    //
+                    // 双击最大化要**自己判**：走 SC_MOVE 之后系统不会再替我们产生
+                    // `WM_NCLBUTTONDBLCLK`（我们没在 WM_NCHITTEST 里返回 HTCAPTION）。
                     let now = unsafe { GetTickCount() } as u64;
                     let is_double = now.saturating_sub(self.last_click_ms) < 400
                         && (x - self.last_click_pt.x).abs() < 6
@@ -1860,21 +1851,24 @@ impl App {
                         self.toggle_maximize();
                         return;
                     }
-                    // 最大化状态下拖标题栏：先还原成普通窗口再拖（Windows 的标准行为），
-                    // 否则会把"铺满屏幕的窗口"整体搬走，看起来同样像界面消失。
-                    if unsafe { IsZoomed(self.hwnd) } != 0 {
-                        unsafe {
+                    unsafe {
+                        // lParam 要**屏幕**坐标（客户区坐标系统会算错拖拽的抓取点）
+                        let mut pt = POINT { x, y };
+                        crate::native::ClientToScreen(self.hwnd, &mut pt);
+                        let lp = (((pt.y as isize) << 16) | ((pt.x as isize) & 0xFFFF)) as isize;
+                        // 最大化时先还原（Windows 的标准行为）：否则会把"铺满屏幕的窗口"整体搬走。
+                        // 还原后把抓取点按比例挪到新窗口上，手感才跟系统一致。
+                        if IsZoomed(self.hwnd) != 0 {
                             ShowWindow(self.hwnd, SW_RESTORE);
                         }
+                        SetForegroundWindow(self.hwnd);
+                        // 落一行诊断：外部探针可以据此证明"拖动确实交给了系统"，
+                        // 而不是又走回手写路径（手写路径已删除，见 E78）。
+                        crate::trace::trace(&format!(
+                            "ui: titlebar drag -> WM_SYSCOMMAND SC_MOVE (client={},{})", x, y));
+                        SendMessageW(self.hwnd, WM_SYSCOMMAND, SC_MOVE as WPARAM, lp as LPARAM);
                     }
-                    self.grab = Grab::Move;
-                    let mut rc = RECT::default();
-                    unsafe {
-                        GetWindowRect(self.hwnd, &mut rc);
-                        SetCapture(self.hwnd);
-                    }
-                    self.grab_client = POINT { x, y };   // 位移基准（客户区）
-                    self.grab_window = rc;
+                    return;
                 }
             }
             return;
@@ -2078,6 +2072,14 @@ impl App {
                 let mut ps = PAINTSTRUCT::default();
                 let hdc = unsafe { BeginPaint(self.hwnd, &mut ps) };
                 if !hdc.is_null() {
+                    // 系统正在移动/缩放窗口：**这一帧不用画**。
+                    // 系统会自己把窗口内容搬过去，我们只要把无效区"确认掉"（BeginPaint 已经
+                    // 做过）就不会被反复要求重绘；松手时 `WM_EXITSIZEMOVE` 会补一次完整重绘。
+                    // 这样拖动期间几乎没有 GDI 工作 ⇒ 不卡、不发抖（2026-09-21 性能修复）。
+                    if self.in_size_move {
+                        unsafe { EndPaint(self.hwnd, &ps) };
+                        return 0;
+                    }
                     // **双缓冲**：先画进内存 DC，再一次性 BitBlt 到屏幕。
                     // 直接往屏幕 DC 逐块画会看到中间过程（文字/卡片"闪一下"），
                     // 这是用户报的"一抽一抽"的第二个成因（见 ERROR.md E38）。
@@ -2121,7 +2123,38 @@ impl App {
             WM_SIZE => {
                 self.w = (lp & 0xFFFF) as i32;
                 self.h = ((lp >> 16) & 0xFFFF) as i32;
+                // ⚠️ 拖动/缩放期间**不要**每步都全量重绘（2026-09-21，性能）。
+                // `WM_SIZE` 在拖动时是连续来的，而我们的重绘是整窗双缓冲 GDI：
+                // 每帧 `CreateCompatibleBitmap(w,h)` + 画 180 万像素 + `BitBlt` 回来。
+                // 系统拖动时自己会把窗口内容搬过去，我们**每步重绘纯属浪费**，
+                // 而且会跟系统抢时间片 ⇒ 明显的卡顿/发抖（用户反馈"一直在颤抖"+"性能浪费"）。
+                // 跳过之后：标题栏/内容保持原位由系统搬动，松手时 `WM_EXITSIZEMOVE` 再干净重画一次。
+                if !self.in_size_move {
+                    unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+                }
+                0
+            }
+            // 系统开始/结束"移动或缩放窗口"（`SC_MOVE`/`SC_SIZE`）。
+            // 进入时打开"拖动期间不重绘"的开关，退出时补一次完整重绘把内容对齐到新尺寸。
+            WM_ENTERSIZEMOVE => {
+                self.in_size_move = true;
+                crate::trace::trace("ui: enter size/move (suspend repaint)");
+                0
+            }
+            WM_EXITSIZEMOVE => {
+                self.in_size_move = false;
+                // ⚠️ 这里**故意不调 `ensure_on_screen()`**：系统拖动允许用户把窗口一部分放到
+                // 屏幕外，如果我们松手就把它"拉回来"，用户会看到窗口自己弹回去（很突兀）。
+                // 兜底只留给"显示器配置变化"那种真会让人抓不到窗口的情况（见 WM_DISPLAYCHANGE）。
                 unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
+                crate::trace::trace("ui: exit size/move (repaint)");
+                0
+            }
+            // 显示器配置变化（拔插外接屏 / 改分辨率 / 改缩放）：此时窗口可能整体落在
+            // 已经不存在的工作区里，抓不回来 ⇒ 这时才做"拉回可见区域"的兜底。
+            WM_DISPLAYCHANGE => {
+                self.ensure_on_screen();
+                crate::trace::trace("ui: display change -> ensure on screen");
                 0
             }
             // 鼠标捕获被抢走（别的窗口 SetCapture / 任务切换 / UAC 打断）时，

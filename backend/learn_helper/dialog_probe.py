@@ -25,6 +25,7 @@ fixture 的两个要点（都是为了让这个探针**能失败**）：
 import os
 import sys
 import tempfile
+import time
 
 from learn_helper import core
 
@@ -76,45 +77,80 @@ def main():
         print(f'  [{"PASS" if ok else "FAIL"}] {name}' + (f' -- {detail}' if detail and not ok else ''))
 
     print('=== 确认弹窗跳过按钮探针 ===')
-    ok, _proc = core.kill_and_launch_browser()
-    check('沙盒浏览器 9222 就绪', ok, '9222 不可用（先确认本机能连 CDP）')
-    if not ok:
+    # ⚠️ 连不上要**整轮重来**（重新拉起浏览器 + 重开 Playwright）：批量跑探针时，上一个探针
+    # 可能刚把沙盒浏览器收掉，此时 9222 报"开着"、连过去却 ECONNREFUSED。
+    # 注意**不能**在一个 `with sync_playwright()` 里重试 —— 出了 with 这个 Playwright 实例就
+    # 停了，第二次会报 "Event loop is closed! Is Playwright already stopped?"（本轮实测踩到）。
+    # 所以把"拉起 + 起 Playwright + 连接"整段放进重试循环，每轮都是全新的。
+    sync_playwright = core.require_playwright()
+    browser = None
+    last_err = ''
+    for attempt in range(4):
+        ok, _proc = core.kill_and_launch_browser()
+        if not ok:
+            last_err = '9222 拉不起来'
+            print(f'  [info] 第 {attempt + 1} 轮：{last_err}，重试')
+            time.sleep(1.2)
+            continue
+        try:
+            # 这里**不能**用 `with`：`browser` 要活到循环外面去用。
+            p = sync_playwright().start()
+            browser = p.chromium.connect_over_cdp(core.CDP_URL, timeout=15000)
+            break
+        except Exception as e:
+            last_err = str(e)
+            browser = None
+            print(f'  [info] 第 {attempt + 1} 轮连接失败，重试：{last_err[:80]}')
+            try:
+                p.stop()
+            except Exception:
+                pass
+            time.sleep(1.2)
+    check('沙盒浏览器 9222 就绪', browser is not None,
+          ('9222 不可用：' + last_err[:80]) if browser is None else '')
+    if browser is None:
         return _summary(results)
 
-    sync_playwright = core.require_playwright()
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.connect_over_cdp(core.CDP_URL, timeout=15000)
-            page = browser.contexts[0].new_page()
+        page = browser.contexts[0].new_page()
+        try:
+            # ---- 有弹窗：必须点中弹窗的「下一节」 ----
+            page.goto('file:///' + modal.replace('\\', '/'))
+            page.wait_for_load_state('load')
+            page.wait_for_timeout(300)
+
+            check('弹窗被识别出来', core.confirmation_dialog_open(page))
+            btn, _fr = core.find_confirmation_bypass_button(page)
+            check('找到了「跳过」按钮', btn is not None, '返回 None（等于弹窗点不掉）')
+            if btn is not None:
+                label = (btn.inner_text() or '').strip()
+                check('挑中的是弹窗的「下一节」而不是「去学习」', label == '下一节', repr(label))
+                btn.click(force=True)
+                page.wait_for_timeout(300)
+                title = page.title()
+                check('确实点中的是弹窗按钮（不是页面自己那颗同名按钮）',
+                      title == 'OK:dialog-next', repr(title))
+
+            # ---- 没有弹窗：不许误判（否则会把正常页面当弹窗处理） ----
+            page.goto('file:///' + plain.replace('\\', '/'))
+            page.wait_for_load_state('load')
+            page.wait_for_timeout(300)
+            check('无弹窗的普通页面不误判',
+                  (not core.confirmation_dialog_open(page))
+                  and (core.find_confirmation_bypass_button(page)[0] is None))
+        except Exception as e:
+            check('探针执行', False, f'异常: {e}')
+        finally:
             try:
-                # ---- 有弹窗：必须点中弹窗的「下一节」 ----
-                page.goto('file:///' + modal.replace('\\', '/'))
-                page.wait_for_load_state('load')
-                page.wait_for_timeout(300)
-
-                check('弹窗被识别出来', core.confirmation_dialog_open(page))
-                btn, _fr = core.find_confirmation_bypass_button(page)
-                check('找到了「跳过」按钮', btn is not None, '返回 None（等于弹窗点不掉）')
-                if btn is not None:
-                    label = (btn.inner_text() or '').strip()
-                    check('挑中的是弹窗的「下一节」而不是「去学习」', label == '下一节', repr(label))
-                    btn.click(force=True)
-                    page.wait_for_timeout(300)
-                    title = page.title()
-                    check('确实点中的是弹窗按钮（不是页面自己那颗同名按钮）',
-                          title == 'OK:dialog-next', repr(title))
-
-                # ---- 没有弹窗：不许误判（否则会把正常页面当弹窗处理） ----
-                page.goto('file:///' + plain.replace('\\', '/'))
-                page.wait_for_load_state('load')
-                page.wait_for_timeout(300)
-                check('无弹窗的普通页面不误判',
-                      (not core.confirmation_dialog_open(page))
-                      and (core.find_confirmation_bypass_button(page)[0] is None))
-            finally:
                 page.close()
-    except Exception as e:
-        check('探针执行', False, f'异常: {e}')
+            except Exception:
+                pass
+    finally:
+        # 我们用的是 `sync_playwright().start()`（不是 with），要自己收尾
+        try:
+            p.stop()
+        except Exception:
+            pass
     return _summary(results)
 
 
