@@ -754,38 +754,146 @@ def find_tab_buttons(cards_frame):
     return []
 
 
+# 平台确认弹窗里"按钮"的范围。⚠️ **Python 侧取定位器时必须用同一个字符串**，
+# 因为 JS 返回的是"这些按钮里的下标"——两边选择器不一致就会点错元素（E77）。
+DIALOG_BUTTON_SELECTOR = (
+    'button,a,[role="button"],input[type="button"],input[type="submit"],'
+    'div[class*="btn"],span[class*="btn"]'
+)
+
+# 在页面里定位"平台确认弹窗"并挑出"跳过/继续"那颗按钮，用**打标记**的方式把结果交回 Python。
+#
+# ⚠️⚠️ 为什么是"打标记"而不是"返回下标"（2026-09-20 实测踩到，E77）：
+# 第一版让 JS 返回"按钮在容器内可见按钮列表里的下标"，Python 再用同一个选择器
+# `frame.locator(sel).nth(idx)` 取回 —— **两边的作用域不同**：
+# JS 是"在弹窗容器内"枚举（3 个），Python 是"全页面"枚举（4 个，多了页面自己的「下一节」），
+# 于是同一个下标指向**不同元素**，结果点成了「去学习」（"回去做题"，与用户意图相反）。
+# 打标记则天然免疫：谁被选中就标记谁，Python 按标记取，作用域差异不再影响正确性。
+DIALOG_BYPASS_SCRIPT = r"""
+(args) => {
+  const { keywords, skipTexts, rejectTexts, sel, mark } = args;
+  const norm = (s) => (s || '').replace(/\s+/g, '');
+  const bodyText = document.body ? (document.body.innerText || '') : '';
+  if (!keywords.some(k => bodyText.indexOf(k) >= 0)) {
+    return { found: false, label: '', candidates: [], reason: 'no-keyword' };
+  }
+  const label = (e) => norm(e.innerText || e.value || e.textContent || '');
+  const shown = (e) => {
+    const r = e.getBoundingClientRect();
+    if (r.width < 4 || r.height < 4) return false;
+    const st = getComputedStyle(e);
+    return st.visibility !== 'hidden' && st.display !== 'none' && st.pointerEvents !== 'none';
+  };
+  const btnsIn = (root) => Array.from(root.querySelectorAll(sel)).filter(e => label(e) && shown(e));
+  // 最深的"含文案 + 含按钮"容器
+  let box = null;
+  for (const e of document.querySelectorAll('div,section,aside,form')) {
+    const t = e.innerText || '';
+    if (!keywords.some(k => t.indexOf(k) >= 0)) continue;
+    if (btnsIn(e).length < 1) continue;
+    if (!box || e.contains(box)) box = e;
+  }
+  if (!box) return { found: false, label: '', candidates: [], reason: 'no-box' };
+  const all = btnsIn(box);
+  // 去掉"只是包着其它按钮的壳"（`[class*="btn"]` 会把 `.btns` 这种外层 div 也选进来）
+  const isWrapper = (e) => all.some(o => o !== e && e.contains(o));
+  const btns = all.filter(e => !isWrapper(e));
+  const isReject = (e) => rejectTexts.some(r => label(e) === norm(r) || label(e).indexOf(norm(r)) >= 0);
+  const candidates = btns.map(e => label(e));
+  const pick = (pred) => btns.find(e => pred(e) && !isReject(e));
+  let hit = null;
+  for (const want of skipTexts) { hit = pick(e => label(e) === norm(want)); if (hit) break; }
+  if (!hit) for (const want of skipTexts) { hit = pick(e => label(e).indexOf(norm(want)) >= 0); if (hit) break; }
+  if (!hit) return { found: false, label: '', candidates, reason: 'no-skip-button' };
+  // 清掉可能残留的旧标记，再给选中的那颗打上（Python 侧按标记取）
+  for (const e of document.querySelectorAll('[' + mark + ']')) e.removeAttribute(mark);
+  hit.setAttribute(mark, '1');
+  return { found: true, label: label(hit), candidates, reason: 'ok' };
+}
+"""
+
+# Python 侧按这个属性把"JS 选中的那颗"取回来（见上面"打标记"的说明）
+DIALOG_MARK_ATTR = 'data-lh-bypass'
+DIALOG_MARKED_SELECTOR = f'[{DIALOG_MARK_ATTR}="1"]'
+
+
+
 def find_confirmation_bypass_button(page):
-    """检测「还有任务点未完成」等确认弹窗，尝试点强跳按钮。"""
-    bypass_selectors = [
-        '.popDiv.wid440.popMove .nextChapter', '.popDiv .nextChapter',
-        ".popDiv a:has-text('下一节')", ".popDiv a:has-text('确定')", ".popDiv button:has-text('确定')",
-        'a.nextChapter', "[class*='pop'] a:has-text('确定')", "[class*='pop'] button:has-text('确定')",
-    ]
-    frames_to_scan = _frames_of(page)
-    for frame in frames_to_scan:
+    """检测「当前章节还有任务点未完成，是否去完成？」这类确认弹窗，返回要点的那颗按钮。
+
+    返回 `(按钮定位器, frame)`；没有弹窗时返回 `(None, None)`。
+
+    ⚠️ **本函数修过一次严重的"看着像能用、实际点不到"的 bug（2026-09-20，E77）**。
+    原实现是「先看页面文本有没有关键词，有就点 `.popDiv .nextChapter` / `确定`」，
+    但真实弹窗的两颗按钮是 **`去学习`** 和 **`下一节`** —— 既不叫 `确定`、也不带
+    `.nextChapter` 类，于是**一个选择器都命中不了**，函数返回 `None`，弹窗原地不动
+    （用户看到的正是"翻页没反应"）。长期没被发现的原因：主流程只在**点完翻页后**
+    轮询 5 次 × 0.2s，弹窗稍晚弹出来就完全错过。
+
+    **现在的判据**：一次性在页面里跑一段 JS，找"**同时**含确认文案与至少一颗按钮"的
+    **最深**容器（= 弹窗本身，而不是包住整页的外壳），再**只在该容器内**按文本找按钮，
+    优先"跳过/继续"类（`下一节`/`继续下一节`/`强行下一节`/`跳过`/`确定`/`继续`），
+    **排除**"回去做题"类（`去学习`/`取消`/`关闭`/`返回`）。
+    返回按钮在"容器内可见按钮列表"里的**下标**，Python 侧用同一套选择器取回定位器
+    —— 两边选择器必须**逐字一致**（写在一个常量里，避免漂移）。
+
+    ⚠️ 这个弹窗**不是**浏览器原生 `alert/confirm`，`page.on('dialog')` 抓不到它；
+    `_register_dialog_handler` 那套是处理原生弹窗的，两者别混。
+    """
+    keywords = ('还有任务点未完成', '未完成的任务点', '当前章节还有', '是否去完成')
+    skip_texts = ('下一节', '继续下一节', '强行下一节', '跳过', '确定', '继续')
+    reject_texts = ('去学习', '取消', '关闭', '返回')
+
+    for frame in _frames_of(page):
         try:
             body_text = frame.evaluate("document.body ? document.body.innerText : ''")
-            if any(kw in body_text for kw in ('还有任务点未完成', '未完成的任务点', '确认离开', '当前章节还有', '是否去完成')):
-                for sel in bypass_selectors:
-                    loc = frame.locator(sel)
-                    if loc.count() > 0:
-                        btn = loc.first
-                        if btn.is_visible() and btn.is_enabled():
-                            return (btn, frame)
-                fallback_locs = [
-                    frame.locator(".popDiv button:has-text('确定')"),
-                    frame.locator(".popDiv a:has-text('确定')"),
-                    frame.locator(".popDiv a:has-text('继续下一节')"),
-                    frame.locator(".popDiv a:has-text('强行下一节')"),
-                ]
-                for loc in fallback_locs:
-                    if loc.count() > 0:
-                        btn = loc.first
-                        if btn.is_visible():
-                            return (btn, frame)
+            if not any(kw in body_text for kw in keywords):
+                continue
+            picked = frame.evaluate(
+                DIALOG_BYPASS_SCRIPT,
+                {
+                    'keywords': list(keywords),
+                    'skipTexts': list(skip_texts),
+                    'rejectTexts': list(reject_texts),
+                    'sel': DIALOG_BUTTON_SELECTOR,
+                    'mark': DIALOG_MARK_ATTR,
+                },
+            )
+            if not picked or not picked.get('found'):
+                if picked:
+                    LOGGER.info(f'[弹窗] 未挑到跳过按钮（{picked.get("reason")}，'
+                                f'容器内候选={picked.get("candidates")}）')
+                continue
+            # ⚠️ 按**标记属性**取回，而不是按下标：JS 在"弹窗容器内"枚举、Python 在
+            # "整个 frame"枚举，两边列表长度不同，下标会指向不同元素（E77 实测点错成「去学习」）。
+            loc = frame.locator(DIALOG_MARKED_SELECTOR)
+            if loc.count() > 0:
+                el = loc.first
+                if el.is_visible():
+                    LOGGER.info(
+                        f'[弹窗] 命中「{picked.get("label")}」'
+                        f'（容器内候选={picked.get("candidates")}）'
+                    )
+                    return (el, frame)
+        except Exception as e:
+            LOGGER.info(f'[弹窗] 查找跳过按钮异常: {e}')
+    return (None, None)
+
+
+def confirmation_dialog_open(page):
+    """页面上是否**正开着**「还有任务点未完成」这类确认弹窗（只看文案，不做点击）。
+
+    给调用方做"点了翻页之后等弹窗出现"的轮询用 —— 比反复找按钮便宜。
+    """
+    keywords = ('还有任务点未完成', '未完成的任务点', '当前章节还有', '是否去完成')
+    for frame in _frames_of(page):
+        try:
+            body_text = frame.evaluate("document.body ? document.body.innerText : ''")
+            if any(kw in body_text for kw in keywords):
+                return True
         except Exception:
             pass
-    return (None, None)
+    return False
 
 
 def robust_wait_for_tasks_to_render(page, check_func, timeout=8000):

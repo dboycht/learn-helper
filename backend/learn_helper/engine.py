@@ -265,6 +265,10 @@ class SolverEngine:
         """
         if self.solver_running:
             return {'ok': False, 'message': '刷课运行中，翻页由流程自己控制；请先停止再手动翻页。'}
+        # 先给足默认值：下面 except 分支也要用到它们（否则异常路径会再抛 NameError）
+        before = after = ''
+        skipped_dialog = False
+        changed = False
         with self._io_lock:
             try:
                 ok, proc = core.kill_and_launch_browser()
@@ -292,38 +296,28 @@ class SolverEngine:
                         browser.close()
                         return {'ok': False, 'message': msg}
 
-                    before = self._safe_title(page, fallback='')
-                    btn, _frame = core.find_next_button(page)
-                    if not btn:
-                        msg = f'当前页没有找到「下一页/下一章」按钮（页面：{before}）。'
+                    ok_click, before, after, skipped_dialog, err = \
+                        self._click_next_and_handle_dialog(page)
+                    # `before` 是**点击前**的标题（由 helper 返回），`changed` 用两者比较得出
+                    changed = (after != before)
+                    if not ok_click:
+                        msg = f'翻页失败：{err}（页面：{before}）。'
                         self.hub.emit_log(f'[翻页] {msg}')
                         browser.close()
                         return {'ok': False, 'message': msg}
-                    try:
-                        btn.scroll_into_view_if_needed()
-                        time.sleep(0.2)
-                        btn.click(force=True)
-                    except Exception as e:
-                        msg = f'点击「下一页」失败: {e}'
-                        self.hub.emit_log(f'[翻页] {msg}')
-                        browser.close()
-                        return {'ok': False, 'message': msg}
-                    # 等新页面的标题 / URL 变化，好把"到底翻过去没有"如实回报给用户
-                    changed = False
-                    for _ in range(15):
-                        time.sleep(0.2)
-                        if self._safe_title(page, fallback='') != before:
-                            changed = True
-                            break
-                    after = self._safe_title(page, fallback='')
                     browser.close()
             except Exception as e:
                 msg = f'翻页异常: {e}'
                 self.hub.emit_log(f'[翻页] {msg}')
                 return {'ok': False, 'message': msg}
         if changed:
-            self.hub.emit_log(f'[翻页] 已翻到：{after}')
-            return {'ok': True, 'message': f'已翻页：【{before}】→【{after}】'}
+            extra = '（已跳过未完成任务点的提示）' if skipped_dialog else ''
+            self.hub.emit_log(f'[翻页] 已翻到：{after}{extra}')
+            return {'ok': True, 'message': f'已翻页：【{before}】→【{after}】{extra}'}
+        if skipped_dialog:
+            msg = f'已跳过「还有任务点未完成」提示，但页面标题仍是：{after}'
+            self.hub.emit_log(f'[翻页] {msg}')
+            return {'ok': True, 'message': msg}
         self.hub.emit_log(f'[翻页] 已点击「下一页」，但页面标题仍是：{after}')
         return {'ok': True, 'message': f'已点击「下一页」（标题未变，可能仍在同一页）：{after}'}
 
@@ -348,6 +342,72 @@ class SolverEngine:
 
         threading.Thread(target=_work, daemon=True, name='self-test').start()
         return True, '自检已开始（结果见日志）'
+
+    def _click_next_and_handle_dialog(self, page, poll_seconds=6.0):
+        """点一次「下一页/下一章」，并处理随之而来的平台确认弹窗。
+
+        返回 `(ok, before, after, skipped_dialog, err)`。
+
+        ⚠️ **两个坑都在这里一次性解决（2026-09-20，E77）**：
+        1. **元素会失效**：`find_next_button` 返回的定位器与真正点击之间，页面可能重渲染
+           （或标签页被换掉），此时 `scroll_into_view_if_needed` 会抛
+           `Protocol error (DOM.scrollIntoViewIfNeeded): Cannot find context with specified id`
+           —— 手动翻页那一路实测踩到。所以**找不到按钮就重新找一遍再点**，最多 3 轮。
+        2. **弹窗要比"立刻查一次"等得久**：主流程原来只 `5 × 0.2s = 1s` 就放弃了，
+           而学习通的弹窗是异步弹出来的，稍晚一点就完全错过（这正是"翻页看着没反应"
+           长期没被定位到的原因）。这里默认轮询 6s，并且**先找弹窗**（否则会在弹窗
+           出现之前就因为"标题变了"提前收工）。
+        """
+        before = self._safe_title(page, fallback='')
+        ok_click = False
+        err = ''
+        for _attempt in range(3):
+            btn, _f = core.find_next_button(page)
+            if not btn:
+                err = '没有找到「下一页/下一章」按钮'
+                break
+            try:
+                btn.scroll_into_view_if_needed()
+                time.sleep(0.25)
+                btn.click(force=True)
+                ok_click = True
+                break
+            except Exception as e:
+                # 元素失效/重渲染：重新找一遍再试（不要直接放弃）
+                err = str(e)
+                LOGGER.info(f'[翻页] 点击失败，重新查找按钮后重试: {e}')
+                time.sleep(0.3)
+        if not ok_click:
+            return (False, before, before, False, err)
+
+        # 先找弹窗；找不到再靠"标题变了"提前收工
+        skipped = False
+        deadline = time.time() + poll_seconds
+        while time.time() < deadline:
+            time.sleep(0.2)
+            try:
+                if core.confirmation_dialog_open(page):
+                    by, _bf = core.find_confirmation_bypass_button(page)
+                    if by:
+                        try:
+                            by.click(force=True)
+                            skipped = True
+                            LOGGER.info('[翻页] 检测到「还有任务点未完成」提示，已按「下一节」跳过。')
+                        except Exception as e:
+                            LOGGER.info(f'[翻页] 点「下一节」失败: {e}')
+                    else:
+                        LOGGER.info('[翻页] 出现未完成提示弹窗，但没找到可点的「下一节」。')
+                    break
+            except Exception:
+                pass
+            if self._safe_title(page, fallback='') != before:
+                break
+        # 再等标题变化，好如实回报"到底翻过去没有"
+        for _ in range(25):
+            time.sleep(0.2)
+            if self._safe_title(page, fallback='') != before:
+                break
+        return (True, before, self._safe_title(page, fallback=''), skipped, '')
 
     def _safe_title(self, page, fallback='(未知页面)'):
         """读页面标题，**任何异常都不许打断主流程**。
@@ -764,27 +824,17 @@ class SolverEngine:
                             end_flow = True
                             break
 
-                        # 翻页
+                        # 翻页（点按钮 + 处理"还有任务点未完成"弹窗，含元素失效重试）
                         hub.emit_log('[导航] 正在查找下一页按钮...')
-                        next_btn, next_frame = core.find_next_button(target_page)
-                        if not next_btn:
-                            hub.emit_log('[系统] 未找到下一页按钮，刷课流程结束。')
+                        ok_click, before, after, skipped, err = \
+                            self._click_next_and_handle_dialog(target_page)
+                        if not ok_click:
+                            hub.emit_log(f'[系统] {err}，刷课流程结束。')
                             end_flow = True
                             break
                         try:
-                            next_btn.scroll_into_view_if_needed()
-                            time.sleep(0.5)
-                            next_btn.click(force=True)
-                            hub.emit_log('[导航] 已翻页，检查是否有确认弹窗...')
-                            for _ in range(5):
-                                if self.check_pause_and_stop():
-                                    break
-                                time.sleep(0.2)
-                                bypass_btn, _bf = core.find_confirmation_bypass_button(target_page)
-                                if bypass_btn:
-                                    hub.emit_log('[系统] 检测到未完成提示弹窗，已强制跳过。')
-                                    bypass_btn.click(force=True)
-                                    break
+                            if skipped:
+                                hub.emit_log('[系统] 检测到未完成提示弹窗，已强制跳过。')
                             hub.emit_log('[导航] 等待页面载入...')
                             time.sleep(0.8)
                             if self.stop_requested:

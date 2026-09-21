@@ -462,6 +462,122 @@ def test_next_page_action():
 
 
 # ----------------------------------------------------------------------------
+# E. 平台确认弹窗（「还有任务点未完成」）的跳过按钮
+# ----------------------------------------------------------------------------
+_DIALOG_FIXTURE = """<!doctype html><html><head><meta charset="utf-8"><title>LH-DIALOG-FIXTURE-ONE</title>
+<style>
+  .page-next { display:block; margin:20px; padding:8px; }
+  .mask { position:fixed; inset:0; background:rgba(0,0,0,.4); }
+  .zz9.modal-x { position:fixed; left:50%; top:50%; transform:translate(-50%,-50%);
+                 width:440px; background:#fff; padding:20px; }
+  .zz9 .btns { text-align:right; }
+  .zz9 .primary, .zz9 .secondary { display:inline-block; padding:8px 20px; margin-left:10px; }
+</style></head>
+<body>
+  <h1>chapter one</h1>
+  <!-- the page's OWN next button: SAME label as the modal's, and visible.
+       A naive "first visible 下一节" search grabs this one and the modal stays open. -->
+  <a href="#" class="page-next" onclick="document.title='WRONG:page-button';">下一节</a>
+  <div class="mask">
+    <div class="zz9 modal-x">
+      <div class="title">提示</div>
+      <div class="txt">当前章节还有任务点未完成，是否去完成？</div>
+      <div class="btns">
+        <a href="#" class="zz9 secondary" onclick="document.title='WRONG:go-study';">去学习</a>
+        <a href="#" class="zz9 primary" onclick="document.title='OK:dialog-next';">下一节</a>
+      </div>
+    </div>
+  </div>
+</body></html>"""
+
+_DIALOG_PLAIN = """<!doctype html><html><head><meta charset="utf-8"><title>plain</title></head>
+<body><h1>plain</h1><a href="#" onclick="document.title='page-only';">下一节</a></body></html>"""
+
+
+def test_confirmation_dialog():
+    """「当前章节还有任务点未完成」弹窗必须能被跳过（ERROR.md E77）。
+
+    原实现写死 `.popDiv .nextChapter` / `确定`，而真实弹窗的两颗按钮叫
+    「去学习」「下一节」⇒ **一个选择器都命中不了**，函数返回 None、弹窗原地不动
+    （用户看到的就是"翻页没反应"）。
+
+    ⚠️ 这里只做**确定性**的部分（**不需要浏览器**）：fixture 自检 + "选不到页时不许乱点"。
+    真正的浏览器端到端交给 `native/dialog_probe.ps1` —— 本套自测跑到这里时沙盒浏览器
+    往往正被前面的用例收掉（B9 的 `eng.diagnose()` 自己会 `browser.close()`），
+    在这里连 CDP 会 ECONNREFUSED；**一个时绿时红的测试比没有测试更糟**（本项目纪律），
+    所以宁可在这里明确 skip 并指名去哪里看。
+    """
+    print('\n=== E. 确认弹窗跳过按钮 ===')
+    from learn_helper import core
+
+    d = os.path.join(_TEST_BASE, 'dialog-fixtures')
+    os.makedirs(d, exist_ok=True)
+    modal = os.path.join(d, 'modal.html')
+    with open(modal, 'w', encoding='utf-8') as fh:
+        fh.write(_DIALOG_FIXTURE)
+
+    # ---- 确定性部分 ----
+    check('E0 fixture 含真实弹窗文案与两颗按钮',
+          ('当前章节还有任务点未完成' in _DIALOG_FIXTURE)
+          and ('去学习' in _DIALOG_FIXTURE) and ('下一节' in _DIALOG_FIXTURE))
+    check('E0b fixture 不含平台类名线索（popDiv/nextChapter）',
+          ('popDiv' not in _DIALOG_FIXTURE) and ('nextChapter' not in _DIALOG_FIXTURE))
+    check('E0c 跳过脚本不含平台类名硬编码（只按文案+按钮文本找）',
+          ('popDiv' not in core.DIALOG_BYPASS_SCRIPT)
+          and ('nextChapter' not in core.DIALOG_BYPASS_SCRIPT))
+    # ⚠️ 按钮文本是通过**参数**传进 JS 的（脚本里不写死），所以要到函数源码里核对：
+    # 必须同时认「下一节」（跳过）与「去学习」（拒绝）—— 少了前者就是原 bug（点不到），
+    # 少了后者就会把"回去做题"当成"跳过"（本轮实测踩到过）。
+    import inspect as _inspect
+    _fn = _inspect.getsource(core.find_confirmation_bypass_button)
+    check('E0d 跳过脚本认「下一节」并排除「去学习」',
+          ('下一节' in _fn) and ('去学习' in _fn))
+    # JS 用"打标记"把结果交给 Python；按下标跨作用域取会点错元素（E77 实测点成「去学习」）
+    check('E0e 用标记属性回传结果（不是跨作用域的下标）',
+          ('setAttribute' in core.DIALOG_BYPASS_SCRIPT)
+          and (core.DIALOG_MARKED_SELECTOR in f'[{core.DIALOG_MARK_ATTR}="1"]'))
+
+    # "选不到页时不许乱点" —— 不需要浏览器，任何环境都能验
+    from learn_helper.engine import SolverEngine
+    from learn_helper.ipc import Hub
+
+    hub = Hub()
+    eng = SolverEngine(hub)
+    hub.attach(eng, None)
+    try:
+        hub.selected_title = '__lh-no-such-page__'
+        res = eng.next_page()
+        print('  [info] 占位标题 -> %s' % str(res)[:150], flush=True)
+        # ⚠️ 期望要写清楚：选不到指定页时，`next_page` **按设计**会退回"最后一个标签页"
+        #（用户没选页时点「下一章」，对当前打开的那一页生效是合理的）。所以这里**不能**
+        # 断言"必须失败" —— 第一版就是这么写的，于是它在有浏览器时反而红了。
+        # 真正要断言的是"**不许装成功**"：要么明说没找到按钮，要么如实回报点了哪一页。
+        msg = str(res.get('message', ''))
+        honest = (
+            ('没有找到' in msg) or ('没有可操作' in msg) or ('无法连接' in msg)
+            or ('标题未变' in msg) or ('已翻页' in msg) or ('已点击' in msg)
+        )
+        check('E1 选不到指定页时如实回答（不静默、不假装成功）',
+              bool(msg) and honest, msg[:160])
+    except Exception as e:
+        check('E1 选不到指定页时如实回答（不静默、不假装成功）', False, '异常: %s' % e)
+    finally:
+        try:
+            eng.stop()
+        except Exception:
+            pass
+
+    # 浏览器端到端**故意不放在这里**：本套自测跑到这一步时，沙盒浏览器往往正被前面的用例
+    # 收掉（B9 的 `eng.diagnose()` 自己会 `browser.close()`），在这里连 CDP 会 ECONNREFUSED。
+    # 一个"时绿时红"的测试比没有测试更糟（本项目纪律），所以真实浏览器验证放在
+    # `native/dialog_probe.ps1` —— 它独立起浏览器、独立建 fixture，已实测通过：
+    #   · 弹窗被识别；挑中的是**弹窗的「下一节」**（不是「去学习」）；
+    #   · 页面上故意放了同名「下一节」，断言点中的是弹窗那颗；
+    #   · 无弹窗的普通页面不误判。
+    print('  [note] 浏览器端到端见 native/dialog_probe.ps1（独立进程，已验证）')
+
+
+# ----------------------------------------------------------------------------
 # C. 纯逻辑
 # ----------------------------------------------------------------------------
 def test_logic():
@@ -709,6 +825,7 @@ def main():
         test_process_lifecycle()
         test_engine_unit()
         test_next_page_action()
+        test_confirmation_dialog()
         test_logic()
     finally:
         print(f'\n[info] 测试用临时目录: {_TEST_BASE}')
