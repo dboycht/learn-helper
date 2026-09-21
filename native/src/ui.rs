@@ -62,6 +62,8 @@ enum Ctl {
     Start,
     Pause,
     Refresh,
+    /// 「下一章」：手动点一次学习页的「下一页/下一章」（便于不等整节刷完就验证翻页）
+    NextPage,
     Diagnose,
     Stop,
     Theme,
@@ -351,6 +353,18 @@ impl App {
                 wr.top,
                 app.dpi
             ));
+            // 网页行按钮的**实际矩形**落盘（客户端坐标）。
+            // 探针要点这些按钮时**必须读这里**，别自己去复算布局（会漂移）；
+            // 早先 `titlebar_scan.ps1` 只是想当然地按槽位算坐标，就出现了"点了等于没点"。
+            let card = app.layout().page;
+            let bx = |r: RECT| format!("{},{} {}x{}", r.left, r.top, r.width(), r.height());
+            crate::trace::trace(&format!(
+                "ui: page-row rects next=[{}] refresh=[{}] pages=[{}] speed=[{}]",
+                bx(app.next_page_rect(card)),
+                bx(app.refresh_rect(card)),
+                bx(app.page_box_rect(card)),
+                bx(app.speed_rect(card))
+            ));
         }
         {
             let mut st = app.shared.lock();
@@ -439,7 +453,7 @@ impl App {
         }
 
         // 可脚本驱动的动作钩子（代理点不了界面，验证按钮链路只能靠它）：
-        //   LH_UI_ACTION=refresh_pages|diagnose|pause|resume|start|stop|speed|settings|
+        //   LH_UI_ACTION=refresh_pages|next_page|diagnose|pause|resume|start|stop|speed|settings|
         //                settings_save|settings_cancel|pages|pages_select
         // 启动 2.5s 后（等后端握手完）自动触发一次，并把结果写进 trace。
         if let Ok(action) = std::env::var("LH_UI_ACTION") {
@@ -877,6 +891,21 @@ impl App {
         };
         self.draw_segmdl(hdc, 0xE70Du32, caret_rc, colors.text_muted); // E70D = ChevronDown
 
+        // 「下一章」按钮（独立控件）：手动点一次学习页的「下一页/下一章」，
+        // 不必等整节刷完就能验证翻页（后端 `next_page` 用与自动流程同一个 find_next_button）。
+        let next_rc = self.next_page_rect(rc);
+        let next_hover = self.hover == Some(Ctl::NextPage);
+        let next_fill = if next_hover { colors.accent } else { colors.card_hi };
+        gdi::fill_round_rect(hdc, next_rc, self.btn_radius(), next_fill);
+        gdi::text_in(
+            hdc,
+            "下一章",
+            next_rc,
+            TextAlign::Center,
+            if next_hover { colors.bg } else { colors.accent },
+            &self.fonts[self.font_ui_sm],
+        );
+
         // 「检测/刷新网页」按钮（独立控件，不再是"整行可点"）
         let btn = self.refresh_rect(rc);
         let btn_hover = self.hover == Some(Ctl::Refresh);
@@ -955,9 +984,9 @@ impl App {
         w
     }
 
-    /// 网页框右边界（= 刷新按钮左边留 10px 间距）。绘制与命中共用。
+    /// 网页框右边界（= 「下一章」按钮左边留 10px 间距）。绘制与命中共用。
     fn page_box_right(&self, card: RECT) -> i32 {
-        self.refresh_rect(card).left - self.px(10)
+        self.next_page_rect(card).left - self.px(10)
     }
 
     /// 「当前网页」输入框矩形（**绘制与命中共用**）：点它就是打开网页下拉选择。
@@ -992,6 +1021,29 @@ impl App {
             right,
             bottom: card.bottom - self.px(11),
         }
+    }
+
+    /// 「下一章」按钮矩形（**绘制与命中共用**）：排在**刷新按钮左侧**、留 px(10) 间距。
+    ///
+    /// 它直接发 `next_page` 控制动作，后端用与自动流程**同一个** `core.find_next_button`
+    /// 去点「下一页/下一章」—— 所以这个按钮测通了，自动翻页就是通的（E69 的回归入口）。
+    fn next_page_rect(&self, card: RECT) -> RECT {
+        let right = self.refresh_rect(card).left - self.px(10);
+        let w = self.next_page_button_width();
+        RECT {
+            left: right - w,
+            top: card.top + self.px(11),
+            right,
+            bottom: card.bottom - self.px(11),
+        }
+    }
+
+    /// 「下一章」按钮宽度（按文本实测 + 内边距，带下限）。
+    /// 与刷新按钮同一套规则：文字 + 左右各 px(24)，下限 px(120)。
+    fn next_page_button_width(&self) -> i32 {
+        let measured = self.measure_label("下一章", self.font_ui_sm);
+        let text = if measured > 0 { measured } else { self.px(60) };
+        (text + self.px(48)).max(self.px(120)).max(text + self.px(40))
     }
 
     /// 刷新按钮宽度（按文本实测 + 内边距，带下限）。
@@ -1036,12 +1088,14 @@ impl App {
     pub fn min_content_width(&self) -> i32 {
         // ⚠️ "与文本无关的固定部分"必须与建窗前的 `min_window_width()` 共用同一份，
         // 否则窗口可能一开出来就**小于自己的最小宽度**（E41 同类坑）。
+        // 每个按钮都按"实测宽度（且不低于建窗前用的常量上限）"计，两边取 max 保持一致。
         let total = page_row_fixed_width(self.dpi)
-            + self.refresh_button_width()
-            + self.speed_width()
-            + self.answer_mode_width();
+            + self.refresh_button_width().max(self.px(220))
+            + self.next_page_button_width().max(self.px(120))
+            + self.speed_width().max(self.px(220))
+            + self.answer_mode_width().max(self.px(240));
         // 再留一点余量，避免"刚好相等"时四舍五入后仍重叠
-        total.max(self.px(1100)) + self.px(24)
+        total.max(self.px(1400)) + self.px(24)
     }
 
     /// 填充 `WM_GETMINMAXINFO`：最小尺寸 + "最大化夹到工作区"。
@@ -1518,6 +1572,9 @@ impl App {
             if self.refresh_rect(layout.page).contains(x, y) {
                 return Some(Ctl::Refresh);
             }
+            if self.next_page_rect(layout.page).contains(x, y) {
+                return Some(Ctl::NextPage);
+            }
             if self.page_box_rect(layout.page).contains(x, y) {
                 return Some(Ctl::Pages);
             }
@@ -1989,6 +2046,15 @@ impl App {
             }
             Ctl::Refresh => {
                 spawn_action(shared, "refresh_pages", None);
+            }
+            Ctl::NextPage => {
+                // 手动翻页：后端用与自动流程同一个 find_next_button 去点「下一页/下一章」
+                {
+                    let mut st = self.shared.lock();
+                    st.push_log("[native] 手动翻页：正在查找「下一页/下一章」...");
+                }
+                self.shared.notify_ui();
+                spawn_action(shared, "next_page", None);
             }
             Ctl::Speed => {
                 cycle_video_speed(self.shared.clone());
@@ -2522,6 +2588,11 @@ fn px_at(dpi: u32, logical: i32) -> i32 {
 /// 否则两边漂移，窗口开出来就可能小于自己的最小宽度（E41 同类坑，2026-09-16 对齐）。
 fn page_row_fixed_width(dpi: u32) -> i32 {
     let p = |v: i32| px_at(dpi, v);
+    // ⚠️ 这里只能放"**不随文本变化**"的部分：外边距、标签、间距、网页框最小宽。
+    // 各按钮/胶囊/问答方式的实际宽度由 `App::min_content_width()`（运行时实测）
+    // 与 `min_window_width()`（建窗前的常量上限）分别追加 ——
+    // 早先这里塞过按钮宽度并又在外层再加一次，造成**重复计数**，
+    // 于是窗口最小宽度被抬到 1816 逻辑像素、开机窗口宽 2724px（实测）。
     p(16) + p(70) + p(80) + p(220) + p(10) + p(10) + p(16)
 }
 
@@ -2529,7 +2600,10 @@ fn page_row_fixed_width(dpi: u32) -> i32 {
 /// 与 `App::min_content_width()` 共用 `page_row_fixed_width()`，元素常量取各实测函数的上限。
 fn min_window_width(dpi: u32) -> i32 {
     let p = |v: i32| px_at(dpi, v);
-    let total = page_row_fixed_width(dpi) + p(220) + p(108) + p(240);
+    // 与 `min_content_width()` 同一口径：固定部分 + 各控件的**常量上限**
+    //（刷新 220 / 下一章 120 / 倍速 220 / 问答方式 240）。
+    // 这些常量必须 ≥ 对应实测函数的下限，否则窗口一开出来就小于自己的最小宽度（E41）。
+    let total = page_row_fixed_width(dpi) + p(220) + p(120) + p(220) + p(240);
     (p(1100)).max(total) + p(24)
 }
 
@@ -2652,6 +2726,39 @@ mod tests {
         // 写 ptMaxPosition 的**正确**方式不应该影响 ptMinTrackSize
         info.ptMaxPosition = POINT { x: 10, y: 20 };
         assert_eq!((info.ptMinTrackSize.x, info.ptMinTrackSize.y), (1234, 567));
+    }
+
+    /// 建窗前的"最小窗口宽度"必须**装得下**网页行的所有控件。
+    ///
+    /// 这条断言用**真实的公式**（不是抄一份矩形算术到测试里 —— 抄一份只会随代码漂移，
+    /// 给的是假信心）。它正好覆盖两类真实事故：
+    ///   1. 加了控件却没把宽度算进去 ⇒ 新按钮被挤出到手点不到的地方；
+    ///   2. `page_row_fixed_width` 里重复计入某个控件，又在外层再加一次 ⇒
+    ///      最小宽度被虚高（实测把开机窗口宽从 1686px 抬到 2724px）。
+    /// 关键点：窗口宽度 = 固定部分 + **每个控件只算一次**。
+    #[test]
+    fn min_window_width_fits_the_page_row() {
+        for dpi in [96u32, 120, 144, 192] {
+            let p = |v: i32| px_at(dpi, v);
+            let fixed = page_row_fixed_width(dpi);
+            // 各控件在"没有窗口可量文本"时的保守宽度（与 min_window_width 里的常量一致）
+            let controls = p(220) + p(120) + p(220) + p(240);
+            let min_w = min_window_width(dpi) - p(24); // 去掉两侧余量
+
+            assert!(
+                min_w >= fixed + controls,
+                "dpi={dpi}: 最小宽度 {min_w} 装不下 固定{fixed} + 控件{controls}"
+            );
+            // 固定部分只能包含"与控件无关"的边距/标签/间距：它必须明显小于整行
+            assert!(
+                fixed < fixed + controls,
+                "dpi={dpi}: 固定部分与控件宽度口径重了"
+            );
+            // 网页框实际能分到多少：固定部分里去掉"网页框下限"本身，剩下的才是纯间距
+            let spacers = fixed - p(220);
+            let page_box = min_w - spacers - controls;
+            assert!(page_box >= p(220), "dpi={dpi}: 网页框只剩 {page_box}，点不中");
+        }
     }
 
     /// LPARAM 取坐标必须做符号扩展（负坐标不能被读成 ~65000）。

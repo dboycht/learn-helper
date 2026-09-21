@@ -406,6 +406,62 @@ def test_engine_unit():
 
 
 # ----------------------------------------------------------------------------
+# D. 界面新增的「下一章」按钮所依赖的控制动作
+# ----------------------------------------------------------------------------
+def test_next_page_action():
+    """`next_page` 动作必须存在、可达、并且**如实**回答（找不到按钮就明说）。
+
+    这个动作是给界面「下一章」按钮用的：它让用户不必等整节刷完就能验证翻页链路
+    （翻页曾经坏了一整个版本，见 ERROR.md E69）。这里不依赖真实课程页 ——
+    只要后端把动作接对了，无论有没有浏览器，回答都应该是"那几句可读的话"之一，
+    而不是「未知动作」。
+    """
+    print('\n=== D. next_page 控制动作 ===')
+    env = dict(os.environ)
+    env['PYTHONIOENCODING'] = 'utf-8'
+    env['LH_BASE_DIR'] = _TEST_BASE
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(BACKEND_DIR, 'main.py'), '--port', '0'],
+        cwd=PROJECT_DIR, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        stdin=subprocess.PIPE, env=env, text=True, encoding='utf-8', errors='replace')
+    try:
+        hs = read_handshake(proc)
+        if 'learn-helper-backend-ready' not in hs:
+            check('D1 next_page：后端可启动', False, hs[:120])
+            return
+        check('D1 next_page：后端可启动', True)
+        base = f'http://127.0.0.1:{json.loads(hs)["port"]}'
+
+        # 先确认"未知动作"确实会被拒 —— 否则下面的断言可能永远通过（假绿）
+        r0 = http_post(f'{base}/api/control', json={'action': 'no_such_action_xyz'},
+                       timeout=15)
+        j0 = r0.json()
+        check('D2 未知动作被明确拒绝（对照，证明 D3 不是假绿）',
+              (not j0.get('ok')) and ('未知' in str(j0.get('message', ''))),
+              str(j0)[:140])
+
+        r = http_post(f'{base}/api/control', json={'action': 'next_page'},
+                      timeout=120)
+        j = r.json()
+        msg = str(j.get('message') or '')
+        print(f'  [info] next_page -> ok={j.get("ok")} msg={msg[:120]}')
+        # 四种合法回答：翻过去了 / 点了但标题没变 / 没有按钮 / 连不上浏览器
+        ok_shapes = ('已翻页' in msg) or ('已点击' in msg) or ('没有找到' in msg) or ('无法连接' in msg)
+        check('D3 next_page 被路由到引擎并如实回答', ok_shapes, msg[:140])
+        check('D4 next_page 不是未知动作', '未知' not in msg, msg[:140])
+    finally:
+        try:
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=25)
+        except Exception:
+            proc.kill()
+            proc.wait(timeout=10)
+
+
+# ----------------------------------------------------------------------------
 # C. 纯逻辑
 # ----------------------------------------------------------------------------
 def test_logic():
@@ -652,6 +708,7 @@ def main():
     try:
         test_process_lifecycle()
         test_engine_unit()
+        test_next_page_action()
         test_logic()
     finally:
         print(f'\n[info] 测试用临时目录: {_TEST_BASE}')

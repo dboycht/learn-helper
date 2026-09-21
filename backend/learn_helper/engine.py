@@ -256,6 +256,77 @@ class SolverEngine:
         self.hub.emit_log(text)
         return {'ok': True, 'message': text}
 
+    def next_page(self):
+        """手动点一次学习页的「下一页/下一章」（短连接；与主流程互斥）。
+
+        用途：给界面加一个「下一章」按钮，**不必等整节刷完**就能验证翻页链路是否正常
+        （翻页曾是坏了一整个版本的功能，见 ERROR.md E69）。也和自动流程共用同一个
+        `core.find_next_button`，所以它点了什么，自动流程就会点什么 —— 测出来的结果可信。
+        """
+        if self.solver_running:
+            return {'ok': False, 'message': '刷课运行中，翻页由流程自己控制；请先停止再手动翻页。'}
+        with self._io_lock:
+            try:
+                ok, proc = core.kill_and_launch_browser()
+                if not ok:
+                    msg = '无法连接/拉起浏览器（9222 不可用）。'
+                    self.hub.emit_log(f'[翻页] {msg}')
+                    return {'ok': False, 'message': msg}
+                self.browser_proc = proc
+                sync_playwright = core.require_playwright()
+                with sync_playwright() as p:
+                    browser = p.chromium.connect_over_cdp(core.CDP_URL)
+                    ctx = browser.contexts[0] if browser.contexts else None
+                    if ctx is None:
+                        msg = '浏览器没有可用上下文。'
+                        self.hub.emit_log(f'[翻页] {msg}')
+                        browser.close()
+                        return {'ok': False, 'message': msg}
+                    selected = (getattr(self.hub, 'selected_title', None) or '')
+                    page = self._locate_page(ctx, selected)
+                    if page is None and ctx.pages:
+                        page = ctx.pages[-1]
+                    if page is None:
+                        msg = '没有可操作的标签页。'
+                        self.hub.emit_log(f'[翻页] {msg}')
+                        browser.close()
+                        return {'ok': False, 'message': msg}
+
+                    before = self._safe_title(page, fallback='')
+                    btn, _frame = core.find_next_button(page)
+                    if not btn:
+                        msg = f'当前页没有找到「下一页/下一章」按钮（页面：{before}）。'
+                        self.hub.emit_log(f'[翻页] {msg}')
+                        browser.close()
+                        return {'ok': False, 'message': msg}
+                    try:
+                        btn.scroll_into_view_if_needed()
+                        time.sleep(0.2)
+                        btn.click(force=True)
+                    except Exception as e:
+                        msg = f'点击「下一页」失败: {e}'
+                        self.hub.emit_log(f'[翻页] {msg}')
+                        browser.close()
+                        return {'ok': False, 'message': msg}
+                    # 等新页面的标题 / URL 变化，好把"到底翻过去没有"如实回报给用户
+                    changed = False
+                    for _ in range(15):
+                        time.sleep(0.2)
+                        if self._safe_title(page, fallback='') != before:
+                            changed = True
+                            break
+                    after = self._safe_title(page, fallback='')
+                    browser.close()
+            except Exception as e:
+                msg = f'翻页异常: {e}'
+                self.hub.emit_log(f'[翻页] {msg}')
+                return {'ok': False, 'message': msg}
+        if changed:
+            self.hub.emit_log(f'[翻页] 已翻到：{after}')
+            return {'ok': True, 'message': f'已翻页：【{before}】→【{after}】'}
+        self.hub.emit_log(f'[翻页] 已点击「下一页」，但页面标题仍是：{after}')
+        return {'ok': True, 'message': f'已点击「下一页」（标题未变，可能仍在同一页）：{after}'}
+
     def test_backend(self, base=None):
         """测试后端连接（纯网络）。"""
         ok, message = core.probe_backend(base=base)

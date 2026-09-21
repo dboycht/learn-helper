@@ -673,6 +673,10 @@ def _make_handler(hub, on_shutdown):
             elif action == 'diagnose':
                 res = engine.diagnose()
                 ok, msg = bool(res.get('ok')), res.get('message', '')
+            elif action == 'next_page':
+                # 手动翻页：给界面的「下一章」按钮用，便于单独验证翻页链路（见 engine.next_page）。
+                res = engine.next_page()
+                ok, msg = bool(res.get('ok')), res.get('message', '')
             elif action == 'test_backend':
                 res = engine.test_backend(base=params.get('server_url'))
                 ok, msg = bool(res.get('ok')), res.get('message', '')
