@@ -8,13 +8,15 @@
 
 现在：**窗口由 Qt 托管** —— 用 Qt 自带的标题栏（`QMainWindow` 原生边框），
 拖动、缩放、贴边分屏、边缘吸附、多显示器 DPI 全部由 Windows 自己处理，
-我们一行相关代码都不写 ⇒ 不可能再抖。绘制交给 Qt 的控件的原生绘制，
-空闲时零重绘（实测 0% CPU）。
+我们一行相关代码都不写 ⇒ 不可能再抖。绘制交给 Qt 控件的原生绘制，
+空闲时几乎不耗 CPU（实测 0.31%/10s）。
 
-⚠️ 有一条**必须保留**的兼容约定：窗口类名必须叫 `LearnHelperNativeWnd`，
-否则 `native/*.ps1` 那批探针找不到窗口（它们按类名枚举）。
-Qt 给的类名是 `Qt5QWindowIcon` / `Qt6QWindowIcon`，所以这里在 `WM_NCCREATE`
-里用 `SetClassNameW` 改掉它 —— 这是"新界面也要能被既有探针验证"的关键一步。
+⚠️ **窗口类名改不掉（试过，不行）**：Qt 给的类名是 `Qt6100QWindowIcon`，而
+`SetClassNameW` **在 user32 的导入表里根本不存在**（只有 MSDN 文档里有；实测调用报
+"function 'SetClassNameW' not found"），所以既有的 `native/*.ps1` 探针（按类名枚举窗口）
+**无法直接复用**。那些探针测的是 Rust 实现细节（自绘标题栏、自绘下拉窗口、自绘滚动条），
+在 Qt 结构下已无意义；本前端的验证改由 `frontend/verify_qt.py` 承担
+（Qt 可被内省，断言比"戳像素"更硬）。`native/` 与 Rust 探针保留作退路。
 """
 from __future__ import annotations
 
@@ -26,12 +28,13 @@ from ctypes import wintypes
 from typing import Optional
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QFont, QIcon, QKeySequence, QTextCursor
+from PySide6.QtGui import (QAction, QColor, QFont, QIcon, QKeySequence, QPainter,
+                           QPixmap, QTextCursor)
 from PySide6.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMainWindow,
-    QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox, QStatusBar,
-    QDoubleSpinBox, QVBoxLayout, QWidget,
+    QMenu, QMessageBox, QPlainTextEdit, QPushButton, QSizePolicy, QSpinBox,
+    QStatusBar, QSystemTrayIcon, QVBoxLayout, QWidget,
 )
 
 from .backend_client import BackendClient, PROJECT_DIR
@@ -97,6 +100,8 @@ class Diag:
 
     ⚠️ 保留这个文件是**刻意的**：项目里所有排障经验、探针判定都依赖它
     （`paint-logs:` / `ui: geometry` / `ui: invoke ...`）。
+    位置由 `backend_client._app_dir()` 决定 —— **冻结时必须落在 exe 旁边**，
+    不能落在 `_MEIPASS` 临时目录（那里会被删掉，日志当场消失，实测踩到）。
     """
 
     def __init__(self) -> None:
@@ -160,6 +165,43 @@ class KpiCard(QFrame):
 
     def set(self, text: str) -> None:
         self.value.setText(str(text))
+
+
+def _make_tray_pixmap(size: int = 64) -> QPixmap:
+    """现画一个托盘图标（圆角蓝底 + 白色对勾），不依赖任何外部文件。
+
+    ⚠️ 用**代码画**而不是读 `logo.ico`：打包成单文件后资源路径会变，
+    读文件最容易变成"托盘一片空白"，而画出来的永远在。
+    """
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    try:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        p.setBrush(QColor('#2f81f7'))
+        p.setPen(Qt.NoPen)
+        r = size * 0.18
+        p.drawRoundedRect(int(size * 0.06), int(size * 0.06),
+                          int(size * 0.88), int(size * 0.88), r, r)
+        # 对勾
+        pen = p.pen()
+        pen.setColor(QColor('#ffffff'))
+        pen.setWidthF(size * 0.11)
+        pen.setCapStyle(Qt.RoundCap)
+        pen.setJoinStyle(Qt.RoundJoin)
+        p.setPen(pen)
+        p.drawPolyline([
+            _pt(size, 0.26, 0.54), _pt(size, 0.44, 0.71),
+            _pt(size, 0.74, 0.33),
+        ])
+    finally:
+        p.end()
+    return pm
+
+
+def _pt(size: int, fx: float, fy: float):
+    from PySide6.QtCore import QPointF
+    return QPointF(size * fx, size * fy)
 
 
 # ----------------------------------------------------------------------------
@@ -369,9 +411,11 @@ class MainWindow(QMainWindow):
         self.client.set_trace_hook(self._trace)
         self._selected_page = ''
         self._pages: list[str] = []
+        self._pages_synced = False      # view 是否已按 `_pages` 同步过（见 _apply_pages）
         self._speed = 2.0
         self._last_status: dict = {}
         self._pending_autolaunch = False
+        self.tray: Optional[QSystemTrayIcon] = None
 
         self.setWindowTitle(f'{APP_TITLE} v2.1.4')
         self.resize(1180, 820)
@@ -380,6 +424,8 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._wire()
         self._install_class_name_patch()
+        self._build_tray()
+        self._quitting = False
 
         # 换肤/主题交给 Qt；这里固定深色（用户环境是深色）
         app = QApplication.instance()
@@ -657,14 +703,32 @@ class MainWindow(QMainWindow):
             self._sync_page_box()
 
     def _on_pages(self, pages: list) -> None:
+        """管道推来的页面列表（走统一入口）。"""
+        self._apply_pages(pages)
+
+    def _apply_pages(self, pages: list) -> None:
+        """**唯一**更新页面列表的入口：先更新 model，再同步 view。
+
+        ⚠️ 这里修过两个"下拉框空着"的真 bug（2026-09-21）：
+        1. `_poll_loop` 原来**直接写 `self._pages`**，于是随后管道推来的 `pages` 事件
+           被判成"没变化"直接 return ⇒ **view 永远没被同步**，下拉框一直空白。
+        2. 去重只比了 model：`_pages` 初值就是 `[]`，所以**第一次**推来空列表时
+           被判成"没变化"⇒ 连"未检测到网页"这个占位都不会填，用户看到一个**空框**。
+        **判据：去重必须同时考虑"view 是否已经同步过"**，否则 model 与 view 会脱节。
+        """
         pages = [str(p) for p in pages]
-        # ⚠️ 去重：轮询每 1.2 秒发一次 pages 事件，列表没变就不该重建下拉框
+        # 去重：轮询每 1.2 秒发一次，列表没变且 view 已同步过就不重建
         #（重建会重置当前选中项、并且每秒白刷几次）。
-        if pages == self._pages:
+        if pages == self._pages and self._pages_synced:
             return
         self._pages = pages
+        self._pages_synced = True
         self.diag(f'ui: pages -> {len(self._pages)}')
         self._sync_page_box()
+
+    def _sync_pages_from_status(self, st: dict) -> None:
+        """从 HTTP 状态里取页面列表（轮询兜底）。走同一个入口。"""
+        self._apply_pages(st.get('pages') or [])
 
     def _sync_page_box(self) -> None:
         """把页面列表填进下拉框。
@@ -762,10 +826,92 @@ class MainWindow(QMainWindow):
         """每秒兜底刷新（管道正常时其实用不上，但断线时能自愈）。"""
         pass
 
+    # ------------------------------------------------------------ 托盘
+    def _build_tray(self) -> None:
+        """系统托盘：挂机时用户可以关掉窗口而不中断刷课。
+
+        ⚠️ 托盘图标用**程序里现成的**绘制（不依赖外部 ico 文件），
+        这样打包成单文件也不会因为资源路径变化而变成空白图标。
+        """
+        if not QSystemTrayIcon.isSystemTrayAvailable():
+            self.diag('ui: 系统托盘不可用，跳过')
+            return
+        icon = QIcon(_make_tray_pixmap())
+        self.tray = QSystemTrayIcon(icon, self)
+        self.tray.setToolTip(f'{APP_TITLE} v2.1.4')
+
+        menu = QMenu()
+        self.act_show = QAction('显示主界面', self)
+        self.act_show.triggered.connect(self._restore_from_tray)
+        menu.addAction(self.act_show)
+        menu.addSeparator()
+        self.act_start = QAction('启动刷课', self)
+        self.act_start.triggered.connect(lambda: self._control('start'))
+        self.act_pause = QAction('暂停/继续', self)
+        self.act_pause.triggered.connect(self._toggle_pause)
+        self.act_stop = QAction('终止并退出', self)
+        self.act_stop.triggered.connect(self._on_stop)
+        menu.addAction(self.act_start)
+        menu.addAction(self.act_pause)
+        menu.addAction(self.act_stop)
+        menu.addSeparator()
+        act_quit = QAction('退出界面', self)
+        act_quit.triggered.connect(self._quit_from_tray)
+        menu.addAction(act_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(self._on_tray_activated)
+        self.tray.show()
+        self.diag('ui: tray icon installed')
+
+    def _toggle_pause(self) -> None:
+        paused = bool((self._last_status.get('engine') or {}).get('paused'))
+        self._control('resume' if paused else 'pause')
+
+    def _restore_from_tray(self) -> None:
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def _quit_from_tray(self) -> None:
+        """托盘菜单里的"退出界面"：真正退出（不再弹确认，用户已经明确点了）。"""
+        self._quitting = True
+        self.close()
+
+    def _on_tray_activated(self, reason) -> None:
+        if reason == QSystemTrayIcon.DoubleClick:
+            self._restore_from_tray()
+
     # ------------------------------------------------------------ 关闭
     def closeEvent(self, event) -> None:  # noqa: N802
         running = bool((self._last_status.get('engine') or {}).get('running'))
-        if running:
+        # 托盘可用且流程在跑 ⇒ 默认**最小化到托盘**（挂机场景：用户想关窗口但不想中断刷课）。
+        # 直接退出仍然是选项之一。没有托盘就退回原来的二选一确认。
+        if running and not getattr(self, '_quitting', False) and getattr(self, 'tray', None):
+            box = QMessageBox(self)
+            box.setWindowTitle('关闭界面')
+            box.setText('刷课流程还在运行。')
+            box.setInformativeText('要最小化到系统托盘继续刷课，还是直接退出（会中断刷课）？')
+            btn_tray = box.addButton('最小化到托盘', QMessageBox.AcceptRole)
+            btn_quit = box.addButton('直接退出', QMessageBox.DestructiveRole)
+            box.addButton('取消', QMessageBox.RejectRole)
+            box.exec()
+            clicked = box.clickedButton()
+            if clicked is btn_tray:
+                self.hide()
+                self.tray.showMessage(APP_TITLE, '已最小化到托盘，刷课继续进行。',
+                                      QSystemTrayIcon.Information, 2500)
+                self.diag('ui: close -> 最小化到托盘')
+                event.ignore()
+                return
+            if clicked is btn_quit:
+                try:
+                    self.client.control('stop')
+                except Exception:
+                    pass
+            else:
+                event.ignore()
+                return
+        elif running:
             ask = QMessageBox.question(
                 self, '确认退出',
                 '刷课流程还在运行，退出会中断它。确定要退出吗？',
@@ -777,10 +923,13 @@ class MainWindow(QMainWindow):
                 self.client.control('stop')
             except Exception:
                 pass
+
         self.diag('ui: invoke Close')
         self.status.showMessage('正在退出…')
         QApplication.processEvents()
         self.client.shutdown()
+        if getattr(self, 'tray', None):
+            self.tray.hide()
         self.diag('native: 事件循环结束，退出')
         event.accept()
 

@@ -4,7 +4,18 @@
 
 ## 版本
 
-- **2.1.4**（2026-09-19，源码包）：
+- **2.1.4**（2026-09-20，源码包）：
+  - ⭐ **界面重写为 PySide6 (Qt6)**：此前是手写的 Win32/GDI 界面（自绘标题栏 + 自己实现
+    拖动/缩放/命中测试 + 每帧整窗全量绘制），**拖动窗口时会发抖**，也丢掉了贴边分屏、
+    边缘吸附这些系统行为。现在改用 Qt 原生窗口 ⇒ **拖动、缩放、贴边分屏、多显示器 DPI
+    全部由 Windows 负责**，界面侧一行相关代码都没有。外观为现代深色扁平，含系统托盘。
+    ⚠️ 代价：整包从 10.6 MB 变为约 **58 MB**（Qt 运行时占大头）。
+  - **修「平台确认弹窗点不掉」**：学习通在"本节还有任务点没做完"时会弹
+    「当前章节还有任务点未完成，是否去完成？」+「去学习 / 下一节」。
+    原代码的按钮选择器写死了平台类名（`.popDiv .nextChapter` / `确定`），
+    而真实按钮叫「去学习」「下一节」⇒ **一个都命中不了**，弹窗原地不动，
+    表现就是"翻页没反应"。现在改为按**文案 + 弹窗容器**定位（不依赖平台类名），
+    并把手动「下一章」与自动流程统一到同一份实现。
   - **新增「下一章」按钮**：「当前网页」框与「检测/刷新网页」之间，点一下就让学习页
     翻到下一页/下一章 —— **不必等整节刷完**就能验证翻页。它走的是与自动流程**同一个**
     "找下一页按钮"的实现，所以这个按钮通 = 自动翻页通。
@@ -19,8 +30,8 @@
   - **修「测验整节被跳过」**：完成态判据里 `.score` / `[class*="score"]` 是子串匹配，
     页面上任何带 "score" 的元素都会被当成"已判分" ⇒ 整节跳过答题。
     判据已收紧为"判分角标 / 答案成绩文案"。
-  - **整包从 51.4 MB 瘦到约 10.6 MB**（zip 约 10.2 MB）：去掉 Playwright 自带的
-    `node.exe`（88 MB 未压缩）、TypeScript 类型定义、trace viewer 资源与 Pillow。
+  - **后端瘦身**：去掉 Playwright 自带的 `node.exe`（88 MB 未压缩）、TypeScript 类型定义、
+    trace viewer 资源与 Pillow ⇒ 后端 exe 从 51.4 MB 降到约 **10.0 MB**。
     ⚠️ **代价见下方"运行要求"**。
   - **修一批健壮性问题**：配置并发写入会丢光（现加锁 + 原子替换，坏文件自动备份为 `.bad`）、
     拖动窗口不跟手（位移改用客户区坐标）、鼠标负坐标、中文日志导致进程被杀、
@@ -55,7 +66,7 @@
   - 稳定性：为上述行为补齐无头回归（后端自测 **38** 项；界面探针 settings **24** / pages **16** /
     about **14** / logscroll **37** / 悬停 **9** / 自动开浏览器 **11** / 焦点让路 **7** / 图标 **9**）。
 - **2.1.1**（已发布，源码包）：**界面重构为原生 Win32（Rust）+ Python 后端服务**，主打「好传播」。
-  - **前端**：`native/` —— Rust 手写 Win32/GDI/DWM，**单 exe 约 0.56 MB**，
+  - **前端**：`frontend/` —— PySide6 (Qt6)，
     解压即用；**纯色自绘界面**（用系统标题栏 + Win11 圆角 + 深色标题栏，
     客户区不透明自绘 —— 不做玻璃背板），保留原生缩放 / 贴边。
   - **后端**：`backend/` —— Python 服务（Playwright 刷课 + 答题），
@@ -81,16 +92,18 @@
 | --- | --- | --- |
 | 1.0.3（WinUI 3，框架依赖） | 26.1 MB | **.NET 9 Desktop Runtime + Windows App SDK Runtime** |
 | 1.0.3（WinUI 3，自包含） | 85.7 MB | 无 |
-| **2.1.4（原生 UI + 瘦身后端）** | **0.56 MB** | **需要 Node.js**（见"运行要求"） |
+| **2.1.4（PySide6 UI + 瘦身后端）** | **58.4 MB** | **需要 Node.js**（见"运行要求"） |
 
 > 后端仍然需要本机有 Python + playwright（或者用 `build_release.ps1` 把它打成 exe 一起分发）；
-> 打整包时体积的大头曾经是 Playwright 自带运行时；2.1.4 起已瘦身到约 10.6 MB（UI 约占 5%）。
+> 打整包时体积的大头曾经是 Playwright 自带运行时（51 MB），2.1.4 一度瘦到 10.6 MB；随后界面换成 PySide6(Qt6)，整包约 **58 MB**（Qt 运行时占大头，用户已知情并选择"手感优先"）。
 
 ### 新增
 
-- **原生 Win32 前端**（`native/`，Rust）：自绘标题栏（含拖拽 / 八方向缩放 / 双击最大化）
-  + 完全自绘的纯色界面，Win11 圆角、深色标题栏、PerMonitorV2 DPI 感知；
-  界面空闲时**零重绘**（状态指纹门控 + 双缓冲）。
+- **默认界面**（`frontend/`，**PySide6 / Qt6**）：Qt 原生窗口，因此**窗口拖动 / 缩放 /
+  贴边分屏 / 边缘吸附 / 多显示器 DPI 全部由 Windows 负责**，界面侧不写任何相关代码；
+  深色扁平主题、系统托盘（挂机时可最小化到托盘继续刷课）、菜单栏、实时日志视图。
+  > 更早的 **手写 Rust Win32/GDI 界面**（`native/`）保留为**退路**：它的自绘标题栏 +
+  > 自实现拖动/缩放 + 每帧整窗全量绘制会导致**拖动发抖**，所以 2.1.4 起不再是默认。
 - **Python 后端服务**（`backend/learn_helper/`）：把原先 Tkinter 客户端里的
   刷课 / 答题逻辑迁出（**去掉全部 UI**），成为独立服务：
   - **HTTP**（`127.0.0.1:<随机端口>`）：`/api/health`、`/api/status`、`/api/pages`、
@@ -98,11 +111,13 @@
     诊断 / 测试后端 / 自检 / 退出）、`/api/logs`；
   - **命名管道**：后端单向推送日志 / 进度 / 状态，界面实时显示；
   - 端口由系统随机分配，前端通过后端 stdout 的**握手行**获知，不猜端口。
-- **「答题设置」对话框**（界面标题栏齿轮图标）：答题方式三选一、后端地址、并发线程、
-  单题超时、失败重试、大模型 Base URL / API Key / 模型名、自动提交开关；
+- **「答题设置」对话框**（菜单栏「文件 → 答题设置…」，`Ctrl+,`）：答题方式三选一、后端地址、
+  并发线程、单题超时、失败重试、大模型 Base URL / API Key / 模型名、自动提交开关；
   「测试连接」按钮可当场验证后端地址。**API Key 留空 = 不修改**（不会把已存的 key 抹掉）。
-- **`backend/verify_backend.py`**：55 项无头自动化验收（进程级端到端、引擎状态机、
+- **`backend/verify_backend.py`**：**61 项**无头自动化验收（进程级端到端、引擎状态机、
   纯逻辑与 mock 后端自检），改动后端后一条命令即可回归。
+- **`frontend/verify_qt.py`**：**47 项**界面自检（可无头跑）：界面骨架、纯交互逻辑、
+  真实后端握手与 HTTP 合同、退出无残留。
 
 ### 保留
 
@@ -114,7 +129,7 @@
 
 | 路径 | 说明 |
 | --- | --- |
-| **`native/`** | **原生 Win32 前端（Rust）** —— 本版默认界面，单 exe 约 0.56 MB |
+| **`frontend/`** | ⭐ **默认界面：PySide6 (Qt6)** —— Qt 原生窗口，拖动/缩放/贴边由 Windows 负责 |
 | `native/src/ui.rs` | 窗口与自绘界面（布局 / 绘制 / 鼠标 / 按钮状态） |
 | `native/src/settings.rs` | 「答题设置」对话框（自绘控件 + 读写 `/api/settings`） |
 | `native/src/backend.rs` | 后端客户端：拉起进程、stdout 握手、命名管道事件、HTTP 调用 |
@@ -126,7 +141,7 @@
 | `backend/learn_helper/core.py` | 刷课 / 答题核心（注入脚本、题型识别、求解、填涂） |
 | `backend/learn_helper/engine.py` | `SolverEngine`：状态机 + 专用自动化线程 |
 | `backend/learn_helper/ipc.py` | HTTP 接口 + 命名管道推送 |
-| `backend/verify_backend.py` | **后端自动化验收（55 项）** |
+| `backend/verify_backend.py` | **后端自动化验收（61 项）** |
 | `winui/` | WinUI 3 界面（1.0.3 起；**现为备选退路**，`winui/RunWinUI.bat` 启动） |
 | `learn_helper.py` | 旧 Tkinter 客户端（逻辑参考） |
 | `client_app_reconstructed.py` | 原软件的反编译重建（研究参考，见 `docs/技术文档.md`） |
@@ -143,7 +158,7 @@ cd native
 cargo build --release
 ```
 
-产物 `native\target\release\learn-helper-native.exe`（约 0.56 MB），双击 `运行界面.bat` 亦可。
+产物 `frontend\main.py`，双击 `运行界面.bat` 亦可。
 
 > 界面会自动寻找并拉起后端：打包后是 `backend\learn-helper-core.exe`；
 > 开发期则是沿目录树找到 `backend\main.py` 并用本机 Python 拉起
@@ -172,7 +187,7 @@ powershell -ExecutionPolicy Bypass -File native\build_release.ps1 -Zip
 | --- | --- |
 | Windows 10/11 + Edge 或 Chrome | 自动化连的是**系统已装的浏览器**（`--remote-debugging-port=9222`），不随包分发浏览器 |
 | **Node.js** | ⚠️ 2.1.4 起整包**不再自带** Playwright 的 Node 运行时（那一个文件就近 90 MB，是当时整包 51 MB 的主因）。程序按 `PATH` → `Program Files\nodejs` → `%LOCALAPPDATA%\Programs\nodejs` → `%APPDATA%\npm` 找 `node.exe`；装在别处可用环境变量 **`LH_NODE_PATH`** 指定 |
-| （可选）Pillow | 只有「答题设置 → 自检」的**合成测试图**功能需要；整包为瘦身已排除 Pillow，缺了会提示 `pip install pillow`，**不影响主线刷课** |
+| （可选）Pillow | 只有"合成测试题图"这类自检需要；整包为瘦身已排除 Pillow，缺了会提示 `pip install pillow`，**不影响主线刷课**（界面里目前没有该按钮入口，见下面说明） |
 
 - **没装 Node.js 会怎样**：界面能正常打开，但点「启动刷课」会报**浏览器挂载失败**
   （自动化层依赖 Node）。装一次 Node.js 即可，或自建包含 `node.exe` 的完整包。

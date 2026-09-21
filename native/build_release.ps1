@@ -1,11 +1,16 @@
 # build_release.ps1 -- build the full 2.x distribution (ASCII only, per rules/01 section 8.2:
-# PowerShell 5.1 reads BOM-less files as GBK, so Chinese here would break parsing).
+# PowerShell 5.1 reads BOM-less UTF-8 as GBK, so Chinese here would break parsing).
 #
 #   dist\learn-helper-<ver>\
-#     LearnHelper.exe            <- native Rust UI, ~0.3 MB, zero dependency
-#     backend\learn-helper-core.exe <- PyInstaller onefile backend (Playwright inside)
-#     Run.bat                    <- plain ASCII launcher
+#     LearnHelper.exe                <- PySide6 (Qt6) UI, onefile (~48 MB)
+#     backend\learn-helper-core.exe  <- PyInstaller onefile backend (Playwright inside)
+#     LearnHelperNative.exe          <- OPTIONAL Rust fallback UI (only with -IncludeRustUi)
+#     Run.bat                        <- plain ASCII launcher
 #     README.txt
+#
+# The product UI is PySide6 since 2.1.4: it uses a real Qt window, so moving / resizing /
+# snap layouts are handled by Windows itself. The previous hand-written Win32/GDI UI is the
+# one that "trembled" while dragging and is now only an optional fallback.
 #
 # Then:  Compress-Archive dist\learn-helper-<ver> dist\learn-helper-<ver>.zip
 #
@@ -14,6 +19,7 @@
 param(
     [switch]$SkipBackend,
     [switch]$SkipUi,
+    [switch]$IncludeRustUi,
     [switch]$Zip
 )
 
@@ -31,36 +37,49 @@ if (-not $version) { throw "cannot read version from $cargo" }
 $dist = Join-Path $root "dist\learn-helper-$version"
 Write-Host "=== learn-helper $version build ===" -ForegroundColor Cyan
 
-# ---------------------------------------------------------------- UI (Rust)
+# ---------------------------------------------------------------- UI (PySide6 / Qt6)
+# The product UI. Built through native\learn-helper-ui.spec so the Qt modules we never
+# import (WebEngine/Qml/Quick/Charts/Multimedia/Network/Sql/...) are excluded -- the spec
+# prints how many data files it dropped, so a regression is visible in the build log.
+$uiExe = Join-Path $root '_release\pyi-ui\LearnHelperUI.exe'
 if (-not $SkipUi) {
-    Write-Host "[1/3] cargo build --release (native UI)" -ForegroundColor Yellow
+    Write-Host "[1/4] PyInstaller onefile (PySide6 UI)" -ForegroundColor Yellow
+    Push-Location $root
+    & py -3.12 -m PyInstaller --noconfirm --clean `
+        --distpath '_release\pyi-ui' `
+        --workpath '_release\pyi-ui-work' `
+        'native\learn-helper-ui.spec'
+    $uiCode = $LASTEXITCODE
+    Pop-Location
+    if ($uiCode -ne 0 -or -not (Test-Path $uiExe)) { throw "PyInstaller UI build failed" }
+}
+if (-not (Test-Path $uiExe)) { throw "UI exe not found: $uiExe (run without -SkipUi)" }
+
+# ---------------------------------------------------------------- UI (Rust, optional)
+$rustExe = $null
+if ($IncludeRustUi) {
+    Write-Host "[2/4] cargo build --release (Rust fallback UI)" -ForegroundColor Yellow
     Push-Location $PSScriptRoot
     & cargo build --release
     if ($LASTEXITCODE -ne 0) { Pop-Location; throw "cargo build failed" }
     Pop-Location
-}
-
-$uiExe = Join-Path $PSScriptRoot 'target\release\learn-helper-native.exe'
-if (-not (Test-Path $uiExe)) { throw "native exe not found: $uiExe (run without -SkipUi)" }
-
-# ---------------------------------------------------------------- icon
-# Stamp the multi-size icon into the freshly built exe. `cargo build` always produces an exe without
-# icon resources, so this MUST run after every build (a rebuild silently drops the icon otherwise).
-# The ICO itself is generated from native\logo-src.png by _tools\make-icon.ps1 (16/24/32/48/64/128/256).
-$icon = Join-Path $PSScriptRoot 'logo.ico'
-if (Test-Path $icon) {
-    Write-Host "[icon] stamping logo.ico into the exe" -ForegroundColor Yellow
-    & powershell -ExecutionPolicy Bypass -File (Join-Path $root '_tools\make-icon.ps1') `
-        -IconFile $icon -ExeFile $uiExe
-    if ($LASTEXITCODE -ne 0) { throw "icon stamping failed" }
-} else {
-    Write-Host "[icon] SKIPPED: $icon not found" -ForegroundColor DarkYellow
+    $rustExe = Join-Path $PSScriptRoot 'target\release\learn-helper-native.exe'
+    if (-not (Test-Path $rustExe)) { throw "native exe not found: $rustExe" }
+    # Stamp the multi-size icon: `cargo build` always produces an exe without icon resources,
+    # so this MUST run after every build (a rebuild silently drops the icon otherwise).
+    # The ICO itself is generated from native\logo-src.png by _tools\make-icon.ps1.
+    $icon = Join-Path $PSScriptRoot 'logo.ico'
+    if (Test-Path $icon) {
+        & powershell -ExecutionPolicy Bypass -File (Join-Path $root '_tools\make-icon.ps1') `
+            -IconFile $icon -ExeFile $rustExe
+        if ($LASTEXITCODE -ne 0) { throw "icon stamping failed" }
+    }
 }
 
 # ---------------------------------------------------------------- backend
 $backendExe = Join-Path $root '_release\pyi\learn-helper-core.exe'
 if (-not $SkipBackend) {
-    Write-Host "[2/3] PyInstaller onefile (Python backend, slim spec)" -ForegroundColor Yellow
+    Write-Host "[3/4] PyInstaller onefile (Python backend, slim spec)" -ForegroundColor Yellow
     # NOTE: we build through native\learn-helper-core.spec instead of passing flags here,
     # because the spec filters out ~106 MB of raw payload that must never ship:
     #   playwright\driver\node.exe                      88.25 MB  (system Node is used instead)
@@ -81,13 +100,14 @@ if (-not $SkipBackend) {
 if (-not (Test-Path $backendExe)) { throw "backend exe not found: $backendExe" }
 
 # ---------------------------------------------------------------- stage
-Write-Host "[3/3] staging -> $dist" -ForegroundColor Yellow
+Write-Host "[4/4] staging -> $dist" -ForegroundColor Yellow
 if (Test-Path $dist) { Remove-Item -Recurse -Force $dist }
 New-Item -ItemType Directory -Force -Path $dist | Out-Null
 New-Item -ItemType Directory -Force -Path (Join-Path $dist 'backend') | Out-Null
 
 Copy-Item $uiExe (Join-Path $dist 'LearnHelper.exe') -Force
 Copy-Item $backendExe (Join-Path $dist 'backend\learn-helper-core.exe') -Force
+if ($rustExe) { Copy-Item $rustExe (Join-Path $dist 'LearnHelperNative.exe') -Force }
 
 # Launcher: plain ASCII so it works on any code page. The UI finds the backend
 # next to itself (backend\learn-helper-core.exe) and starts it automatically.
@@ -145,8 +165,10 @@ No Python needs to be installed: the backend ships as a single self-contained ex
 
 Files
 -----
-  LearnHelper.exe            UI (native Win32, ~0.4 MB, zero dependency)
-  backend\learn-helper-core.exe   Python backend (browser automation + solving)
+  LearnHelper.exe                UI (PySide6 / Qt6, ~48 MB, self-contained)
+  backend\learn-helper-core.exe  Python backend (browser automation + solving)
+  LearnHelperNative.exe          OPTIONAL fallback UI (hand-written Rust; smaller but
+                                 its window dragging is worse -- only use if Qt fails)
   config.example.json        copy to config.json and edit to change the
                              answering backend / model / speed
   logs\learn_helper.log      created on first run (backend log)
@@ -161,10 +183,14 @@ $uiSize = (Get-Item (Join-Path $dist 'LearnHelper.exe')).Length / 1MB
 $beSize = (Get-Item (Join-Path $dist 'backend\learn-helper-core.exe')).Length / 1MB
 $total = (Get-ChildItem $dist -Recurse -File | Measure-Object Length -Sum).Sum / 1MB
 Write-Host ""
-Write-Host ("  UI      : {0:N2} MB" -f $uiSize)
-Write-Host ("  backend : {0:N1} MB" -f $beSize)
-Write-Host ("  TOTAL   : {0:N1} MB" -f $total) -ForegroundColor Green
-Write-Host "  staged  : $dist"
+Write-Host ("  UI (Qt)  : {0:N1} MB" -f $uiSize)
+$rustPath = Join-Path $dist 'LearnHelperNative.exe'
+if (Test-Path $rustPath) {
+    Write-Host ("  UI (Rust): {0:N2} MB (optional fallback)" -f ((Get-Item $rustPath).Length / 1MB))
+}
+Write-Host ("  backend  : {0:N1} MB" -f $beSize)
+Write-Host ("  TOTAL    : {0:N1} MB" -f $total) -ForegroundColor Green
+Write-Host "  staged   : $dist"
 
 if ($Zip) {
     # NOTE: do not name this $zip -- PowerShell is case-insensitive and it would

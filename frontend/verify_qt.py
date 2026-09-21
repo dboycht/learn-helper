@@ -144,6 +144,42 @@ def _leftover_backends() -> list[str]:
         return []
 
 
+def _reap_stale_backends() -> int:
+    """清掉**上一次自检/冒烟跑残留**的后端，返回清掉的个数。
+
+    ⚠️ 为什么需要它：残留的后端会占着沙盒浏览器（9222）。本自检一 spawn 自己的后端，
+    新后端就会把浏览器"接管"过去，**残留那个随即退出**，于是本次断言"后端仍在运行"
+    就会红 —— 那是**上一次的垃圾**造成的假失败（本轮反复踩到）。
+    真正需要避让的是"**用户正开着界面**"，那由 `_ui_running()` 判断，不是看残留。
+    """
+    killed = 0
+    for pid in _leftover_backends():
+        try:
+            subprocess.run(['taskkill', '/PID', str(pid), '/T', '/F'],
+                           capture_output=True, timeout=15)
+            killed += 1
+        except Exception:
+            pass
+    return killed
+
+
+def _ui_running() -> bool:
+    """用户是否**正开着界面**（`pythonw` 或打包的 `LearnHelper.exe`）。
+
+    界面开着时不能跑端到端：两边会争抢同一个沙盒浏览器（9222），
+    新后端把浏览器接管、老后端退出，是**环境冲突**而不是缺陷。
+    """
+    try:
+        out = subprocess.run(
+            ['powershell', '-NoProfile', '-Command',
+             "Get-Process -Name pythonw,LearnHelper -ErrorAction SilentlyContinue | "
+             "Measure-Object | Select-Object -ExpandProperty Count"],
+            capture_output=True, text=True, timeout=20)
+        return int((out.stdout or '0').strip() or 0) > 0
+    except Exception:
+        return False
+
+
 def main() -> int:
     app = QApplication(sys.argv)
     win = MainWindow(win_diag := __import__('frontend.app', fromlist=['Diag']).Diag())
@@ -234,16 +270,16 @@ def main() -> int:
     dlg.close()
 
     print('\n=== D. 真实后端（拉起 + 握手 + HTTP 合同）===')
-    # ⚠️ 如果**已经有一个 learn-helper 后端在跑**（界面开着），本自检会与它争抢同一个
-    # 沙盒浏览器：新后端把浏览器"接管"过去，老后端随即退出（实测 code=3）。
-    # 那是环境冲突、不是缺陷 ⇒ 跳过 D/E，而不是误报失败
-    #（一个"时绿时红"的测试比没有测试更糟）。
-    # 注意判据是"有没有**别的后端**"，而不是"9222 开着" —— 沙盒浏览器本来就常驻 9222。
-    other = [p for p in _leftover_backends() if p != str(os.getpid())]
-    if other:
-        print(f'  [skip] D/E：已有后端在跑（{other}）—— 请先关掉那个界面再跑本自检')
+    # ⚠️ 两条判据分工要清楚（本轮踩过"把残留当冲突、整段跳过"）：
+    #   · **用户正开着界面** ⇒ 真冲突（两边抢同一个沙盒浏览器），跳过 D/E；
+    #   · **上次跑残留的后端** ⇒ 只是垃圾，**清掉再跑**，不该因此跳过端到端。
+    if _ui_running():
+        print('  [skip] D/E：检测到界面正在运行 —— 请先关掉界面再跑本自检')
         _finish(RESULTS)
         return 1 if any(not ok for _n, ok, _d in RESULTS) else 0
+    reaped = _reap_stale_backends()
+    if reaped:
+        print(f'  [info] 清掉 {reaped} 个上次残留的后端进程，继续跑端到端')
 
     state = {'phase': 0, 'deadline': time.time() + 120}
     win.client.start()
@@ -274,9 +310,27 @@ def main() -> int:
         elif state['phase'] == 1:
             before = len(win.log_view.toPlainText())
             check('界面收到了后端日志（管道/轮询在工作）', before > 0, f'len={before}')
-            win.page_box.setCurrentIndex(1 if win.page_box.count() > 1 else 0)
-            check('页面列表已填进下拉框（或明确显示"未检测到"）',
-                  win.page_box.count() >= 1, str(win.page_box.count()))
+            # ⚠️ **不要断言"下拉框里有页面"**：那取决于本机 9222 上有没有开着的标签页，
+            # 是在测**环境**而不是测代码 —— 沙盒浏览器没起来时它会红（本轮实测踩到）。
+            # 该断言的是"轮询把后端的页面列表同步进了界面模型"：
+            # 后端 /api/status 报几页，界面 `_pages` 就应该是几页（两边可独立求证）。
+            # 轮询周期 1.2s，所以给几轮时间再判定，而不是查一次。
+            api_pages = list((c.status() or {}).get('pages') or [])
+            # 两件事都要给时间：轮询周期 1.2s（同步 `_pages`），
+            # 以及 `_on_connected` 里 200ms 后才跑的 `_after_connect`（它才第一次填下拉框）。
+            if state.get('sync_tries', 0) < 8 and (
+                    list(win._pages) != api_pages or win.page_box.count() < 1):
+                state['sync_tries'] = state.get('sync_tries', 0) + 1
+                QTimer.singleShot(700, step)
+                return
+            check('界面页面列表与后端 /api/status 一致（轮询同步生效）',
+                  list(win._pages) == api_pages,
+                  f'ui={win._pages!r} api={api_pages!r}')
+            # ⚠️ **不要断言"下拉框里有页面"**（本轮反复踩到）：本自检刻意设了
+            # `LH_NO_AUTO_BROWSER=1`，所以后端根本不会去开浏览器 ⇒ `/api/status` 的
+            # pages **本来就是空的**，断言"必须有页面"是在测环境，必然时红时绿。
+            # "空列表 / 有列表 / 列表变了"这三种 view 行为在 §F 里用纯函数级的方式验证
+            #（不依赖任何外部状态），那才是真的测到了代码。
             state['phase'] = 2
             app.quit()
             return
@@ -307,6 +361,40 @@ def main() -> int:
         check('退出后没有残留后端进程', True)
     check('重复 shutdown 幂等（不抛异常）',
           (win.client.shutdown() or True))
+
+    print('\n=== F. 页面下拉的 view 行为（纯函数级，不依赖环境）===')
+    # ⚠️ 这一段是**故意**从 D/E 里拆出来的：D/E 需要真后端（而自检设了
+    # `LH_NO_AUTO_BROWSER=1`，所以后端不会开浏览器、pages 本来就是空）。
+    # 把"空列表 / 有列表 / 列表变了"这三种 view 行为放在这里，用**直接构造的数据**验证，
+    # 与"本机有没有开浏览器"完全无关 —— 该断言的是代码，不是环境。
+    win._apply_pages([])
+    check('空列表 -> 下拉框给出"未检测到网页"占位（不是空框）',
+          win.page_box.count() == 1 and '未检测到' in win.page_box.itemText(0),
+          f'count={win.page_box.count()} item0={win.page_box.itemText(0)!r}')
+
+    win._apply_pages(['page-A', 'page-B'])
+    check('有列表 -> 占位 + 每个页面各一项',
+          win.page_box.count() == 3, f'count={win.page_box.count()}')
+    check('有列表 -> 首项是"未选择"占位且带数量',
+          ('未选择' in win.page_box.itemText(0)) and ('2' in win.page_box.itemText(0)),
+          win.page_box.itemText(0))
+    check('页面项按顺序填入且 data 可回查',
+          win.page_box.itemData(1) == 'page-A' and win.page_box.itemData(2) == 'page-B',
+          f'{win.page_box.itemData(1)!r},{win.page_box.itemData(2)!r}')
+
+    # 用户选中某一页后，列表刷新**不能把选中项弄丢**（E41 同族：新界面也要保留这个行为）
+    win.page_box.setCurrentIndex(2)          # 选中 page-B
+    win._selected_page = 'page-B'
+    win._apply_pages(['page-A', 'page-B', 'page-C'])
+    check('列表刷新后仍保留用户选中的那一页',
+          win.page_box.currentData() == 'page-B',
+          f'currentData={win.page_box.currentData()!r}')
+
+    # 同一个列表重复推送不应重建（否则每秒白刷、选中项也会抖）
+    n_before = win.page_box.count()
+    win._apply_pages(['page-A', 'page-B', 'page-C'])
+    check('列表没变时不重建下拉框（去重生效）',
+          win.page_box.count() == n_before, f'{n_before} -> {win.page_box.count()}')
 
     print()
     bad = sum(1 for _n, ok, _d in RESULTS if not ok)

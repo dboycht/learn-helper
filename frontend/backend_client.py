@@ -32,8 +32,29 @@ import requests
 from PySide6.QtCore import QObject, Signal
 
 READY_TOKEN = 'learn-helper-backend-ready'
-# 本文件在 <repo>/frontend/backend_client.py ⇒ 上溯两级就是仓库根
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _app_dir() -> str:
+    """界面应该把**自己的运行时数据**（config.json / logs / native-diag.log）放在哪。
+
+    ⚠️ **冻结（PyInstaller onefile）时绝不能用 `__file__` 拼路径**（2026-09-21 实测踩到）：
+    冻结后 `__file__` 指向 `_MEIPASS` 那个**临时解包目录**（`%TEMP%\\_MEIxxxx`），
+    进程一退就被删 ⇒ 写在那里的诊断日志"当场消失"，用户和探针都找不到。
+    （同一个坑在 `native/rthook_node.py` 里也踩过，见 ERROR.md E72。）
+
+    顺序：`LH_BASE_DIR` 显式覆盖 → 冻结时 exe 所在目录 → 源码时仓库根。
+    """
+    override = os.environ.get('LH_BASE_DIR')
+    if override:
+        return override
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# 本文件在 <repo>/frontend/backend_client.py ⇒ 源码运行时上溯两级就是仓库根；
+# 冻结时用 exe 所在目录（见 _app_dir 的说明）。
+PROJECT_DIR = _app_dir()
 BACKEND_ENTRY = os.path.join(PROJECT_DIR, 'backend', 'main.py')
 
 _NO_PROXY = {'http': None, 'https': None}
@@ -93,6 +114,12 @@ class BackendClient(QObject):
             env = dict(os.environ)
             env['PYTHONIOENCODING'] = 'utf-8'
             env.setdefault('PYTHONUTF8', '1')
+            # ⚠️ **显式告诉后端把运行时文件放哪**：后端自己会取 `sys.executable` 所在目录，
+            # 而打包后它在 `backend\` 子目录里 ⇒ 它会战 config.json / logs 放进
+            # `backend\`，与 README 说的"在 LearnHelper.exe 旁边"不符，用户找不到。
+            # 这里统一钉到界面自己的目录（= exe 旁边），源码运行 = 仓库根，行为一致。
+            env['LH_BASE_DIR'] = PROJECT_DIR
+            self._trace(f'backend: LH_BASE_DIR={PROJECT_DIR}')
             self.proc = subprocess.Popen(
                 [exe] + args,
                 cwd=PROJECT_DIR,
@@ -112,14 +139,25 @@ class BackendClient(QObject):
         self._read_handshake()
 
     def _resolve_command(self):
-        """优先用打包后的 `learn-helper-core.exe`，否则用当前解释器跑源码。
+        """决定用哪个后端可执行文件。顺序与 Rust 版一致，并**显式覆盖冻结场景**。
 
-        与 Rust 版同样的顺序（冻结后 exe 与界面同级）。
+        1. **冻结（PyInstaller onefile）**：`sys.executable` 就是界面 exe，后端在它旁边
+           （`backend\\learn-helper-core.exe`）。⚠️ 注意 onefile 下**不能**用 `sys._MEIPASS`
+           去拼路径 —— 那是会被删掉的临时解包目录，后端不在那里。
+        2. **源码运行**：`sys.executable` 是 python.exe，此时跑 `backend\\main.py`。
+        3. 两者都不成立就抛异常（好过让 `Popen` 用错误的参数静默失败）。
         """
-        cand = os.path.join(os.path.dirname(sys.executable), 'backend', 'learn-helper-core.exe')
-        if os.path.exists(cand):
-            return cand, ['--port', '0']
-        return sys.executable, [BACKEND_ENTRY, '--port', '0']
+        # 1) 打包后：后端就在界面 exe 旁边
+        for base in (os.path.dirname(sys.executable), PROJECT_DIR):
+            cand = os.path.join(base, 'backend', 'learn-helper-core.exe')
+            if os.path.exists(cand):
+                return cand, ['--port', '0']
+        # 2) 源码运行：用当前解释器跑后端脚本
+        if os.path.exists(BACKEND_ENTRY):
+            return sys.executable, [BACKEND_ENTRY, '--port', '0']
+        raise FileNotFoundError(
+            f'找不到后端：既没有打包的 backend\\learn-helper-core.exe，'
+            f'也没有源码 {BACKEND_ENTRY}')
 
     def _drain_stderr(self) -> None:
         if not self.proc or not self.proc.stderr:
