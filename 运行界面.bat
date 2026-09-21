@@ -1,43 +1,46 @@
 @echo off
 chcp 65001 >nul
 rem ============================================================
-rem  learn-helper 2.x -- native default launcher (developer build)
+rem  learn-helper 2.1.4 -- launcher (PySide6 / Qt6 frontend)
 rem
-rem  The product UI since 2.1.1 is the ZERO-DEPENDENCY Rust Win32 app
-rem  (native\), a single exe of about 0.56 MB that needs no runtime install.
-rem  NOTE: the *backend* does need Node.js on this machine since 2.1.4
-rem  (see README "运行要求"); the UI itself needs nothing.
-rem  The former WinUI 3 build is kept as a fallback and has its own
-rem  launcher: winui\RunWinUI.bat
+rem  The product UI is now built with PySide6 (Qt6): native window
+rem  frame, so moving/resizing/snap-layouts are handled by Windows
+rem  itself. The old hand-written Rust Win32/GDI UI (native\) is kept
+rem  as a fallback -- it is what "trembled" while dragging.
 rem
-rem  If it says "not built yet", build it with:
-rem      cd native  &&  cargo build --release
+rem  Fallbacks:
+rem      native\target\release\learn-helper-native.exe   (Rust, no runtime needed)
+rem      winui\RunWinUI.bat                              (WinUI 3)
 rem ============================================================
 
-set "EXE=%~dp0native\target\release\learn-helper-native.exe"
+set "PYW=py -3.12"
+set "APPDIR=%~dp0"
 
-if not exist "%EXE%" (
+rem Prefer pythonw so no console window flashes; fall back to py.
+where pythonw >nul 2>nul
+if %errorlevel%==0 (
+    set "PYW=pythonw"
+)
+
+if not exist "%~dp0frontend\app.py" (
     echo.
-    echo   [X] Not built yet:
-    echo       %EXE%
-    echo.
-    echo   Build it first with:
-    echo       cd native ^&^& cargo build --release
-    echo.
-    echo   Or try the fallback WinUI build:
-    echo       winui\RunWinUI.bat
+    echo   [X] Missing frontend\app.py
     echo.
     pause
     exit /b 1
 )
 
 echo.
-echo   Starting learn-helper ^(native Win32^) ...
-echo   Diagnostics log:
-echo       %~dp0native\target\release\native-diag.log
-echo   Backend log:
-echo       %~dp0logs\learn_helper.log
+echo   Starting learn-helper ^(PySide6 frontend^) ...
+echo   Diagnostics log: %~dp0native-diag.log
+echo   Backend log:     %~dp0logs\learn_helper.log
 echo.
 
-start "" "%EXE%"
+pushd "%~dp0"
+if /i "%PYW%"=="pythonw" (
+    start "" pythonw -m frontend.app
+) else (
+    start "" py -3.12 -m frontend.app
+)
+popd
 exit /b 0

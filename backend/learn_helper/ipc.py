@@ -222,8 +222,10 @@ class PipeServer:
         with self._lock:
             clients = list(self._clients.items())
             self._clients.clear()
-        for _cid, (handle, _wlock, _q) in clients:
-            self._close_handle(handle)
+        for _cid, (_whandle, _wlock, _q, rhandle) in clients:
+            self._close_handle(rhandle)
+            if _whandle != rhandle:
+                self._close_handle(_whandle)
 
     @staticmethod
     def _close_handle(handle):
@@ -282,13 +284,20 @@ class PipeServer:
 
     def _spawn_client(self, handle):
         q = queue.Queue(maxsize=2000)
+        try:
+            # 写用**非阻塞**的复制句柄（见 _make_nowait 的说明：用原句柄会在对端不读时
+            # 永久阻塞并把整个后端拖死）。复制失败也不算致命 —— 退回原句柄（行为同旧版）。
+            w_handle = self._make_nowait(handle)
+        except Exception as e:
+            LOGGER.info(f'[管道] 非阻塞写句柄创建失败，退回阻塞句柄: {e}')
+            w_handle = handle
         with self._lock:
             self._next_id += 1
             cid = self._next_id
-            self._clients[cid] = (handle, threading.Lock(), q)
+            self._clients[cid] = (w_handle, threading.Lock(), q, handle)
         hub = self.hub
         try:
-            self._write_raw(handle, dumps_ascii({
+            self._write_raw(w_handle, dumps_ascii({
                 'type': 'hello', 'version': APP_VERSION,
                 'protocol': PROTOCOL_VERSION, 'device_id': DEVICE_ID,
                 'pipe': self.name,
@@ -301,14 +310,14 @@ class PipeServer:
         # 否则重连一次就会丢掉之前的所有日志（实测踩到）。
         try:
             for entry in hub.recent_logs():
-                self._write_raw(handle, dumps_ascii({
+                self._write_raw(w_handle, dumps_ascii({
                     'type': 'log', 'seq': entry['seq'], 'text': entry['text'],
                     'replay': True}) + '\n')
         except Exception as e:
             LOGGER.info(f'[管道] 历史日志补发失败: {e}')
         try:
             latest = hub.snapshot()
-            self._write_raw(handle, dumps_ascii(latest) + '\n')
+            self._write_raw(w_handle, dumps_ascii(latest) + '\n')
         except Exception:
             pass
         threading.Thread(target=self._reader, args=(cid, handle), daemon=True,
@@ -317,19 +326,35 @@ class PipeServer:
                          name=f'pipe-write-{cid}').start()
 
     def _reader(self, cid, handle):
-        import ctypes
-        kernel32 = ctypes.windll.kernel32
-        kernel32.ReadFile.restype = ctypes.c_int
-        kernel32.ReadFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
-                                      ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
-        buf = ctypes.create_string_buffer(4096)
-        read = ctypes.c_uint32(0)
+        """**不在服务端读这个句柄**（只登记客户端是否还在）。
+
+        ⚠️⚠️ 这是本轮最花时间的一个诊断（2026-09-21，用户报"界面不更新"）：
+        原实现起了一个线程在**服务端**对这根双向管道 `ReadFile`，目的是"发现对端断开"。
+        实测这个读会**永久阻塞**（最小复现：服务端 `CreateNamedPipe` + 一个只读的 Python
+        客户端，`ConnectNamedPipe` 成功、写 hello/status 成功，随后服务端 `ReadFile` 卡死）。
+        而 Python 的 ctypes **不释放 GIL** ⇒ 卡住的那个线程把整个后端拖死：
+        `/api/status` 超时、`/api/shutdown` 不响应、管道推送全停。
+
+        前端协议本来就是**单向**的（"前端只收不发"——见类文档），所以这里**根本不需要读**。
+        是否存在由"写失败"来发现：`_write_raw` 写得进就说明客户端在，写不进（对端关了）
+        就剔除。周期性心跳（下面这个循环）负责在没有事件时也定期探活。
+        """
+        import time as _time
         while not self.stop_event.is_set():
-            ok = kernel32.ReadFile(ctypes.c_void_p(handle), buf, 4096,
-                                   ctypes.byref(read), None)
-            if not ok:
+            if self.stop_event.wait(2.0):
                 break
-        self._drop_client(cid)
+            with self._lock:
+                entry = self._clients.get(cid)
+            if entry is None:
+                return
+            whandle = entry[0]
+            try:
+                # 心跳：能让"对端已消失"在 2 秒内被发现，而不必等下一次业务事件
+                self._write_raw(whandle, '{"type":"ping"}\n')
+            except Exception as e:
+                LOGGER.info(f'[管道] 心跳失败，判定客户端已断开（cid={cid}）: {e}')
+                self._drop_client(cid)
+                return
 
     def _writer(self, cid, q):
         while not self.stop_event.is_set():
@@ -343,39 +368,98 @@ class PipeServer:
                 entry = self._clients.get(cid)
             if entry is None:
                 break
-            handle, wlock, _q = entry
+            handle, wlock, _q, _rhandle = entry
             try:
                 with wlock:
                     self._write_raw(handle, chunk)
-            except Exception:
+            except Exception as e:
+                # ⚠️ 必须留一行日志：这里静默吞异常会让"界面再也不更新"变成一个
+                # 完全无迹可寻的现象（本轮就是靠把异常打出来才定位到 WriteFile 阻塞）。
+                LOGGER.info(f'[管道] 推送失败，剔除客户端 {cid}: {type(e).__name__}: {e}')
                 self._drop_client(cid)
                 break
 
     @staticmethod
+    def _make_nowait(handle):
+        """复制出一个**非阻塞**的写句柄（`PIPE_NOWAIT`），供推送使用。
+
+        ⚠️⚠️ 这里修的是一个会让**整个后端冻死**的严重 bug（2026-09-21，用户报"界面不更新"）：
+        原实现直接用 `CreateNamedPipe` 给的句柄 `WriteFile`。该句柄是**阻塞**模式，
+        当对端不读（客户端已死/卡住/读得慢）时 `WriteFile` 会**永久阻塞**；
+        而 Python 的 ctypes 调用**不释放 GIL** ⇒ 这个卡住的线程把整个解释器拖死：
+        `/api/status` 超时、`/api/shutdown` 不响应、进程永不退出（实测日志停在
+        「收尾②：关闭命名管道」）。
+        **最小复现**：`PipeServer` + 一个普通 Python 读取端，收到 hello/status 之后
+        再 `emit_pages` 就永久卡住。Rust 界面用 Win32 读原始字节，所以从没暴露它。
+
+        修法：给**写**单独复制一个 `PIPE_NOWAIT` 句柄。非阻塞模式下缓冲满时
+        `WriteFile` 立刻返回失败（而不是等），我们据此剔除该客户端 —— 宁可丢一个客户端，
+        也绝不能让后端陪着它一起僵死。读仍用原句柄（`PeekNamedPipe`/`ReadFile` 语义不变）。
+        """
+        import ctypes
+        kernel32 = ctypes.WinDLL('kernel32', use_last_error=True)
+        # ⚠️ 每个函数的 restype/argtypes 都必须写全：`GetCurrentProcess` 返回**句柄**，
+        # 不设 restype 会按 c_int 截断成 32 位（64 位下句柄是 64 位）⇒ DuplicateHandle 必失败。
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.DuplicateHandle.restype = ctypes.c_int
+        kernel32.DuplicateHandle.argtypes = [
+            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p),
+            ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+        kernel32.SetNamedPipeHandleState.restype = ctypes.c_int
+        kernel32.SetNamedPipeHandleState.argtypes = [
+            ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p, ctypes.c_void_p]
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+
+        cur = ctypes.c_void_p(0)
+        proc = kernel32.GetCurrentProcess()
+        ok = kernel32.DuplicateHandle(ctypes.c_void_p(proc), ctypes.c_void_p(handle),
+                                      ctypes.c_void_p(proc), ctypes.byref(cur),
+                                      0, 0, 0x00000002)      # DUPLICATE_SAME_ACCESS
+        if not ok or not cur.value:
+            raise OSError(f'DuplicateHandle 失败 err={ctypes.get_last_error()}')
+        PIPE_NOWAIT = ctypes.c_uint32(0x00000001)
+        ok = kernel32.SetNamedPipeHandleState(ctypes.c_void_p(cur.value),
+                                              ctypes.byref(PIPE_NOWAIT), None, None)
+        if not ok:
+            err = ctypes.get_last_error()
+            kernel32.CloseHandle(ctypes.c_void_p(cur.value))
+            raise OSError(f'SetNamedPipeHandleState(PIPE_NOWAIT) 失败 err={err}')
+        return cur.value
+
+    @staticmethod
     def _write_raw(handle, text):
+        """写一条事件到管道。**绝不阻塞**（宁可丢客户端，也不能卡住后端）。
+
+        句柄由 `_make_nowait` 复制而来（非阻塞）：缓冲满时 `WriteFile` 立刻失败，
+        我们把异常抛给 `_writer`，由它剔除该客户端。
+        """
         import ctypes
         kernel32 = ctypes.windll.kernel32
+        data = text.encode('ascii', 'replace')
         kernel32.WriteFile.restype = ctypes.c_int
         kernel32.WriteFile.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
                                        ctypes.POINTER(ctypes.c_uint32), ctypes.c_void_p]
-        data = text.encode('ascii', 'replace')
         written = ctypes.c_uint32(0)
         ok = kernel32.WriteFile(ctypes.c_void_p(handle), data, len(data),
                                 ctypes.byref(written), None)
         if not ok:
-            raise OSError('WriteFile 失败')
+            raise OSError(f'WriteFile 失败 err={ctypes.get_last_error()}')
+        if written.value != len(data):
+            raise OSError(f'WriteFile 只写了 {written.value}/{len(data)} 字节')
 
     def _drop_client(self, cid):
         with self._lock:
             entry = self._clients.pop(cid, None)
         if entry is None:
             return
-        handle, _wlock, q = entry
+        whandle, _wlock, q, rhandle = entry
         try:
             q.put_nowait(None)
         except Exception:
             pass
-        self._close_handle(handle)
+        self._close_handle(rhandle)
+        if whandle != rhandle:
+            self._close_handle(whandle)
 
     def client_count(self):
         with self._lock:
@@ -386,7 +470,7 @@ class PipeServer:
         chunk = dumps_ascii(event) + '\n'
         with self._lock:
             items = list(self._clients.items())
-        for cid, (_handle, _wlock, q) in items:
+        for cid, (_handle, _wlock, q, _rh) in items:
             try:
                 q.put_nowait(chunk)
             except queue.Full:
